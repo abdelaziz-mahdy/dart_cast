@@ -785,11 +785,28 @@ class MediaProxy {
 
     final fileLength = await file.length();
     final contentType = _contentTypeForPath(route.url);
+    final isVideo = contentType.primaryType == 'video';
 
     _addCorsHeaders(request.response);
     request.response.headers.contentType = contentType;
     request.response.headers.set('Accept-Ranges', 'bytes');
-    request.response.headers.set('transferMode.dlna.org', 'Streaming');
+    // DLNA transfer mode: Interactive for seekable files, Streaming for live/piped
+    request.response.headers.set(
+        'transferMode.dlna.org', isVideo ? 'Interactive' : 'Streaming');
+    // DLNA content features: tells the renderer what the content supports
+    if (isVideo) {
+      request.response.headers.set('contentFeatures.dlna.org',
+          'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000');
+    }
+
+    // Handle HEAD requests — DLNA renderers probe content before fetching.
+    // Respond with headers only, no body.
+    if (request.method == 'HEAD') {
+      request.response.statusCode = HttpStatus.ok;
+      request.response.headers.set('Content-Length', fileLength.toString());
+      await request.response.close();
+      return;
+    }
 
     // Handle virtual segment requests (?start=X&end=Y) from HLS playlists.
     // These serve a byte range as a normal 200 response (not 206), which is
