@@ -52,6 +52,11 @@ class MediaProxy {
   /// can initialize independently for each segment.
   Uint8List? _tsPatPmt;
 
+  /// Last registered subtitle proxy URL. Used to populate the
+  /// `CaptionInfo.sec` HTTP header on HEAD responses for Samsung
+  /// DLNA subtitle discovery.
+  String? _lastSubtitleProxyUrl;
+
   /// The base URL of the running proxy server, or null if not started.
   String? get baseUrl => _baseUrl;
 
@@ -352,11 +357,16 @@ class MediaProxy {
   /// Returns a proxy URL that can be given to a cast device.
   String registerSubtitle(String urlOrPath,
       {Map<String, String> headers = const {}}) {
+    String proxyUrl;
     if (urlOrPath.startsWith('file://')) {
       final filePath = urlOrPath.replaceFirst('file://', '');
-      return registerFile(filePath);
+      proxyUrl = registerFile(filePath);
+    } else {
+      proxyUrl = registerMedia(urlOrPath, headers: headers);
     }
-    return registerMedia(urlOrPath, headers: headers);
+    // Store for CaptionInfo.sec header on HEAD responses (Samsung DLNA)
+    _lastSubtitleProxyUrl = proxyUrl;
+    return proxyUrl;
   }
 
   /// Registers an HLS stream to be served as continuous MPEG-TS.
@@ -790,17 +800,26 @@ class MediaProxy {
     _addCorsHeaders(request.response);
     request.response.headers.contentType = contentType;
     request.response.headers.set('Accept-Ranges', 'bytes');
-    // DLNA transfer mode: Interactive for seekable files, Streaming for live/piped
-    request.response.headers.set(
-        'transferMode.dlna.org', isVideo ? 'Interactive' : 'Streaming');
-    // DLNA content features: tells the renderer what the content supports
+    // DLNA transfer mode: Streaming for A/V content (Interactive is for images)
+    request.response.headers.set('transferMode.dlna.org', 'Streaming');
+    // DLNA content features: tells the renderer codec profile, seek support,
+    // and protocol capabilities. Required for many DLNA renderers to accept content.
+    // DLNA.ORG_OP=01: byte-range seeking supported
+    // DLNA.ORG_CI=0: not transcoded (original format)
+    // DLNA.ORG_FLAGS=01700000: streaming + background + connection stall + v1.5
     if (isVideo) {
       request.response.headers.set('contentFeatures.dlna.org',
           'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000');
+      // Samsung subtitle discovery — CaptionInfo.sec header on both HEAD and GET
+      if (_lastSubtitleProxyUrl != null) {
+        request.response.headers.set(
+            'CaptionInfo.sec', _lastSubtitleProxyUrl!);
+      }
     }
 
-    // Handle HEAD requests — DLNA renderers probe content before fetching.
-    // Respond with headers only, no body.
+    // Handle HEAD requests — DLNA renderers probe content with HEAD before
+    // streaming. Must return same headers as GET but without a message body.
+    // Samsung TVs specifically use HEAD to discover subtitle availability.
     if (request.method == 'HEAD') {
       request.response.statusCode = HttpStatus.ok;
       request.response.headers.set('Content-Length', fileLength.toString());

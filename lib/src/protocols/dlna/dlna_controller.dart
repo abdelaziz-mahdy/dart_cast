@@ -40,9 +40,18 @@ class DlnaSoapBuilder {
     final escapedUrl = _escapeXml(url);
     final escapedTitle = _escapeXml(title ?? 'Media');
 
-    final subtitleElement = subtitleUrl != null
-        ? '<sec:CaptionInfoEx sec:type="srt">${_escapeXml(subtitleUrl)}</sec:CaptionInfoEx>'
-        : '';
+    // Subtitle elements — use multiple vendor-specific approaches for
+    // maximum TV compatibility. No DLNA standard exists for external subs.
+    final subtitleElements = StringBuffer();
+    if (subtitleUrl != null) {
+      final escapedSubUrl = _escapeXml(subtitleUrl);
+      // Samsung: sec:CaptionInfoEx (modern Samsung TVs)
+      subtitleElements.write(
+          '<sec:CaptionInfoEx sec:type="srt">$escapedSubUrl</sec:CaptionInfoEx>');
+      // Generic: separate <res> element with text/srt MIME (LG, Panasonic, Roku)
+      subtitleElements.write(
+          '<res protocolInfo="http-get:*:text/srt:*">$escapedSubUrl</res>');
+    }
 
     // Build optional <res> attributes for duration and size
     final durationAttr = duration != null ? ' duration="$duration"' : '';
@@ -52,12 +61,13 @@ class DlnaSoapBuilder {
       '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"'
       ' xmlns:dc="http://purl.org/dc/elements/1.1/"'
       ' xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"'
-      ' xmlns:sec="http://www.sec.co.kr/">'
+      ' xmlns:sec="http://www.sec.co.kr/"'
+      ' xmlns:pv="http://www.pv.com/pvns/">'
       '<item id="0" parentID="0" restricted="0">'
       '<dc:title>$escapedTitle</dc:title>'
       '<upnp:class>object.item.videoItem</upnp:class>'
       '<res protocolInfo="$protocolInfo"$durationAttr$sizeAttr>$escapedUrl</res>'
-      '$subtitleElement'
+      '$subtitleElements'
       '</item>'
       '</DIDL-Lite>',
     );
