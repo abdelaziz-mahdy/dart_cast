@@ -11,13 +11,16 @@
 /// ## Usage
 ///
 /// ```dart
-/// final session = await device.connect(
+/// // For Chromecast (remux only):
+/// final session = ChromecastSession(
+///   device: device,
 ///   mediaTransformer: FfmpegMediaTransformer(),
 /// );
-/// await session.load(CastMedia.file(
-///   filePath: '/path/to/episode.ts',
-///   type: CastMediaType.mpegTs,
-/// ));
+///
+/// // For DLNA (remux + embed subtitles for TV compatibility):
+/// final session = DlnaSession.fromDevice(device);
+/// // Pass embedSubtitles: true and the transformer creates a temp MP4
+/// // with subtitles baked in, so all TVs can display them.
 /// ```
 ///
 /// ## Platform requirements
@@ -29,16 +32,6 @@
 /// - **Android / iOS (Flutter):** `Process.run` is not available. Swap
 ///   [FfmpegRemuxer] internals to use `FFmpegKit.execute` from the
 ///   `ffmpeg_kit_flutter_new` package instead.
-///
-/// ## Behaviour
-///
-/// 1. Non-local or non-TS media is delegated to [DefaultMediaTransformer].
-/// 2. If an `.mp4` file already exists next to the `.ts` file, it is used
-///    directly (skip remux).
-/// 3. Otherwise, [FfmpegRemuxer.remuxToMp4] shells out to ffmpeg to create
-///    the `.mp4`.
-/// 4. On remux failure, the partial `.mp4` is deleted and the original `.ts`
-///    is served directly as a fallback.
 library;
 
 import 'dart:io';
@@ -51,36 +44,41 @@ typedef RemuxProgressCallback = void Function(String message);
 
 /// Utility that remuxes MPEG-TS files to MP4 using the system `ffmpeg` binary.
 ///
-/// This implementation uses [Process.run], which works on desktop platforms
-/// (Windows, Linux, macOS). On mobile platforms (Android/iOS), replace the
-/// [Process.run] call with `FFmpegKit.execute` from the
-/// `ffmpeg_kit_flutter_new` package.
+/// Supports optional subtitle embedding for DLNA compatibility — when a
+/// subtitle file is provided, it's muxed into the MP4 as a mov_text track
+/// so all TVs can display it without vendor-specific extensions.
 class FfmpegRemuxer {
   /// Remuxes a TS file to MP4 using ffmpeg.
   ///
   /// Returns the output path on success, `null` on failure.
   /// Cleans up partial output on failure.
   ///
-  /// The ffmpeg command copies all streams (no re-encoding), drops data
-  /// streams to avoid muxer errors, regenerates PTS timestamps, and moves
-  /// the moov atom to the front for streaming.
+  /// If [subtitlePath] is provided, the subtitle is embedded in the MP4
+  /// using the mov_text codec (MP4's native subtitle format). This gives
+  /// maximum DLNA TV compatibility.
   static Future<String?> remuxToMp4(
     String inputPath, {
     String? outputPath,
+    String? subtitlePath,
     void Function(String message)? onProgress,
   }) async {
     final mp4Path = outputPath ?? p.setExtension(inputPath, '.mp4');
     final stopwatch = Stopwatch()..start();
+    final hasSubs = subtitlePath != null && File(subtitlePath).existsSync();
 
-    onProgress?.call('Remuxing ${p.basename(inputPath)} → .mp4');
+    onProgress?.call(
+        'Remuxing ${p.basename(inputPath)} → .mp4${hasSubs ? ' (with subs)' : ''}');
 
     try {
       final result = await Process.run('ffmpeg', [
         '-fflags', '+genpts',
         '-i', inputPath,
+        if (hasSubs) ...['-i', subtitlePath],
         '-map', '0',
+        if (hasSubs) ...['-map', '1'],
         '-map', '-0:d',
         '-c', 'copy',
+        if (hasSubs) ...['-c:s', 'mov_text'],
         '-movflags', '+faststart',
         '-y',
         mp4Path,
@@ -123,23 +121,32 @@ class FfmpegRemuxer {
 ///
 /// Extends [DefaultMediaTransformer] so remote URLs and non-TS local files
 /// pass through unchanged. Only local `.ts` files trigger the remux path.
+///
+/// ## DLNA subtitle embedding
+///
+/// Set [embedSubtitles] to `true` when casting to DLNA. The transformer will:
+/// 1. Look for a subtitle file (.srt/.vtt) next to the video
+/// 2. Create a temp MP4 with the subtitle embedded as a mov_text track
+/// 3. Serve the temp file instead of the original
+///
+/// This is necessary because DLNA has no standard for external subtitles —
+/// embedding them in the container is the most reliable approach.
 class FfmpegMediaTransformer extends DefaultMediaTransformer {
   /// Optional callback invoked with progress messages during remux.
-  ///
-  /// Example messages: `"Remuxing file.ts → .mp4"`,
-  /// `"Remux complete (3.2s)"`, `"Remux failed: ..."`.
   final RemuxProgressCallback? onProgress;
 
+  /// Whether to embed subtitle files into the MP4 during remux.
+  ///
+  /// Set to `true` for DLNA targets where external subtitle delivery
+  /// is unreliable. Creates a temp file with subs baked in.
+  /// Set to `false` (default) for Chromecast which handles sidecar VTT.
+  final bool embedSubtitles;
+
   /// Creates an [FfmpegMediaTransformer].
-  ///
-  /// [wrapRemoteTs] defaults to `true` — remote TS URLs are wrapped in HLS
-  /// for Chromecast compatibility. Set to `false` if you only target DLNA.
-  ///
-  /// [onProgress] receives human-readable status messages during the remux
-  /// process, suitable for displaying in a UI snackbar or log.
   FfmpegMediaTransformer({
     super.wrapRemoteTs = true,
     this.onProgress,
+    this.embedSubtitles = false,
   });
 
   @override
@@ -154,6 +161,45 @@ class FfmpegMediaTransformer extends DefaultMediaTransformer {
     final mp4Path = p.setExtension(media.url, '.mp4');
     final mp4File = File(mp4Path);
 
+    // Find subtitle to embed (only for DLNA)
+    String? subtitlePath;
+    if (embedSubtitles && media.subtitles.isNotEmpty) {
+      final subUrl = media.subtitles.first.url;
+      // Handle file:// URLs
+      subtitlePath = subUrl.startsWith('file://')
+          ? subUrl.replaceFirst('file://', '')
+          : subUrl;
+      if (!File(subtitlePath).existsSync()) {
+        subtitlePath = null;
+      }
+    }
+
+    // If we need to embed subs, always create a temp file (don't reuse
+    // the permanent MP4 which may not have subs embedded)
+    if (embedSubtitles && subtitlePath != null) {
+      final tempDir = await Directory.systemTemp.createTemp('dart_cast_');
+      final tempMp4 = '${tempDir.path}/cast_with_subs.mp4';
+
+      // Use the existing MP4 as input if available, otherwise the TS
+      final inputPath = mp4File.existsSync() ? mp4Path : media.url;
+
+      final result = await FfmpegRemuxer.remuxToMp4(
+        inputPath,
+        outputPath: tempMp4,
+        subtitlePath: subtitlePath,
+        onProgress: onProgress,
+      );
+
+      if (result != null) {
+        final url = proxy.registerFile(result);
+        return TransformedMedia(
+            proxyUrl: url, effectiveType: CastMediaType.mp4);
+      }
+      // Subtitle embedding failed — fall through to normal remux
+      onProgress?.call('Subtitle embedding failed, casting without subs');
+    }
+
+    // Normal remux (no subtitle embedding)
     if (!mp4File.existsSync()) {
       final result = await FfmpegRemuxer.remuxToMp4(
         media.url,
