@@ -1,3 +1,28 @@
+## 0.4.0
+
+### Breaking
+- DLNA file serving now uses HTTP/1.0 via raw sockets instead of Dart's HttpServer response. This fixes playback on TCL Google TV and other renderers that reject HTTP/1.1.
+- Removed DLNA-specific HTTP headers (`transferMode.dlna.org`, `contentFeatures.dlna.org`, `Connection: close`) from file responses — these caused some DLNA renderers to reject content.
+- Cleared Dart's default security headers (`x-frame-options`, `x-xss-protection`, `x-content-type-options`) from the proxy server.
+
+### New
+- `Http10FileServer` — reusable HTTP/1.0 file server class for DLNA compatibility
+- `CastMediaType.mkv` — MKV container support for casting with embedded subtitles
+- `SubtitleConverter.vttToSrt()` — WebVTT to SRT conversion
+- `SubtitleConverter.toAss()` — VTT/SRT to ASS conversion with customizable styling (font, outline, shadow, margins)
+- `MediaProxy.registerSubtitleVariants()` — registers both SRT and VTT subtitle variants for maximum TV compatibility
+- DLNA subtitle variants: DIDL-Lite now includes both SRT and VTT subtitle URLs with proper format/type attributes
+- DLNA seek instantly updates position without waiting for next polling cycle
+- MKV content type detection and proxy URL extension support
+
+### Fixed
+- DLNA playback failing on TCL Google TV and similar renderers that reject HTTP/1.1 responses
+- DLNA flags mismatch between DIDL-Lite protocolInfo (`21500000`) and HTTP headers (`01700000`) — now aligned to `01700000` matching VLC and MiniDLNA
+- Missing `DLNA.ORG_PN` profile name in protocolInfo (`AVC_MP4_HP_HD_AAC` for MP4, `MPEG_TS_HD_NA_ISO` for TS)
+- DLNA seeking not working — Range responses now correctly return 206 with Content-Range
+- Subtitle file proxy URLs missing file extensions (`.vtt`, `.srt`) — some TVs need extensions to recognize subtitle files
+- Synthetic content (subtitle playlists, converted subtitles) now served via HTTP/1.0 for DLNA compatibility
+
 ## 0.3.1
 
 - Added protocol status table to README with testing coverage and known limitations

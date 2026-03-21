@@ -217,7 +217,7 @@ void main() {
       }
     });
 
-    test('synthetic content has correct CORS headers', () async {
+    test('synthetic content served via HTTP/1.0 without CORS', () async {
       await proxy.start();
 
       final url = proxy.registerSubtitlePlaylist(
@@ -230,10 +230,9 @@ void main() {
         final response = await request.close();
         await response.drain<void>();
 
-        expect(
-          response.headers.value('Access-Control-Allow-Origin'),
-          '*',
-        );
+        // Synthetic content now served via HTTP/1.0 raw socket for
+        // DLNA compatibility — no CORS headers needed.
+        expect(response.statusCode, HttpStatus.ok);
       } finally {
         client.close();
       }

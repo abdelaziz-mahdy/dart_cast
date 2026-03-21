@@ -69,7 +69,8 @@ void main() {
     test('enum values are distinct', () {
       expect(CastMediaType.hls, isNot(CastMediaType.mp4));
       expect(CastMediaType.mp4, isNot(CastMediaType.mpegTs));
-      expect(CastMediaType.values, hasLength(3));
+      expect(CastMediaType.mkv, isNot(CastMediaType.mp4));
+      expect(CastMediaType.values, hasLength(4));
     });
   });
 }

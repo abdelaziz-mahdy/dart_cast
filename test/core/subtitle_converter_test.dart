@@ -53,6 +53,94 @@ void main() {
       });
     });
 
+    group('vttToSrt', () {
+      test('converts VTT to SRT format', () {
+        const vtt = 'WEBVTT\n\n'
+            '00:00:01.000 --> 00:00:04.000\n'
+            'Hello world\n'
+            '\n'
+            '00:01:30.500 --> 00:01:35.250\n'
+            'Second subtitle\n';
+
+        final srt = SubtitleConverter.vttToSrt(vtt);
+
+        expect(srt, contains('1\n00:00:01,000 --> 00:00:04,000'));
+        expect(srt, contains('2\n00:01:30,500 --> 00:01:35,250'));
+        expect(srt, contains('Hello world'));
+        expect(srt, contains('Second subtitle'));
+        expect(srt, isNot(contains('WEBVTT')));
+      });
+
+      test('strips X-TIMESTAMP-MAP from VTT', () {
+        const vtt = 'WEBVTT\n'
+            'X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n'
+            '00:00:01.000 --> 00:00:04.000\n'
+            'Test\n';
+
+        final srt = SubtitleConverter.vttToSrt(vtt);
+        expect(srt, isNot(contains('TIMESTAMP')));
+        expect(srt, contains('Test'));
+      });
+
+      test('adds sequence numbers', () {
+        const vtt = 'WEBVTT\n\n'
+            '00:00:01.000 --> 00:00:02.000\n'
+            'First\n'
+            '\n'
+            '00:00:03.000 --> 00:00:04.000\n'
+            'Second\n';
+
+        final srt = SubtitleConverter.vttToSrt(vtt);
+        expect(srt, contains('1\n'));
+        expect(srt, contains('2\n'));
+      });
+    });
+
+    group('toAss', () {
+      test('generates valid ASS header', () {
+        const vtt = 'WEBVTT\n\n'
+            '00:00:01.000 --> 00:00:04.000\n'
+            'Hello\n';
+
+        final ass = SubtitleConverter.toAss(vtt);
+        expect(ass, contains('[Script Info]'));
+        expect(ass, contains('[V4+ Styles]'));
+        expect(ass, contains('[Events]'));
+        expect(ass, contains('Style: Default'));
+      });
+
+      test('converts VTT cues to ASS dialogues', () {
+        const vtt = 'WEBVTT\n\n'
+            '00:00:25.250 --> 00:00:32.210\n'
+            'Hello world\n';
+
+        final ass = SubtitleConverter.toAss(vtt);
+        expect(ass, contains('Dialogue:'));
+        expect(ass, contains('Hello world'));
+        expect(ass, contains('0:00:25'));
+        expect(ass, contains('0:00:32'));
+      });
+
+      test('converts SRT input to ASS', () {
+        const srt = '1\n'
+            '00:00:01,000 --> 00:00:04,000\n'
+            'From SRT\n';
+
+        final ass = SubtitleConverter.toAss(srt);
+        expect(ass, contains('Dialogue:'));
+        expect(ass, contains('From SRT'));
+      });
+
+      test('respects custom fontSize', () {
+        const vtt = 'WEBVTT\n\n'
+            '00:00:01.000 --> 00:00:02.000\n'
+            'Test\n';
+
+        final ass = SubtitleConverter.toAss(vtt, fontSize: 36);
+        expect(ass, contains(',36,'));
+      });
+    });
+
     group('isSrt', () {
       test('detects SRT format', () {
         const srt = '1\n'

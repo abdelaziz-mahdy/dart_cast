@@ -2,6 +2,7 @@
 enum CastMediaType {
   hls,
   mp4,
+  mkv,
   mpegTs,
 }
 

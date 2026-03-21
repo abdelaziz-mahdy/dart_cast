@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'hls_parser.dart';
 import 'hls_stream_proxy.dart';
+import 'http10_file_server.dart';
 import 'subtitle_converter.dart';
 import '../utils/logger.dart';
 import '../utils/network_utils.dart';
@@ -52,10 +53,6 @@ class MediaProxy {
   /// can initialize independently for each segment.
   Uint8List? _tsPatPmt;
 
-  /// Last registered subtitle proxy URL. Used to populate the
-  /// `CaptionInfo.sec` HTTP header on HEAD responses for Samsung
-  /// DLNA subtitle discovery.
-  String? _lastSubtitleProxyUrl;
 
   /// The base URL of the running proxy server, or null if not started.
   String? get baseUrl => _baseUrl;
@@ -82,6 +79,10 @@ class MediaProxy {
     final bindAddress = ip ?? '0.0.0.0';
 
     _server = await HttpServer.bind(bindAddress, port ?? 0);
+    // Remove Dart's default security headers — DLNA renderers (especially
+    // TCL Google TV) fail to play content when x-content-type-options,
+    // x-frame-options, or x-xss-protection headers are present.
+    _server!.defaultResponseHeaders.clear();
     final actualPort = _server!.port;
     _baseUrl = 'http://${ip ?? bindAddress}:$actualPort';
 
@@ -122,12 +123,20 @@ class MediaProxy {
   /// Returns a proxy URL that can be given to a cast device.
   String registerFile(String filePath) {
     final token = _generateToken();
-    // Add file extension to the proxy URL so HLS players can detect format
-    final ext = filePath.toLowerCase().endsWith('.ts')
+    // Add file extension to the proxy URL so players/TVs can detect format.
+    // Many DLNA TVs require the extension to recognize subtitle files.
+    final lower = filePath.toLowerCase();
+    final ext = lower.endsWith('.ts')
         ? '.ts'
-        : filePath.toLowerCase().endsWith('.mp4')
+        : lower.endsWith('.mp4')
             ? '.mp4'
-            : '';
+            : lower.endsWith('.mkv')
+                ? '.mkv'
+                : lower.endsWith('.vtt')
+                    ? '.vtt'
+                    : lower.endsWith('.srt')
+                        ? '.srt'
+                        : '';
     _routes['$token$ext'] = _ProxyRoute(
       type: _RouteType.localFile,
       url: filePath,
@@ -364,9 +373,73 @@ class MediaProxy {
     } else {
       proxyUrl = registerMedia(urlOrPath, headers: headers);
     }
-    // Store for CaptionInfo.sec header on HEAD responses (Samsung DLNA)
-    _lastSubtitleProxyUrl = proxyUrl;
     return proxyUrl;
+  }
+
+  /// Registers subtitle variants in both SRT and VTT formats for DLNA.
+  ///
+  /// Many DLNA TVs only support one format. By serving both, the TV can
+  /// pick whichever it supports. The original file is served as-is, and
+  /// a converted variant is generated (VTT→SRT or SRT→VTT).
+  ///
+  /// Returns a list of (url, format) pairs for inclusion in DIDL-Lite.
+  List<({String url, String format})> registerSubtitleVariants(
+    String urlOrPath, {
+    Map<String, String> headers = const {},
+  }) {
+    // Register the original subtitle
+    final originalUrl = registerSubtitle(urlOrPath, headers: headers);
+
+    // Read content to detect format and generate the other variant
+    String? content;
+    String originalPath = urlOrPath;
+    if (originalPath.startsWith('file://')) {
+      originalPath = originalPath.replaceFirst('file://', '');
+    }
+
+    try {
+      if (File(originalPath).existsSync()) {
+        content = File(originalPath).readAsStringSync();
+      }
+    } catch (_) {}
+
+    if (content == null) {
+      // Can't read file, just return original with guessed format
+      final isVtt = urlOrPath.toLowerCase().endsWith('.vtt');
+      return [(url: originalUrl, format: isVtt ? 'vtt' : 'srt')];
+    }
+
+    final isVtt = content.trimLeft().startsWith('WEBVTT');
+    final isSrt = SubtitleConverter.isSrt(content);
+
+    final variants = <({String url, String format})>[];
+
+    if (isVtt) {
+      // Original is VTT — generate SRT variant
+      variants.add((url: originalUrl, format: 'vtt'));
+      final srtContent = SubtitleConverter.vttToSrt(content);
+      final srtToken = _generateToken();
+      _syntheticContent['$srtToken.srt'] = _SyntheticContent(
+          content: srtContent,
+          contentType: ContentType('text', 'srt'));
+      variants.add(
+          (url: '$_baseUrl/synthetic/$srtToken.srt', format: 'srt'));
+    } else if (isSrt) {
+      // Original is SRT — generate VTT variant
+      variants.add((url: originalUrl, format: 'srt'));
+      final vttContent = SubtitleConverter.srtToVtt(content);
+      final vttToken = _generateToken();
+      _syntheticContent['$vttToken.vtt'] = _SyntheticContent(
+          content: vttContent,
+          contentType: ContentType('text', 'vtt'));
+      variants.add(
+          (url: '$_baseUrl/synthetic/$vttToken.vtt', format: 'vtt'));
+    } else {
+      // Unknown format, serve as-is
+      variants.add((url: originalUrl, format: 'srt'));
+    }
+
+    return variants;
   }
 
   /// Registers an HLS stream to be served as continuous MPEG-TS.
@@ -503,6 +576,12 @@ class MediaProxy {
       final rangeHeader = request.headers.value('Range');
       CastLogger.debug(
           'MediaProxy: ${request.method} $path${rangeHeader != null ? ' Range: $rangeHeader' : ''}');
+      // Log all request headers for DLNA debugging
+      final headerBuf = StringBuffer();
+      request.headers.forEach((name, values) {
+        headerBuf.write('  $name: ${values.join(", ")}\n');
+      });
+      CastLogger.debug('MediaProxy: request headers:\n$headerBuf');
 
       // Handle CORS preflight (OPTIONS) requests — Chromecast's HLS player
       // sends these before fetching segments from a different origin/path.
@@ -559,7 +638,6 @@ class MediaProxy {
     final synthetic = _syntheticContent[token];
     if (synthetic == null) {
       request.response.statusCode = HttpStatus.notFound;
-      _addCorsHeaders(request.response);
       await request.response.close();
       return;
     }
@@ -567,14 +645,24 @@ class MediaProxy {
     CastLogger.debug('MediaProxy: serving synthetic content token=$token '
         'contentType=${synthetic.contentType} '
         'size=${synthetic.content.length} chars');
-    CastLogger.debug('MediaProxy: synthetic content:\n${synthetic.content}');
 
     final encoded = utf8.encode(synthetic.content);
-    _addCorsHeaders(request.response);
-    request.response.statusCode = HttpStatus.ok;
-    request.response.headers.contentType = synthetic.contentType;
-    request.response.headers.set('Content-Length', encoded.length.toString());
-    request.response.add(encoded);
+
+    // Serve via HTTP/1.0 for DLNA compatibility (same as file serving)
+    final socket = await request.response.detachSocket(writeHeaders: false);
+    try {
+      final headers = StringBuffer();
+      headers.write('HTTP/1.0 200 OK\r\n');
+      headers.write('Content-Type: ${synthetic.contentType.mimeType}\r\n');
+      headers.write('Content-Length: ${encoded.length}\r\n');
+      headers.write('\r\n');
+      socket.add(utf8.encode(headers.toString()));
+      if (request.method != 'HEAD') {
+        socket.add(encoded);
+      }
+    } finally {
+      await socket.close();
+    }
     await request.response.close();
   }
 
@@ -753,86 +841,55 @@ class MediaProxy {
       return;
     }
 
-    // Auto-convert SRT subtitle files to VTT and strip X-TIMESTAMP-MAP
+    // For subtitle files served to Chromecast (via HLS), convert SRT→VTT.
+    // For DLNA, serve as-is (DLNA TVs handle SRT/VTT natively).
+    // Detection: Chromecast requests come via /stream/ routes with HLS,
+    // while DLNA requests come via /file/ routes. Since we're in the
+    // /file/ handler, check if this is a subtitle and serve it raw via
+    // HTTP/1.0 for DLNA compatibility. Non-subtitle files fall through
+    // to the HTTP/1.0 file server below.
     if (_isSubtitleFile(route.url)) {
       var content = await file.readAsString();
 
       CastLogger.debug(
           'MediaProxy: local subtitle file (${content.length} chars, '
-          'isSrt=${SubtitleConverter.isSrt(content)}, '
-          'hasTimestampMap=${content.contains('X-TIMESTAMP-MAP')})');
+          'isSrt=${SubtitleConverter.isSrt(content)})');
 
-      bool converted = false;
+      // Convert SRT→VTT for non-DLNA consumers (Chromecast needs VTT)
       if (SubtitleConverter.isSrt(content)) {
         content = SubtitleConverter.srtToVtt(content);
         CastLogger.debug('MediaProxy: converted local SRT → VTT');
-        converted = true;
       }
 
       if (content.contains('X-TIMESTAMP-MAP')) {
-        CastLogger.debug(
-            'MediaProxy: stripping existing X-TIMESTAMP-MAP from local VTT');
         content = SubtitleConverter.stripTimestampMap(content);
-        converted = true;
       }
 
-      // Note: X-TIMESTAMP-MAP injection was removed — Chromecast's Shaka Player
-      // doesn't support it in sidecar VTT tracks (only HLS subtitle segments).
-      // PTS-based EXTINF durations handle timeline alignment instead.
-
-      if (converted || content.trimLeft().startsWith('WEBVTT')) {
-        final encoded = utf8.encode(content);
-        _addCorsHeaders(request.response);
-        request.response.statusCode = HttpStatus.ok;
-        request.response.headers.contentType = ContentType('text', 'vtt');
-        request.response.headers
-            .set('Content-Length', encoded.length.toString());
-        request.response.add(encoded);
-        await request.response.close();
-        return;
+      // Serve subtitle via HTTP/1.0 for DLNA TV compatibility
+      final encoded = utf8.encode(content);
+      final socket = await request.response.detachSocket(writeHeaders: false);
+      try {
+        final isVtt = content.trimLeft().startsWith('WEBVTT');
+        final mime = isVtt ? 'text/vtt' : 'text/srt';
+        final headers = StringBuffer();
+        headers.write('HTTP/1.0 200 OK\r\n');
+        headers.write('Content-Type: $mime\r\n');
+        headers.write('Content-Length: ${encoded.length}\r\n');
+        headers.write('\r\n');
+        socket.add(utf8.encode(headers.toString()));
+        if (request.method != 'HEAD') {
+          socket.add(encoded);
+        }
+      } finally {
+        await socket.close();
       }
-    }
-
-    final fileLength = await file.length();
-    final contentType = _contentTypeForPath(route.url);
-    final isVideo = contentType.primaryType == 'video';
-
-    _addCorsHeaders(request.response);
-    request.response.headers.contentType = contentType;
-    request.response.headers.set('Accept-Ranges', 'bytes');
-    // DLNA transfer mode: Streaming for A/V content (Interactive is for images)
-    request.response.headers.set('transferMode.dlna.org', 'Streaming');
-    // DLNA content features: tells the renderer codec profile, seek support,
-    // and protocol capabilities. Required for many DLNA renderers to accept content.
-    // DLNA.ORG_OP=01: byte-range seeking supported
-    // DLNA.ORG_CI=0: not transcoded (original format)
-    // DLNA.ORG_FLAGS=01700000: streaming + background + connection stall + v1.5
-    if (isVideo) {
-      request.response.headers.set('contentFeatures.dlna.org',
-          'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000');
-      // Samsung subtitle discovery — CaptionInfo.sec header on both HEAD and GET
-      if (_lastSubtitleProxyUrl != null) {
-        request.response.headers.set(
-            'CaptionInfo.sec', _lastSubtitleProxyUrl!);
-      }
-    }
-
-    // Handle HEAD requests — DLNA renderers probe content with HEAD before
-    // streaming. Must return same headers as GET but without a message body.
-    // Samsung TVs specifically use HEAD to discover subtitle availability.
-    if (request.method == 'HEAD') {
-      request.response.statusCode = HttpStatus.ok;
-      request.response.headers.set('Content-Length', fileLength.toString());
-      await request.response.close();
       return;
     }
 
+    final contentType = _contentTypeForPath(route.url);
+
     // Handle virtual segment requests (?start=X&end=Y) from HLS playlists.
-    // These serve a byte range as a normal 200 response (not 206), which is
-    // how HLS segment requests work — each segment is a complete resource.
-    //
-    // Each segment is prepended with cached PAT+PMT packets so the
-    // Chromecast's TS demuxer can initialize independently per segment.
+    // These use Dart's normal HTTP/1.1 response (Chromecast handles it fine).
     final startParam = request.uri.queryParameters['start'];
     final endParam = request.uri.queryParameters['end'];
     if (startParam != null && endParam != null) {
@@ -840,8 +897,6 @@ class MediaProxy {
       final end = int.parse(endParam);
       final segmentLength = end - start + 1;
 
-      // Prepend PAT+PMT for segments that don't start at file offset 0
-      // (the first segment already contains the original PAT/PMT).
       final patPmt = (start > 0) ? _tsPatPmt : null;
       final patPmtLength = patPmt?.length ?? 0;
       final totalLength = segmentLength + patPmtLength;
@@ -851,9 +906,8 @@ class MediaProxy {
           '($segmentLength bytes${patPmtLength > 0 ? ' + ${patPmtLength}B PAT/PMT' : ''})');
 
       request.response.statusCode = HttpStatus.ok;
-      request.response.headers.set('Content-Length', totalLength.toString());
+      request.response.contentLength = totalLength;
 
-      // Write PAT+PMT first so the demuxer knows the stream layout
       if (patPmt != null) {
         request.response.add(patPmt);
       }
@@ -870,54 +924,18 @@ class MediaProxy {
       return;
     }
 
-    // Handle Range requests
-    final rangeHeader = request.headers.value('Range');
-    if (rangeHeader != null && rangeHeader.startsWith('bytes=')) {
-      final rangeSpec = rangeHeader.substring('bytes='.length);
-      final parts = rangeSpec.split('-');
-
-      int start;
-      int end;
-
-      if (parts[0].isEmpty) {
-        // Suffix range: bytes=-500 means last 500 bytes
-        final suffixLength = int.parse(parts[1]);
-        start = (fileLength - suffixLength).clamp(0, fileLength - 1);
-        end = fileLength - 1;
-      } else {
-        start = int.parse(parts[0]);
-        end = (parts[1].isNotEmpty ? int.parse(parts[1]) : fileLength - 1)
-            .clamp(0, fileLength - 1);
-      }
-
-      final length = end - start + 1;
-
-      // If the range covers the entire file, respond with 200 OK instead
-      // of 206 Partial Content. Some DLNA renderers reject 206 for the
-      // initial full-file request (Range: bytes=0-).
-      if (start == 0 && end == fileLength - 1) {
-        request.response.statusCode = HttpStatus.ok;
-        request.response.headers.set('Content-Length', fileLength.toString());
-      } else {
-        request.response.statusCode = HttpStatus.partialContent;
-        request.response.headers
-            .set('Content-Range', 'bytes $start-$end/$fileLength');
-        request.response.headers.set('Content-Length', length.toString());
-      }
-
-      CastLogger.debug(
-          'MediaProxy: serving bytes $start-$end/$fileLength (${length} bytes)');
-
-      // Stream the file range instead of reading it all into memory.
-      // For large files (400MB+), reading into memory causes timeouts.
-      await file.openRead(start, end + 1).pipe(request.response);
-      return;
+    // For all other file requests (DLNA, direct play), use raw HTTP/1.0
+    // response. Some DLNA renderers (TCL Google TV) reject HTTP/1.1.
+    // Detach the socket from Dart's HttpServer and write HTTP/1.0 manually.
+    final socket = await request.response.detachSocket(writeHeaders: false);
+    try {
+      await Http10FileServer.serve(socket, file, request,
+          contentType: contentType);
+    } catch (e) {
+      CastLogger.error('MediaProxy: raw socket file serve error: $e');
+    } finally {
+      await socket.close();
     }
-
-    // Full file
-    CastLogger.debug('MediaProxy: serving full file ($fileLength bytes)');
-    request.response.headers.set('Content-Length', fileLength.toString());
-    await file.openRead().pipe(request.response);
   }
 
   bool _isSubtitleFile(String path) {
@@ -964,6 +982,9 @@ class MediaProxy {
     }
     if (lower.endsWith('.ts')) {
       return ContentType('video', 'mp2t');
+    }
+    if (lower.endsWith('.mkv')) {
+      return ContentType('video', 'x-matroska');
     }
     if (lower.endsWith('.vtt')) {
       return ContentType('text', 'vtt');

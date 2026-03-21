@@ -33,6 +33,8 @@ class DlnaSoapBuilder {
     String url, {
     String? title,
     String? subtitleUrl,
+    String? subtitleFormat,
+    List<({String url, String format})>? subtitleVariants,
     String protocolInfo = 'http-get:*:video/mp4:*',
     String? duration,
     int? size,
@@ -42,15 +44,23 @@ class DlnaSoapBuilder {
 
     // Subtitle elements — use multiple vendor-specific approaches for
     // maximum TV compatibility. No DLNA standard exists for external subs.
+    // When subtitleVariants is provided (e.g., both SRT and VTT), include
+    // all variants so the TV can pick whichever format it supports.
     final subtitleElements = StringBuffer();
-    if (subtitleUrl != null) {
-      final escapedSubUrl = _escapeXml(subtitleUrl);
-      // Samsung: sec:CaptionInfoEx (modern Samsung TVs)
+    final variants = subtitleVariants ??
+        (subtitleUrl != null
+            ? [(url: subtitleUrl, format: subtitleFormat ?? 'srt')]
+            : <({String url, String format})>[]);
+    for (final variant in variants) {
+      final escapedSubUrl = _escapeXml(variant.url);
+      final subType = variant.format;
+      final subMime = 'text/$subType';
+      // Samsung: sec:CaptionInfoEx
       subtitleElements.write(
-          '<sec:CaptionInfoEx sec:type="srt">$escapedSubUrl</sec:CaptionInfoEx>');
-      // Generic: separate <res> element with text/srt MIME (LG, Panasonic, Roku)
+          '<sec:CaptionInfoEx sec:type="$subType">$escapedSubUrl</sec:CaptionInfoEx>');
+      // Generic: separate <res> element with subtitle MIME
       subtitleElements.write(
-          '<res protocolInfo="http-get:*:text/srt:*">$escapedSubUrl</res>');
+          '<res protocolInfo="http-get:*:$subMime:*">$escapedSubUrl</res>');
     }
 
     // Build optional <res> attributes for duration and size

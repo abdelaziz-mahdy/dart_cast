@@ -580,6 +580,7 @@ class ChromecastSession extends CastSession {
     return switch (type) {
       CastMediaType.hls => 'application/x-mpegURL',
       CastMediaType.mp4 => 'video/mp4',
+      CastMediaType.mkv => 'video/x-matroska',
       CastMediaType.mpegTs => 'video/mp2t',
     };
   }
