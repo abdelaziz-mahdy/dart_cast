@@ -1,3 +1,8 @@
+## 0.4.1
+
+- Updated example app to showcase DLNA improvements (MKV subtitle remux, HTTP/1.0 file serving, subtitle converters)
+- Added protocol feature indicators in example device picker
+
 ## 0.4.0
 
 ### Breaking

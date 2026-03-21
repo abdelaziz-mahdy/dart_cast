@@ -66,11 +66,38 @@ class CastMediaDemo {
     ],
   );
 
+  /// Sample MKV with embedded subtitles — demonstrates the MKV container
+  /// support added in dart_cast 0.4.0.
+  ///
+  /// When casting a local file via DLNA with subtitles, the recommended
+  /// approach is to remux to MKV with an embedded SRT track. DLNA TVs
+  /// handle embedded MKV subtitles more reliably than external sidecar files.
+  ///
+  /// For this demo we use a remote MP4 URL — in a real app you'd use
+  /// [CastMedia.file] with a local MKV path:
+  ///
+  /// ```dart
+  /// CastMedia.file(
+  ///   filePath: '/path/to/video.mkv',
+  ///   type: CastMediaType.mkv,
+  ///   title: 'My Video (MKV + embedded subs)',
+  /// )
+  /// ```
+  static const mkvWithEmbeddedSubs = CastMedia(
+    url:
+        'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4',
+    type: CastMediaType.mkv,
+    title: 'Tears of Steel (MKV demo)',
+    imageUrl:
+        'https://upload.wikimedia.org/wikipedia/commons/thumb/6/6d/Tears_of_Steel_poster.jpg/220px-Tears_of_Steel_poster.jpg',
+  );
+
   /// All available sample media items.
   static const List<CastMedia> allMedia = [
     hlsStream,
     hlsTearsOfSteel,
     mp4Video,
     mp4TearsOfSteel,
+    mkvWithEmbeddedSubs,
   ];
 }

@@ -94,6 +94,9 @@ class _DeviceDiscoveryPageState extends State<DeviceDiscoveryPage> {
     if (lower.contains('.ts')) {
       return CastMediaType.mpegTs;
     }
+    if (lower.contains('.mkv')) {
+      return CastMediaType.mkv;
+    }
     return CastMediaType.mp4;
   }
 
@@ -488,7 +491,9 @@ class _DeviceDiscoveryPageState extends State<DeviceDiscoveryPage> {
                     leading: Icon(
                       media.type == CastMediaType.hls
                           ? Icons.live_tv
-                          : Icons.movie,
+                          : media.type == CastMediaType.mkv
+                              ? Icons.video_library
+                              : Icons.movie,
                     ),
                     title: Text(media.title ?? 'Custom Video'),
                     subtitle: Text(

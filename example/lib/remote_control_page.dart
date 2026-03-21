@@ -556,6 +556,8 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
         return const Icon(Icons.live_tv);
       case CastMediaType.mp4:
         return const Icon(Icons.movie);
+      case CastMediaType.mkv:
+        return const Icon(Icons.video_library);
       case CastMediaType.mpegTs:
         return const Icon(Icons.video_file);
     }
