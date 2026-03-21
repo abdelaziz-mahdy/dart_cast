@@ -27,6 +27,7 @@ class DlnaSession extends CastSession {
   CastSubtitle? _currentSubtitle;
   String? _currentProxyUrl;
   String? _currentProtocolInfo;
+  Duration? _pendingSeekPosition;
 
   /// Creates a [DlnaSession] for the given [device] and [description].
   ///
@@ -204,9 +205,12 @@ class DlnaSession extends CastSession {
 
     stateMachine.transitionTo(SessionState.playing);
 
-    // Seek to start position if specified (e.g., resuming from where user left off)
+    // Save start position — will seek after TV confirms PLAYING via poll.
+    // Seeking immediately after Play fails because the TV hasn't loaded yet.
     if (media.startPosition != null && media.startPosition! > Duration.zero) {
-      await seek(media.startPosition!);
+      _pendingSeekPosition = media.startPosition;
+      CastLogger.info(
+          'DLNA: deferred seek to ${media.startPosition!.inSeconds}s (waiting for TV to load)');
     }
 
     // Start position polling
@@ -453,6 +457,14 @@ class DlnaSession extends CastSession {
         if (state != SessionState.playing &&
             stateMachine.canTransitionTo(SessionState.playing)) {
           stateMachine.transitionTo(SessionState.playing);
+        }
+        // Execute deferred seek now that the TV has loaded and is playing.
+        if (_pendingSeekPosition != null) {
+          final pos = _pendingSeekPosition!;
+          _pendingSeekPosition = null;
+          CastLogger.info(
+              'DLNA: executing deferred seek to ${pos.inSeconds}s');
+          seek(pos);
         }
         break;
       case 'PAUSED_PLAYBACK':
