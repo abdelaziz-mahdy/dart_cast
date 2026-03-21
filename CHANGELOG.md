@@ -1,7 +1,16 @@
 ## 0.4.1
 
-- Updated example app to showcase DLNA improvements (MKV subtitle remux, HTTP/1.0 file serving, subtitle converters)
+### Fixed
+- DLNA start position: seek now deferred until TV confirms PLAYING state (immediate seek was ignored by TVs still loading)
+- Chromecast subtitles for local files: subtitle files now served via HTTP/1.1 with CORS headers (HTTP/1.0 path lacked `Access-Control-Allow-Origin` required by Shaka Player)
+- `Http10FileServer`: returns 416 Range Not Satisfiable for invalid/out-of-bounds ranges
+- `SubtitleConverter.vttToSrt()`: uses targeted regex for timestamp dots (no longer corrupts non-timestamp content), expands 2-component MM:SS timestamps to HH:MM:SS
+- Removed stray `response.close()` after socket detach in synthetic content handler
+
+### New
+- Updated example app with optimistic slider state, keyboard shortcuts, mute toggle, and responsive layout
 - Added protocol feature indicators in example device picker
+- Updated README with "What Works Where" feature matrix, protocol notes, and DLNA local files guide
 
 ## 0.4.0
 
