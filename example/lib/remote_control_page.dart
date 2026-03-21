@@ -2,8 +2,65 @@ import 'dart:async';
 
 import 'package:dart_cast/dart_cast.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'cast_media_demo.dart';
+
+/// Prevents slider jitter by ignoring polled values during and after user
+/// interaction.
+///
+/// State machine: IDLE -> DRAGGING -> LOCKED -> IDLE
+/// - IDLE: display polled value from the device
+/// - DRAGGING: display user's drag position, ignore polls
+/// - LOCKED: display last sent value for [_lockDuration], ignore polls
+class OptimisticSliderState {
+  double? _dragValue;
+  double? _lockedValue;
+  Timer? _lockTimer;
+  final VoidCallback _onStateChanged;
+  static const _lockDuration = Duration(seconds: 3);
+
+  OptimisticSliderState({required VoidCallback onStateChanged})
+      : _onStateChanged = onStateChanged;
+
+  double displayValue(double polledValue) {
+    return _dragValue ?? _lockedValue ?? polledValue;
+  }
+
+  bool get isDragging => _dragValue != null;
+
+  void onDragUpdate(double value) {
+    _lockTimer?.cancel();
+    _lockedValue = null;
+    _dragValue = value;
+    _onStateChanged();
+  }
+
+  void onDragEnd(double value, VoidCallback onSend) {
+    _dragValue = null;
+    _lock(value);
+    onSend();
+  }
+
+  /// Lock to a value after a programmatic action (keyboard shortcut, mute).
+  void lock(double value) {
+    _lock(value);
+  }
+
+  void _lock(double value) {
+    _lockedValue = value;
+    _lockTimer?.cancel();
+    _lockTimer = Timer(_lockDuration, () {
+      _lockedValue = null;
+      _onStateChanged();
+    });
+    _onStateChanged();
+  }
+
+  void dispose() {
+    _lockTimer?.cancel();
+  }
+}
 
 /// Remote control page for an active cast session.
 ///
@@ -11,6 +68,8 @@ import 'cast_media_demo.dart';
 /// - Reactive UI via [StreamBuilder] for position, duration, state, and volume
 /// - Loading media with [CastSession.loadMedia]
 /// - Play/pause/stop/seek/volume controls
+/// - Optimistic slider state to prevent jitter
+/// - Keyboard shortcuts (Space, arrows, M)
 /// - Subtitle selection
 /// - Graceful error handling
 /// - Disconnecting and disposing resources
@@ -36,13 +95,26 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
   CastMedia? _currentMedia;
   CastSubtitle? _selectedSubtitle;
   double _volume = 0.25;
-  bool _isSeeking = false;
-  double _seekValue = 0;
+  double _lastVolumeBeforeMute = 0.5;
   StreamSubscription<SessionState>? _stateSubscription;
+  StreamSubscription<double>? _volumeSubscription;
+
+  late final OptimisticSliderState _seekState;
+  late final OptimisticSliderState _volumeState;
 
   @override
   void initState() {
     super.initState();
+    _seekState = OptimisticSliderState(onStateChanged: () {
+      if (mounted) setState(() {});
+    });
+    _volumeState = OptimisticSliderState(onStateChanged: () {
+      if (mounted) setState(() {});
+    });
+    // Track volume from the device stream.
+    _volumeSubscription = widget.session.volumeStream.listen((vol) {
+      _volume = vol;
+    });
     // Auto-pop when the session disconnects (e.g., device-side disconnect)
     _stateSubscription = widget.session.stateStream.listen((state) {
       if (state == SessionState.disconnected && mounted) {
@@ -55,7 +127,10 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
 
   @override
   void dispose() {
+    _seekState.dispose();
+    _volumeState.dispose();
     _stateSubscription?.cancel();
+    _volumeSubscription?.cancel();
     // Stop playback when closing the remote
     widget.session.stop().catchError((_) {});
     super.dispose();
@@ -63,59 +138,150 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(widget.device.name),
-        actions: [
-          // Disconnect button in the app bar.
-          IconButton(
-            icon: const Icon(Icons.cast_connected),
-            tooltip: 'Disconnect',
-            onPressed: _disconnect,
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          // -- Session state indicator --
-          _buildStateBar(),
-          Expanded(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // -- Device info --
-                  _buildDeviceInfo(),
-                  const SizedBox(height: 24),
-                  // -- Media selector --
-                  _buildMediaSelector(),
-                  const SizedBox(height: 24),
-                  // -- Now playing info --
-                  if (_currentMedia != null) ...[
-                    _buildNowPlaying(),
-                    const SizedBox(height: 24),
-                    // -- Seek slider --
-                    _buildSeekSlider(),
-                    const SizedBox(height: 16),
-                    // -- Playback controls --
-                    _buildPlaybackControls(),
-                    const SizedBox(height: 24),
-                    // -- Volume slider --
-                    _buildVolumeSlider(),
-                    const SizedBox(height: 24),
-                    // -- Subtitle selector --
-                    if (_currentMedia!.subtitles.isNotEmpty)
-                      _buildSubtitleSelector(),
-                  ],
-                ],
-              ),
+    return Focus(
+      autofocus: true,
+      onKeyEvent: _handleKeyEvent,
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(widget.device.name),
+          actions: [
+            // Disconnect button in the app bar.
+            IconButton(
+              icon: const Icon(Icons.cast_connected),
+              tooltip: 'Disconnect',
+              onPressed: _disconnect,
+            ),
+          ],
+        ),
+        body: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 500),
+            child: Column(
+              children: [
+                // -- Session state indicator --
+                _buildStateBar(),
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        // -- Device info --
+                        _buildDeviceInfo(),
+                        const SizedBox(height: 24),
+                        // -- Media selector --
+                        _buildMediaSelector(),
+                        const SizedBox(height: 24),
+                        // -- Now playing info --
+                        if (_currentMedia != null) ...[
+                          _buildNowPlaying(),
+                          const SizedBox(height: 24),
+                          // -- Seek slider --
+                          _buildSeekSlider(),
+                          const SizedBox(height: 16),
+                          // -- Playback controls --
+                          _buildPlaybackControls(),
+                          const SizedBox(height: 24),
+                          // -- Volume slider --
+                          _buildVolumeSlider(),
+                          const SizedBox(height: 24),
+                          // -- Subtitle selector --
+                          if (_currentMedia!.subtitles.isNotEmpty)
+                            _buildSubtitleSelector(),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
-        ],
+        ),
       ),
     );
   }
+
+  // -- Keyboard shortcuts --
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+
+    final key = event.logicalKey;
+
+    // Space: play/pause
+    if (key == LogicalKeyboardKey.space) {
+      final state = widget.session.state;
+      if (state == SessionState.playing) {
+        _pause();
+      } else {
+        _play();
+      }
+      return KeyEventResult.handled;
+    }
+
+    // Left arrow: seek back 10s
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      final dur = widget.session.duration;
+      if (dur <= Duration.zero) return KeyEventResult.ignored;
+      final pos = widget.session.position;
+      final target = pos - const Duration(seconds: 10);
+      final clamped = target.isNegative ? Duration.zero : target;
+      _seek(clamped);
+      _seekState
+          .lock(clamped.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble()));
+      return KeyEventResult.handled;
+    }
+
+    // Right arrow: seek forward 30s
+    if (key == LogicalKeyboardKey.arrowRight) {
+      final dur = widget.session.duration;
+      if (dur <= Duration.zero) return KeyEventResult.ignored;
+      final pos = widget.session.position;
+      final target = pos + const Duration(seconds: 30);
+      final clamped = target > dur ? dur : target;
+      _seek(clamped);
+      _seekState
+          .lock(clamped.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble()));
+      return KeyEventResult.handled;
+    }
+
+    // Up arrow: volume up
+    if (key == LogicalKeyboardKey.arrowUp) {
+      final vol = _volumeState.displayValue(_volume.clamp(0.0, 1.0));
+      final newVol = (vol + 0.1).clamp(0.0, 1.0);
+      _setVolume(newVol);
+      _volumeState.lock(newVol);
+      return KeyEventResult.handled;
+    }
+
+    // Down arrow: volume down
+    if (key == LogicalKeyboardKey.arrowDown) {
+      final vol = _volumeState.displayValue(_volume.clamp(0.0, 1.0));
+      final newVol = (vol - 0.1).clamp(0.0, 1.0);
+      _setVolume(newVol);
+      _volumeState.lock(newVol);
+      return KeyEventResult.handled;
+    }
+
+    // M: mute toggle
+    if (key == LogicalKeyboardKey.keyM) {
+      final vol = _volumeState.displayValue(_volume.clamp(0.0, 1.0));
+      if (vol > 0) {
+        _lastVolumeBeforeMute = vol;
+        _setVolume(0);
+        _volumeState.lock(0);
+      } else {
+        final restored = _lastVolumeBeforeMute > 0 ? _lastVolumeBeforeMute : 0.5;
+        _setVolume(restored);
+        _volumeState.lock(restored);
+      }
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
+  }
+
+  // -- Widgets --
 
   /// Shows the current session state as a colored bar at the top.
   Widget _buildStateBar() {
@@ -263,38 +429,39 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     );
   }
 
-  /// Seek slider that updates reactively from the session position stream.
+  /// Seek slider using [OptimisticSliderState] to prevent jitter.
   Widget _buildSeekSlider() {
-    // StreamBuilder listens to positionStream for live position updates.
     return StreamBuilder<Duration>(
       stream: widget.session.positionStream,
       initialData: widget.session.position,
       builder: (context, posSnapshot) {
-        // Also listen to durationStream for the total media length.
         return StreamBuilder<Duration>(
           stream: widget.session.durationStream,
           initialData: widget.session.duration,
           builder: (context, durSnapshot) {
             final position = posSnapshot.data ?? Duration.zero;
             final duration = durSnapshot.data ?? Duration.zero;
-            final totalSeconds = duration.inSeconds.toDouble();
-            final currentSeconds = _isSeeking
-                ? _seekValue
-                : position.inSeconds.toDouble().clamp(0.0, totalSeconds);
+            final maxSeconds = duration.inSeconds.toDouble();
+            final polledSeconds = maxSeconds > 0
+                ? position.inSeconds.toDouble().clamp(0.0, maxSeconds)
+                : 0.0;
+            final displaySeconds = _seekState.displayValue(polledSeconds);
 
             return Column(
               children: [
                 Slider(
-                  value: totalSeconds > 0 ? currentSeconds : 0,
-                  max: totalSeconds > 0 ? totalSeconds : 1,
-                  onChangeStart: (_) => _isSeeking = true,
-                  onChanged: (value) {
-                    setState(() => _seekValue = value);
-                  },
-                  onChangeEnd: (value) {
-                    _isSeeking = false;
-                    _seek(Duration(seconds: value.toInt()));
-                  },
+                  value: maxSeconds > 0
+                      ? displaySeconds.clamp(0.0, maxSeconds)
+                      : 0,
+                  max: maxSeconds > 0 ? maxSeconds : 1,
+                  onChanged: maxSeconds > 0
+                      ? (value) => _seekState.onDragUpdate(value)
+                      : null,
+                  onChangeEnd: maxSeconds > 0
+                      ? (value) => _seekState.onDragEnd(value, () {
+                            _seek(Duration(seconds: value.toInt()));
+                          })
+                      : null,
                 ),
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -302,9 +469,7 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       Text(_formatDuration(
-                        _isSeeking
-                            ? Duration(seconds: _seekValue.toInt())
-                            : position,
+                        Duration(seconds: displaySeconds.toInt()),
                       )),
                       Text(_formatDuration(duration)),
                     ],
@@ -318,7 +483,7 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     );
   }
 
-  /// Play/pause/stop buttons.
+  /// Play/pause and disconnect controls.
   Widget _buildPlaybackControls() {
     return StreamBuilder<SessionState>(
       stream: widget.session.stateStream,
@@ -332,15 +497,7 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
         return Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // Stop button
-            IconButton.filled(
-              iconSize: 32,
-              onPressed: _stop,
-              icon: const Icon(Icons.stop),
-              tooltip: 'Stop',
-            ),
-            const SizedBox(width: 16),
-            // Play/Pause toggle — the primary control.
+            // Play/Pause toggle
             IconButton.filled(
               iconSize: 48,
               onPressed: isBuffering ? null : (isPlaying ? _pause : _play),
@@ -374,35 +531,56 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     );
   }
 
-  /// Volume slider with reactive updates from the session volume stream.
+  /// Volume slider with [OptimisticSliderState] and mute toggle icon.
   Widget _buildVolumeSlider() {
     return StreamBuilder<double>(
       stream: widget.session.volumeStream,
       initialData: _volume,
       builder: (context, snapshot) {
-        final vol = snapshot.data ?? _volume;
+        final polledVol = (snapshot.data ?? 0.25).clamp(0.0, 1.0);
+        final displayVol = _volumeState.displayValue(polledVol);
+
         return Row(
           children: [
-            Icon(
-              vol == 0
-                  ? Icons.volume_off
-                  : vol < 0.5
-                      ? Icons.volume_down
-                      : Icons.volume_up,
+            // Mute toggle icon
+            IconButton(
+              iconSize: 20,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              icon: Icon(
+                displayVol <= 0
+                    ? Icons.volume_off
+                    : displayVol < 0.5
+                        ? Icons.volume_down
+                        : Icons.volume_up,
+              ),
+              onPressed: () {
+                if (displayVol > 0) {
+                  _lastVolumeBeforeMute = displayVol;
+                  _setVolume(0);
+                  _volumeState.lock(0);
+                } else {
+                  final restored =
+                      _lastVolumeBeforeMute > 0 ? _lastVolumeBeforeMute : 0.5;
+                  _setVolume(restored);
+                  _volumeState.lock(restored);
+                }
+              },
+              tooltip: displayVol > 0 ? 'Mute' : 'Unmute',
             ),
             Expanded(
               child: Slider(
-                value: vol.clamp(0.0, 1.0),
-                onChanged: (value) {
-                  setState(() => _volume = value);
+                value: displayVol.clamp(0.0, 1.0),
+                onChanged: (value) => _volumeState.onDragUpdate(value),
+                onChangeEnd: (value) => _volumeState.onDragEnd(value, () {
                   _setVolume(value);
-                },
+                }),
               ),
             ),
             SizedBox(
               width: 40,
               child: Text(
-                '${(vol * 100).round()}%',
+                '${(displayVol * 100).round()}%',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ),
@@ -456,7 +634,7 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     try {
       await widget.session.loadMedia(media);
       // Apply default volume to the device after loading.
-      await widget.session.setVolume(_volume);
+      await widget.session.setVolume(0.25);
     } catch (e) {
       _showError('Failed to load media: $e');
     }
@@ -475,14 +653,6 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
       await widget.session.pause();
     } catch (e) {
       _showError('Pause failed: $e');
-    }
-  }
-
-  Future<void> _stop() async {
-    try {
-      await widget.session.stop();
-    } catch (e) {
-      _showError('Stop failed: $e');
     }
   }
 
