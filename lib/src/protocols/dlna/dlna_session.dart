@@ -204,6 +204,11 @@ class DlnaSession extends CastSession {
 
     stateMachine.transitionTo(SessionState.playing);
 
+    // Seek to start position if specified (e.g., resuming from where user left off)
+    if (media.startPosition != null && media.startPosition! > Duration.zero) {
+      await seek(media.startPosition!);
+    }
+
     // Start position polling
     _startPolling();
   }
