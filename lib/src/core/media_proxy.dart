@@ -864,24 +864,20 @@ class MediaProxy {
         content = SubtitleConverter.stripTimestampMap(content);
       }
 
-      // Serve subtitle via HTTP/1.0 for DLNA TV compatibility
+      // Serve subtitles via HTTP/1.1 with CORS — Chromecast's Shaka Player
+      // requires Access-Control-Allow-Origin. DLNA TVs don't fetch subtitles
+      // via sidecar URLs anyway, so HTTP/1.1 is fine here.
       final encoded = utf8.encode(content);
-      final socket = await request.response.detachSocket(writeHeaders: false);
-      try {
-        final isVtt = content.trimLeft().startsWith('WEBVTT');
-        final mime = isVtt ? 'text/vtt' : 'text/srt';
-        final headers = StringBuffer();
-        headers.write('HTTP/1.0 200 OK\r\n');
-        headers.write('Content-Type: $mime\r\n');
-        headers.write('Content-Length: ${encoded.length}\r\n');
-        headers.write('\r\n');
-        socket.add(utf8.encode(headers.toString()));
-        if (request.method != 'HEAD') {
-          socket.add(encoded);
-        }
-      } finally {
-        await socket.close();
+      final isVtt = content.trimLeft().startsWith('WEBVTT');
+      _addCorsHeaders(request.response);
+      request.response.statusCode = HttpStatus.ok;
+      request.response.headers.contentType =
+          ContentType('text', isVtt ? 'vtt' : 'srt');
+      request.response.contentLength = encoded.length;
+      if (request.method != 'HEAD') {
+        request.response.add(encoded);
       }
+      await request.response.close();
       return;
     }
 
