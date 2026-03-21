@@ -1,8 +1,16 @@
 /// Media type for casting.
 enum CastMediaType {
+  /// HTTP Live Streaming (m3u8 playlist with TS/fMP4 segments).
   hls,
+
+  /// MP4 container (H.264/AAC). Best Chromecast compatibility.
   mp4,
+
+  /// Matroska container. Supports embedded SRT/ASS subtitle tracks.
+  /// Recommended for DLNA casting with subtitles.
   mkv,
+
+  /// Raw MPEG Transport Stream.
   mpegTs,
 }
 

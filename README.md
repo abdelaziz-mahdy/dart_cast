@@ -203,10 +203,6 @@ A built-in HTTP proxy server that handles header injection. Used internally by p
 - `registerMedia(url, headers: {...})` -- returns a proxy URL
 - `registerFile(filePath)` -- serves a local file over HTTP
 
-### Http10FileServer
-
-HTTP/1.0 raw socket file server for DLNA compatibility. Some TVs (e.g., TCL Google TV) reject files served over Dart's default HTTP/1.1 server. This server handles byte-range requests (206 Partial Content) for seeking support.
-
 ### SubtitleConverter
 
 Format conversion utilities for subtitles.
@@ -269,16 +265,26 @@ Cast devices cannot send custom HTTP headers (like `Referer` or cookies) when fe
 
 ## DLNA Local Files
 
-For local file casting over DLNA, files are served via `Http10FileServer` with byte-range support for seeking. To include subtitles, remux SRT into an MKV container -- most DLNA TVs ignore sidecar subtitle URLs.
+DLNA local file casting works out of the box -- just use `CastMedia.file()` with `CastMediaType.mp4` or `.mkv`. The proxy handles HTTP serving automatically (using HTTP/1.0 for maximum TV compatibility).
 
-```dart
-// Serve a local MKV file (with embedded SRT subtitles) over DLNA
-final fileServer = Http10FileServer();
-final url = await fileServer.serve(File('/path/to/video.mkv'));
-await dlnaSession.loadMedia(CastMedia(url: url, type: CastMediaType.mkv));
+For **subtitles**, most DLNA TVs ignore sidecar subtitle URLs. The reliable approach is to embed SRT into an MKV container using ffmpeg before casting:
+
+```bash
+# Remux video + subtitle into MKV (fast, no re-encoding)
+ffmpeg -i video.mp4 -i subtitle.srt -map 0 -map 1 -c copy -c:s srt output.mkv
 ```
 
-For SRT subtitle embedding, use ffmpeg to remux the video and subtitle into MKV before casting. See the example app for a complete implementation.
+```dart
+// Cast the MKV with embedded subtitles
+await session.loadMedia(CastMedia.file(
+  filePath: '/path/to/output.mkv',
+  type: CastMediaType.mkv,
+  title: 'My Video',
+  startPosition: Duration(minutes: 5), // resume from saved position
+));
+```
+
+See the [example app](example/) for a complete implementation with ffmpeg remuxing.
 
 ## Pluggable Discovery
 
