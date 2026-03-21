@@ -663,7 +663,6 @@ class MediaProxy {
     } finally {
       await socket.close();
     }
-    await request.response.close();
   }
 
   Future<void> _handleHlsStreamRequest(

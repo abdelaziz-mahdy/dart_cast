@@ -67,6 +67,17 @@ class Http10FileServer {
       statusText = 'Partial Content';
     }
 
+    // Validate range: start must not exceed end or file length
+    if (start > end || start >= fileLength) {
+      final errorHeaders = StringBuffer();
+      errorHeaders.write('HTTP/1.0 416 Range Not Satisfiable\r\n');
+      errorHeaders.write('Content-Range: bytes */$fileLength\r\n');
+      errorHeaders.write('Content-Length: 0\r\n');
+      errorHeaders.write('\r\n');
+      socket.add(utf8.encode(errorHeaders.toString()));
+      return;
+    }
+
     final length = end - start + 1;
 
     // Write HTTP/1.0 response headers

@@ -82,6 +82,17 @@ void main() {
         expect(srt, contains('Test'));
       });
 
+      test('handles 2-component MM:SS.mmm timestamps', () {
+        const vtt = 'WEBVTT\n\n'
+            '01:30.500 --> 01:35.250\n'
+            'Short timestamp\n';
+
+        final srt = SubtitleConverter.vttToSrt(vtt);
+
+        expect(srt, contains('00:01:30,500 --> 00:01:35,250'));
+        expect(srt, contains('Short timestamp'));
+      });
+
       test('adds sequence numbers', () {
         const vtt = 'WEBVTT\n\n'
             '00:00:01.000 --> 00:00:02.000\n'
