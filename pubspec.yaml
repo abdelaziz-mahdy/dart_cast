@@ -1,6 +1,6 @@
 name: dart_cast
 description: A pure Dart cross-platform casting package supporting Chromecast (CASTV2), AirPlay, and DLNA with built-in HTTP proxy for header injection.
-version: 0.4.2
+version: 0.4.3
 repository: https://github.com/abdelaziz-mahdy/dart_cast
 homepage: https://github.com/abdelaziz-mahdy/dart_cast
 issue_tracker: https://github.com/abdelaziz-mahdy/dart_cast/issues
