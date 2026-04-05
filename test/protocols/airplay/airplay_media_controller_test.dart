@@ -68,7 +68,8 @@ Future<({ServerSocket server, HapSession client})> createEncryptedPair() async {
 const _featuresV1 = AirPlayFeatures(0x1); // supportsVideoV1 = true
 // Features bitmask: bit 49 (V2 video) set
 const _featuresV2 = AirPlayFeatures(1 << 49); // supportsVideoV2 = true
-// Both V1 and V2
+// Both V1 and V2 (kept for future tests)
+// ignore: unused_element
 const _featuresBoth = AirPlayFeatures((1 << 49) | 0x1);
 // No video support
 const _featuresNone = AirPlayFeatures(0);
@@ -501,7 +502,7 @@ void main() {
       server.listen((sock) async {
         final srvSess = _serverSession(sock, server.port);
         try {
-          final data = await srvSess.readDecryptedData();
+          await srvSess.readDecryptedData();
           requestCount++;
           await _sendResponse(srvSess, sock, 200, 'OK');
         } catch (_) {}

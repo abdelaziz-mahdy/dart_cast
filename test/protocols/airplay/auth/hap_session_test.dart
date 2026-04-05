@@ -1020,7 +1020,6 @@ void main() {
       clientSession = pair.client;
 
       final originalSessionId = clientSession.sessionId;
-      int requestCount = 0;
 
       server.listen((sock) async {
         final srvSession = _serverSession(sock, server.port);
@@ -1028,7 +1027,6 @@ void main() {
           // Handle multiple requests
           while (true) {
             final data = await srvSession.readDecryptedData();
-            requestCount++;
             final requestStr = utf8.decode(data);
 
             // Always respond 200 OK
