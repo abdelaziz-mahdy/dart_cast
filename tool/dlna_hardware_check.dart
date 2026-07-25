@@ -16,6 +16,9 @@
 //   --seconds=20         how long to watch playback for
 //   --subtitle=<path>    sidecar subtitle file (.srt/.vtt) for the second pass
 //   --skip-subtitles     run only the no-subtitle pass
+//   --as-source          feed the file through MediaSource instead of a path,
+//                        exercising the byte-source path a content:// or asset
+//                        would take
 //   --quiet              hide DEBUG lines
 
 import 'dart:async';
@@ -24,6 +27,7 @@ import 'dart:io';
 import 'package:dart_cast/src/core/cast_device.dart';
 import 'package:dart_cast/src/core/cast_media.dart';
 import 'package:dart_cast/src/core/cast_session.dart';
+import 'package:dart_cast/src/core/media_source.dart';
 import 'package:dart_cast/src/protocols/dlna/dlna_discovery_provider.dart';
 import 'package:dart_cast/src/protocols/dlna/dlna_session.dart';
 import 'package:dart_cast/src/utils/logger.dart';
@@ -36,6 +40,7 @@ Future<void> main(List<String> args) async {
   final watchSeconds = int.tryParse(options['seconds'] ?? '') ?? 20;
   final subtitlePath = options['subtitle'];
   final skipSubtitles = args.contains('--skip-subtitles');
+  final asSource = args.contains('--as-source');
 
   if (positional.isEmpty) {
     stderr.writeln(
@@ -87,12 +92,13 @@ Future<void> main(List<String> args) async {
   // -- 2. Run the passes ---------------------------------------------------
   final results = <String, bool>{};
 
-  results['no subtitles'] = await _runPass(
+  results[asSource ? 'byte source' : 'no subtitles'] = await _runPass(
     target: target,
     mediaPath: mediaPath,
     subtitlePath: null,
     watchSeconds: watchSeconds,
-    label: 'no subtitles',
+    label: asSource ? 'byte source' : 'no subtitles',
+    asSource: asSource,
   );
 
   if (!skipSubtitles) {
@@ -131,6 +137,7 @@ Future<bool> _runPass({
   required String? subtitlePath,
   required int watchSeconds,
   required String label,
+  bool asSource = false,
 }) async {
   _step('Pass: $label', mediaPath);
 
@@ -161,8 +168,27 @@ Future<bool> _runPass({
     ];
 
     final isLocal = !mediaPath.startsWith('http');
+
+    // Exercise the caller-supplied byte-source path: identical to what an
+    // Android content:// URI or a Flutter asset would go through.
+    CastMedia? sourceMedia;
+    if (asSource) {
+      final source = await MediaSource.file(
+        File(mediaPath),
+        contentType: 'video/mp4',
+      );
+      stdout.writeln('  serving via MediaSource (${source.length} bytes)');
+      sourceMedia = CastMedia.source(
+        source,
+        type: _typeFor(mediaPath),
+        fileExtension: '.mp4',
+        title: 'dart_cast byte-source check',
+      );
+    }
+
     final media =
-        isLocal
+        sourceMedia ??
+        (isLocal
             ? CastMedia.file(
               filePath: mediaPath,
               type: _typeFor(mediaPath),
@@ -174,7 +200,7 @@ Future<bool> _runPass({
               type: _typeFor(mediaPath),
               title: 'dart_cast hardware check',
               subtitles: subtitles,
-            );
+            ));
 
     await session.loadMedia(media);
     stdout.writeln('  loadMedia returned, state=${session.state}');
