@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 /// Reads a byte range from a [MediaSource].
@@ -6,7 +7,42 @@ import 'dart:io';
 /// [File.openRead]. A source is asked for ranges whenever the cast device
 /// seeks, so this must be able to start from an arbitrary offset — returning
 /// the whole payload and ignoring the arguments will break seeking.
-typedef MediaSourceReader = Stream<List<int>> Function(int start, int end);
+///
+/// May return the stream directly, or a `Future` of one for sources that have
+/// to open something first — an Android `content://` URI, a network handle, a
+/// decrypt handshake. An `async` function satisfies this directly:
+///
+/// ```dart
+/// read: (start, end) async {
+///   final handle = await openSomething();
+///   return handle.readRange(start, end - start);
+/// }
+/// ```
+///
+/// An `async*` reader needs a **declared return type** — an inline `async*`
+/// closure infers against this typedef as
+/// `Stream<FutureOr<Stream<List<int>>>>` and will not compile. Give it a
+/// signature instead:
+///
+/// ```dart
+/// Stream<List<int>> readRange(int start, int end) async* {
+///   var remaining = end - start;
+///   final stream = await openStreamAt(start);
+///   await for (final chunk in stream) {
+///     if (remaining <= 0) break;      // break also closes the upstream
+///     yield chunk.length <= remaining ? chunk : chunk.sublist(0, remaining);
+///     remaining -= chunk.length;
+///   }
+/// }
+/// ```
+///
+/// **The stream must contain exactly `end - start` bytes.** The proxy has
+/// already sent that as `Content-Length` and does not truncate. A source that
+/// streams to end-of-file regardless of [end] — which is the default behaviour
+/// of most "open a stream at this offset" APIs — will corrupt the response and
+/// break seeking.
+typedef MediaSourceReader =
+    FutureOr<Stream<List<int>>> Function(int start, int end);
 
 /// A byte payload the proxy can serve without knowing where it came from.
 ///

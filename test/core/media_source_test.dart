@@ -56,7 +56,8 @@ void main() {
       final source = await MediaSource.file(file, contentType: 'video/mp4');
       expect(source.length, equals(1024));
 
-      final chunk = await source.read(10, 20).expand((c) => c).toList();
+      final stream = await source.read(10, 20);
+      final chunk = await stream.expand((c) => c).toList();
       expect(chunk, equals(payload.sublist(10, 20)));
     });
   });
@@ -174,6 +175,86 @@ void main() {
 
       await (await fetch(url, range: 'bytes=0-9')).drain<void>();
       expect(reads, equals(1));
+    });
+
+    test('accepts a reader that opens asynchronously', () async {
+      // saf_stream, network handles and decrypt handshakes all have to open
+      // something before they can read. Requiring a synchronous Stream forced
+      // those callers through Stream.fromFuture(...).asyncExpand(...).
+      final url = proxy.registerSource(
+        MediaSource(
+          length: payload.length,
+          contentType: 'video/mp4',
+          read: (start, end) async {
+            await Future<void>.delayed(const Duration(milliseconds: 5));
+            return Stream.value(payload.sublist(start, end));
+          },
+        ),
+      );
+
+      final response = await fetch(url, range: 'bytes=100-199');
+      final body = await response.fold<List<int>>(
+        <int>[],
+        (a, b) => a..addAll(b),
+      );
+
+      expect(response.statusCode, equals(206));
+      expect(body, equals(payload.sublist(100, 200)));
+    });
+
+    test('accepts an async* reader', () async {
+      // The natural shape once the reader may be asynchronous: open, then
+      // yield while honouring the requested range.
+      //
+      // Note the explicit return type. An inline `async*` closure infers
+      // against the FutureOr context as Stream<FutureOr<Stream<List<int>>>>
+      // and will not compile, so an async* reader needs a declared signature.
+      Stream<List<int>> reader(int start, int end) async* {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+        var offset = start;
+        while (offset < end) {
+          final chunkEnd = (offset + 64) < end ? offset + 64 : end;
+          yield payload.sublist(offset, chunkEnd);
+          offset = chunkEnd;
+        }
+      }
+
+      final url = proxy.registerSource(
+        MediaSource(
+          length: payload.length,
+          contentType: 'video/mp4',
+          read: reader,
+        ),
+      );
+
+      final response = await fetch(url);
+      final body = await response.fold<List<int>>(
+        <int>[],
+        (a, b) => a..addAll(b),
+      );
+
+      expect(response.statusCode, equals(200));
+      expect(body, equals(payload));
+    });
+
+    test('a synchronous reader still works', () async {
+      // The non-breaking guarantee, asserted rather than assumed.
+      final url = proxy.registerSource(
+        MediaSource(
+          length: payload.length,
+          contentType: 'video/mp4',
+          read: (start, end) => Stream.value(payload.sublist(start, end)),
+        ),
+      );
+
+      final response = await fetch(url, range: 'bytes=0-9');
+      final body = await response.fold<List<int>>(
+        <int>[],
+        (a, b) => a..addAll(b),
+      );
+
+      expect(response.statusCode, equals(206));
+      expect(body, equals(payload.sublist(0, 10)));
     });
 
     test('an unregistered token still 404s', () async {

@@ -126,6 +126,8 @@ class Http10FileServer {
 
     // Stream the requested range. `end` is inclusive here, and
     // MediaSourceReader takes an exclusive end, matching File.openRead.
-    await source.read(start, end + 1).pipe(socket);
+    // The reader may open asynchronously, so resolve it before piping.
+    final stream = await source.read(start, end + 1);
+    await stream.pipe(socket);
   }
 }
