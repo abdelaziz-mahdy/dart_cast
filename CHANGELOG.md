@@ -4,7 +4,20 @@ AirPlay 2 and DLNA fixes plus caller-supplied byte sources, driven by testing ag
 
 ### Breaking
 - AirPlay selects its protocol version from the advertised feature bits instead of probing `/play`; devices with no video bit throw `UnsupportedFeatureException` immediately
-- `AirPlaySession.connect()` pairs with every AirPlay 2 receiver, so it can throw `NeedsPairingException` where it previously returned an unusable session
+- `AirPlaySession.connect()` pairs with every AirPlay 2 receiver, so it can now throw `NeedsPairingException` where it previously returned a session. **If you call `connect()` on an AirPlay 2 device and do not catch that exception, this release will start throwing at you.** The old behaviour was not useful — the session it returned had fallen back to a legacy path those devices reject, so it could not cast anything — but it did not fail either. Handle it by prompting for the on-screen passcode and calling `pairSetup(pin)`, or by catching it and offering Chromecast/DLNA instead:
+
+  ```dart
+  try {
+    await session.connect();
+  } on NeedsPairingException {
+    // Show the code on the TV, then:
+    await session.pairSetup(pinTheUserTyped);
+    await session.connect();
+  }
+  ```
+
+  Most smart TVs use PIN-less transient pairing and never reach this path; it is
+  devices that demand a passcode which now surface it.
 - `AirPlayMediaController.dispose()` returns `Future<void>`; `play()` takes `startPositionSeconds:` instead of `startPosition:`
 
 ### Fixed
