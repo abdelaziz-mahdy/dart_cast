@@ -1,9 +1,69 @@
-/// Parses Apple XML plist format used in AirPlay responses.
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'auth/binary_plist.dart';
+
+/// Parses Apple plist responses from AirPlay devices.
 ///
-/// Supports the subset needed for AirPlay: `<real>`, `<integer>`,
-/// `<string>`, `<true/>`, `<false/>`, `<dict>`, and `<array>`.
+/// AirPlay 1 answers with an XML plist; AirPlay 2 answers the same endpoints
+/// with a *binary* plist. Both are handled here — see
+/// [parsePlaybackInfoBytes], which picks a decoder from the `Content-Type`
+/// header and falls back to sniffing the `bplist00` magic.
+///
+/// The XML parser supports the subset needed for AirPlay: `<real>`,
+/// `<integer>`, `<string>`, `<true/>`, `<false/>`, `<dict>`, and `<array>`.
 class PlistCodec {
   PlistCodec._();
+
+  /// Content type AirPlay 2 uses for binary plists.
+  static const String binaryPlistContentType =
+      'application/x-apple-binary-plist';
+
+  /// Magic bytes at the start of every binary plist.
+  static const List<int> binaryPlistMagic = [
+    0x62, 0x70, 0x6C, 0x69, 0x73, 0x74, // "bplist"
+  ];
+
+  /// Whether [body] starts with the binary plist magic.
+  static bool isBinaryPlist(List<int> body) {
+    if (body.length < binaryPlistMagic.length) return false;
+    for (int i = 0; i < binaryPlistMagic.length; i++) {
+      if (body[i] != binaryPlistMagic[i]) return false;
+    }
+    return true;
+  }
+
+  /// Decodes a plist [body] that may be binary or XML.
+  ///
+  /// [contentType] is consulted first; when it is absent or unhelpful the
+  /// body is sniffed for the `bplist00` magic. Returns an empty map if the
+  /// body is empty or cannot be decoded either way.
+  static Map<String, dynamic> parsePlist(
+    List<int> body, {
+    String contentType = '',
+  }) {
+    if (body.isEmpty) return {};
+
+    final looksBinary =
+        contentType.toLowerCase().contains('binary-plist') ||
+        isBinaryPlist(body);
+
+    if (looksBinary) {
+      try {
+        return BinaryPlistDecoder.decode(Uint8List.fromList(body));
+      } catch (_) {
+        // Fall through and try XML — some receivers mislabel the body, and a
+        // malformed one must degrade to an empty result rather than take the
+        // polling loop down.
+      }
+    }
+
+    try {
+      return parseXmlPlist(utf8.decode(body, allowMalformed: true));
+    } catch (_) {
+      return {};
+    }
+  }
 
   /// Parses an XML plist string into a [Map<String, dynamic>].
   ///
@@ -186,8 +246,28 @@ class PlistCodec {
       ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
 
   /// Parses an AirPlay `/playback-info` XML plist response.
-  static PlaybackInfo parsePlaybackInfo(String xml) {
-    final map = parseXmlPlist(xml);
+  static PlaybackInfo parsePlaybackInfo(String xml) =>
+      _playbackInfoFromMap(parseXmlPlist(xml));
+
+  /// Parses an AirPlay `/playback-info` response body of either encoding.
+  ///
+  /// AirPlay 2 returns a binary plist here, so decoding the bytes as UTF-8
+  /// first — as the XML-only path must — throws or yields an all-zero result.
+  static PlaybackInfo parsePlaybackInfoBytes(
+    List<int> body, {
+    String contentType = '',
+  }) => _playbackInfoFromMap(parsePlist(body, contentType: contentType));
+
+  static PlaybackInfo _playbackInfoFromMap(Map<String, dynamic> map) {
+    PlaybackError? error;
+    final rawError = map['error'];
+    if (rawError is Map) {
+      error = PlaybackError(
+        code: (rawError['code'] as num?)?.toInt(),
+        domain: rawError['domain'] as String?,
+      );
+    }
+
     return PlaybackInfo(
       duration: (map['duration'] as num?)?.toDouble() ?? 0.0,
       position: (map['position'] as num?)?.toDouble() ?? 0.0,
@@ -195,6 +275,8 @@ class PlistCodec {
       readyToPlay: map['readyToPlay'] as bool? ?? false,
       playbackBufferEmpty: map['playbackBufferEmpty'] as bool? ?? false,
       playbackLikelyToKeepUp: map['playbackLikelyToKeepUp'] as bool? ?? false,
+      hasDuration: map.containsKey('duration'),
+      error: error,
     );
   }
 
@@ -207,6 +289,27 @@ class PlistCodec {
       model: map['model'] as String? ?? '',
     );
   }
+}
+
+/// An error reported by the receiver inside a `/playback-info` response.
+///
+/// pyatv aborts playback when this dict is present
+/// (`pyatv/protocols/airplay/player.py`), and so does this package — the
+/// alternative is a session that sits in `loading` forever while the receiver
+/// has already given up.
+class PlaybackError {
+  /// Receiver-defined error code, when reported.
+  final int? code;
+
+  /// Receiver-defined error domain, when reported.
+  final String? domain;
+
+  const PlaybackError({this.code, this.domain});
+
+  @override
+  String toString() =>
+      'PlaybackError(code: ${code ?? 'unknown'}, '
+      'domain: ${domain ?? 'unknown domain'})';
 }
 
 /// Parsed AirPlay playback info.
@@ -229,6 +332,17 @@ class PlaybackInfo {
   /// Whether buffering is sufficient for smooth playback.
   final bool playbackLikelyToKeepUp;
 
+  /// Whether the response actually carried a `duration` key.
+  ///
+  /// A receiver that is not playing anything answers with a body that omits
+  /// `duration` entirely, which is indistinguishable from `duration: 0` once
+  /// it has been defaulted. pyatv uses exactly this key to decide whether
+  /// playback has started.
+  final bool hasDuration;
+
+  /// The error the receiver reported, if any.
+  final PlaybackError? error;
+
   const PlaybackInfo({
     required this.duration,
     required this.position,
@@ -236,12 +350,15 @@ class PlaybackInfo {
     required this.readyToPlay,
     required this.playbackBufferEmpty,
     required this.playbackLikelyToKeepUp,
+    this.hasDuration = false,
+    this.error,
   });
 
   @override
   String toString() =>
       'PlaybackInfo(duration: $duration, position: $position, rate: $rate, '
-      'readyToPlay: $readyToPlay)';
+      'readyToPlay: $readyToPlay'
+      '${error != null ? ', error: $error' : ''})';
 }
 
 /// Parsed AirPlay server info.

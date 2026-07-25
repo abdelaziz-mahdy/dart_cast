@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:multicast_dns/multicast_dns.dart';
 
 import '../core/cast_device.dart';
+import '../protocols/airplay/airplay_features.dart';
 import 'logger.dart';
 
 /// Represents a discovered mDNS service with its TXT records.
@@ -56,22 +57,13 @@ class MdnsServiceInfo {
   /// two-part (`"0x5A7FFFF7,0x1E"`) where the first part is the lower
   /// 32 bits and the second is the upper 32 bits.
   ///
-  /// Video support is indicated by bit 0 (0x01) of the lower 32 bits.
-  static bool supportsVideo(String features) {
-    if (features.isEmpty) return false;
-
-    try {
-      final parts = features.split(',');
-      final lower = parts[0].trim();
-      final value = int.parse(
-        lower.replaceFirst('0x', '').replaceFirst('0X', ''),
-        radix: 16,
-      );
-      return (value & 0x01) != 0;
-    } catch (_) {
-      return false;
-    }
-  }
+  /// Video support is bit 0 (`SupportsAirPlayVideoV1`) **or** bit 49
+  /// (`SupportsAirPlayVideoV2`). Checking only bit 0 misreads every
+  /// AirPlay 2–only receiver as incapable of video — which is exactly the
+  /// wrong call for the Roku and Google TV devices that set bit 49 and leave
+  /// bit 0 clear.
+  static bool supportsVideo(String features) =>
+      AirPlayFeatures.parse(features).supportsVideo;
 
   /// Creates a [CastDevice] configured for the Chromecast protocol.
   CastDevice toChromecastDevice() {

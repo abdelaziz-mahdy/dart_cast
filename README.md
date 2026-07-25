@@ -17,33 +17,69 @@ Cast media to Chromecast, AirPlay, and DLNA devices from pure Dart.
 - **Subtitle support** -- WebVTT and SRT with automatic SRT-to-VTT conversion
 - **Local file serving** -- serves downloaded content via proxy with `MediaTransformer` interface
 - **Pluggable discovery** -- swap in native mDNS (e.g., bonsoir) on Apple platforms
-- **666+ tests** -- mock servers for each protocol
+- **750+ tests** -- mock servers for each protocol
 
 ## Protocol Status
 
-| Protocol   | Streaming | Local Files | Subtitles | Status |
-|------------|-----------|-------------|-----------|--------|
-| **Chromecast** | Fully tested | MP4 recommended, TS fallback | VTT (auto-converts SRT) | **Recommended** |
-| **DLNA** | Tested (HLS piped as TS) | Working (MP4, MKV, TS) | MKV embedded SRT | Working |
-| **AirPlay** | Feature detection + V1/V2 `/play` | Not tested | Not yet supported | Experimental |
+**Use Chromecast.** It is the only protocol with a recorded end-to-end success
+against real hardware in this repository.
+
+| Protocol | Hardware-verified? | Evidence | Use it? |
+|---|---|---|---|
+| **Chromecast** | **Yes** — media actually played | Full local-file cast to a TCL Google TV captured in [`test/integration/logs.txt`](test/integration/logs.txt) (`Local file loaded successfully`) | **Recommended** |
+| **DLNA** | Discovery only | Devices discovered in the same capture; no playback trace is recorded in this repo. Playback is covered by mock-server tests and developer reports, not by a captured device session | Reasonable second choice, especially for local MKV |
+| **AirPlay** | Handshake yes, playback **no** | Pairing, RTSP `SETUP` with timing server, event channel and `RECORD` all verified against a real receiver on 2026-07-25. `/play` returns 404 — see below | **Not for video.** Use Chromecast or DLNA |
+
+> **A passing test suite is not hardware verification.** All 750+ tests here run
+> against mock servers. The AirPlay work is the cautionary tale: 666 tests passed
+> for four months against a protocol path that had never once succeeded on a real
+> device. Where this README says "verified", it means a captured session with a
+> physical device; where it doesn't, assume it hasn't been.
+
+### AirPlay: read this before using it
+
+AirPlay video casting is implemented and its AirPlay 2 handshake is
+hardware-verified, but **no receiver has yet been found that accepts the
+`/play` request**, and the one device tested in depth cannot play AirPlay video
+from *any* sender:
+
+- The TCL Google TV tested exports only four HTTP endpoints — `/command`,
+  `/feedback`, `/info`, `/server-info`. `/play`, `/playback-info`, `/rate` and
+  `/scrub` do not exist on it, and the string `Content-Location` is absent from
+  its receiver binary entirely.
+- **Apple's own software fails the same way.** QuickTime Player on macOS reports
+  "This video is playing on Living room TV" while the TV shows only its idle
+  AirPlay wallpaper and QuickTime's timeline never leaves `00:00:00`. macOS
+  negotiates an *audio* session; no video stream is ever set up. Screen
+  mirroring works on that TV — media casting does not, for anyone.
+- On such a receiver `play()` throws `UnsupportedFeatureException` with a
+  message naming the cause, rather than hanging or silently doing nothing.
+
+Full write-up, including the ADB-captured receiver logs:
+[`doc/specs/2026-07-25-airplay-hardware-results.md`](doc/specs/2026-07-25-airplay-hardware-results.md).
 
 > **Chromecast is the best-tested protocol.** For local file casting, remux `.ts` to `.mp4` with ffmpeg. See [`doc/LOCAL_FILE_CASTING.md`](doc/LOCAL_FILE_CASTING.md).
 
 ### What Works Where
 
+"Implemented" means the code path exists and passes mock tests. Only the
+Chromecast column has a captured hardware session behind it.
+
 | Use Case | Chromecast | DLNA | AirPlay |
 |----------|-----------|------|---------|
-| Stream HLS (remote) | Yes | Partial (piped as TS) | Yes |
-| Stream MP4 (remote) | Yes | No | Yes |
-| Local MP4 files | Yes | Yes | Untested |
-| Local TS files | Yes (HLS wrap) | Yes | Untested |
-| Local MKV files | No | Yes | Untested |
+| Stream HLS (remote) | Yes | Partial (piped as TS) | Implemented, no receiver accepts it yet |
+| Stream MP4 (remote) | Yes | No | Implemented, no receiver accepts it yet |
+| Local MP4 files | **Yes (verified)** | Implemented | Implemented, unverified |
+| Local TS files | Yes (HLS wrap) | Implemented | Implemented, unverified |
+| Local MKV files | No | Implemented | Implemented, unverified |
 | Subtitles (sidecar VTT) | Yes | No | No |
 | Subtitles (MKV embedded) | N/A | Yes | N/A |
-| Seeking | Yes | Yes | Yes |
-| Resume from position | Yes | Yes | Yes |
+| Seeking | Yes | Yes | Implemented, unverified |
+| Resume from position | Yes | Yes | Implemented, unverified |
 | Volume control | Yes | Yes | No |
 | Subtitle switching | Yes | Requires reload | No |
+| Device discovery | Yes | **Yes (verified)** | **Yes (verified)** |
+| Pairing / auth | N/A | N/A | **Yes (verified)** — transient and PIN |
 
 ### Protocol Notes
 
@@ -57,19 +93,19 @@ Cast media to Chromecast, AirPlay, and DLNA devices from pure Dart.
 - Uses HTTP/1.0 raw socket server -- Dart's HTTP/1.1 breaks some TVs (e.g., TCL Google TV)
 - Embed SRT in MKV for subtitles (most TVs ignore sidecar files)
 - TV controls subtitle styling
-- HLS piped as TS: works, but reports zero duration and cannot seek
+- HLS piped as TS: plays, and seeking now works (the pipe restarts at the requested offset). The session reports the real duration probed from the playlist; the TV's own on-screen readout may still show a placeholder, which a sender cannot change
 - Local file seeking via byte-range requests (206 Partial Content)
 
 **AirPlay**
-- Video URL casting with V1/V2 auto-negotiation
-- Many smart TVs (Google TV, Roku) return 404 on `/play` -- reliable only on Apple TV
+- Video URL casting, with the protocol version chosen from the device's advertised feature bits
+- Handshake verified against a real receiver; video URL playback not yet achieved on any tested device — see the hardware matrix below
 - Screen mirroring and RAOP audio unimplemented
 
 ### Known Limitations
 
-- **AirPlay video**: `/play` returns 404 on some Google TV devices. Screen mirroring is unimplemented.
+- **AirPlay video**: the AirPlay 2 handshake is hardware-verified, but no tested receiver accepts `/play` -- modern smart TVs use AirPlay 2 unified media control (`/command`), which is unimplemented. See the hardware matrix below. Screen mirroring is also unimplemented.
 - **Local TS on Chromecast**: `TsHlsMediaTransformer` has per-segment buffering and subtitle drift. Remux to MP4 via ffmpeg instead -- see [`example/lib/ffmpeg_media_transformer.dart`](example/lib/ffmpeg_media_transformer.dart).
-- **DLNA streaming**: HLS piped as TS works, but reports zero duration and cannot seek.
+- **DLNA streaming**: HLS is piped as MPEG-TS. Seeking works via a pipe restart, and `durationStream` carries the real length; a renderer's own UI may still show a placeholder duration because the stream has no `Content-Length`.
 - **DLNA subtitle styling**: The TV controls styling, not the app.
 
 ## Supported Platforms
@@ -327,7 +363,8 @@ final features = AirPlayFeatures.parse('0x5A7FFFF7,0x1E');
 features.supportsVideo    // true if bit 0 (V1) or bit 49 (V2) is set
 features.supportsScreen   // true if bit 7 is set (screen mirroring)
 features.supportsAudio    // true if bit 9 is set (RAOP audio)
-features.requiresHapPairing // true if bit 46 or 48 is set
+features.requiresHapPairing // true if bit 43, 46 or 48 is set
+features.supportsTransientPairing // true if bit 43 or 48 is set (no PIN)
 features.isV2Protocol     // true if bit 38 or 48 is set
 ```
 
@@ -335,24 +372,31 @@ features.isV2Protocol     // true if bit 38 or 48 is set
 
 | Mode | Feature Bits | Status |
 |------|-------------|--------|
-| Video URL casting (V1) | Bit 0 | Supported |
-| Video URL casting (V2) | Bit 49 | Supported |
-| Screen mirroring | Bit 7 | Not yet implemented (see [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md)) |
-| Audio streaming (RAOP) | Bit 9 | Not yet implemented (see [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md)) |
+| Video URL casting (V1) | Bit 0 | Implemented -- plain HTTP `POST /play`, no RTSP setup |
+| Video URL casting (V2) | Bits 38/48 + bit 49 | Implemented -- requires transient pairing, RTSP `SETUP` with a live UDP timing server, `RECORD`, and a `/rate` after `/play`. Not yet verified against hardware |
+| Screen mirroring | Bit 7 | Not yet implemented (see [doc/FUTURE_WORK.md](doc/FUTURE_WORK.md)) |
+| Audio streaming (RAOP) | Bit 9 | Not yet implemented (see [doc/FUTURE_WORK.md](doc/FUTURE_WORK.md)) |
 
-### V1/V2 Auto-Negotiation
+### Capability-Driven Version Selection
 
-`AirPlayMediaController.play()` selects the best `/play` format for the target device:
+`AirPlayMediaController.play()` decides which protocol to speak **before sending anything**, from the bitmask the device advertises over mDNS:
 
-1. **V1 binary plist** (`application/x-apple-binary-plist`) — tried first
-2. **V1 text/parameters** — fallback if V1 plist returns 404 or 415
-3. **V2 with RTSP SETUP** — fallback if V1 text also returns 404 or 415
+- Bit 38 or bit 48 set -> AirPlay 2. Bit 49 is then required; the session pairs
+  transiently, runs RTSP `SETUP` (advertising a live UDP timing port) and
+  `RECORD`, sends `POST /play`, and follows it with `POST /rate?value=1.000000`.
+  **That last command is not optional** -- an AirPlay 2 `/play` starts the item
+  paused, so without it the receiver sits on a black frame.
+- Otherwise -> AirPlay 1. Bit 0 is required; a plain `POST /play` with a binary
+  plist body, no RTSP setup.
 
-This negotiation handles the wide variation in third-party AirPlay receivers (Apple TV, smart TVs, audio receivers) without manual configuration.
+There is no fallback ladder. Earlier versions tried a V1 `/play` first and only
+reached the V2 path if the device answered 404 or 415. Every AirPlay 2-only
+receiver answers that first request with 404 -- correctly, since it never
+advertised V1 -- and the 404 was then misread as "this TV cannot cast video".
 
 ### Devices Without Video Support
 
-If a device advertises neither video bit (0 nor 49), `play()` throws `UnsupportedFeatureException` immediately. Many Google TV / Android TV devices support only screen mirroring, not video URL casting.
+If a device advertises neither video bit (0 nor 49), `play()` throws `UnsupportedFeatureException` before any request goes out. An AirPlay 2 receiver with bits 38/48 but no bit 49 is a mirroring-only or audio-only device; use Chromecast or DLNA for those.
 
 ```dart
 try {
@@ -361,6 +405,66 @@ try {
   // Device supports screen mirroring only — video URL cast not available
   print(e.message);
 }
+```
+
+### Hardware Test Matrix
+
+Status after a live hardware run on 2026-07-25 (full write-up:
+[`doc/specs/2026-07-25-airplay-hardware-results.md`](doc/specs/2026-07-25-airplay-hardware-results.md)):
+the AirPlay 2 **handshake is verified working** — pairing (transient *and*
+PIN-based), RTSP `SETUP` with a live timing server, the event channel,
+`/feedback` and `RECORD` were all accepted by a real receiver. **Video URL
+playback was not achieved**, because the receiver tested has no `/play`
+endpoint at all.
+
+| Device | Raw `features` | V1 (bit 0) | V2 (bit 49) | Pairing verified | `/play` |
+|---|---|---|---|---|---|
+| TCL JX32B / Google TV, AirPlaySDK 3.5.0.244 | `0x000bcf46007f8ad0` | No | Yes | **Yes** — transient *and* PIN-based HAP | **404 — endpoint absent** |
+| Roku Express | `0x038bcf46007f8ad0` | No | Yes | Not tested (device off-network) | Not tested |
+| macOS AirPlay receiver (MacBook Pro) | `0x38174fde4a7fcfd5` | Yes | Yes | Not tested | Not tested |
+| Apple TV (any model) | — | — | — | — | **Never tested.** Earlier README versions claimed AirPlay was "reliable only on Apple TV"; that claim was never supported by evidence |
+
+**Why the TCL 404s.** Pulling its receiver apart
+(`/system/app/RtkAirPlay/RtkAirPlay.apk` → `libairplay2-lib.so`) shows it
+exports exactly four HTTP endpoints — `/command`, `/feedback`, `/info`,
+`/server-info` — and the string `Content-Location` does not appear in the
+binary at all. The AirPlay 1-era media REST endpoints (`/play`,
+`/playback-info`, `/rate`, `/scrub`) are simply not implemented. Playback is
+driven over AirPlay 2 *unified media control* (`POST /command`, feature bit 38)
+into an hls.js receiver web app. dart_cast does not speak that protocol yet, so
+`play()` raises `UnsupportedFeatureException` naming the cause. Use Chromecast
+for these devices — it is verified working against this exact TV.
+
+**Apple's own sender fails identically.** Sending a local MP4 from QuickTime
+Player on macOS to this TV reports "This video is playing on Living room TV"
+while the TV shows only its idle AirPlay wallpaper and QuickTime's timeline
+stays at `00:00:00`. The session macOS negotiates is an *audio* session. Screen
+mirroring works on this TV; media casting does not — for any sender tested,
+Apple included. No sender-side library can fix that.
+
+> **Note on pyatv.** `atvremote` reports `PlayUrl: Unavailable` for this TV, but
+> that is a bug in pyatv, not a property of the device: its `parse_features`
+> concatenates the two hex *strings* rather than shifting by 32 bits, so a
+> device that omits leading zeros (`0x7F8AD0,0xBCF46`) is decoded 24 bits off.
+> The TV's own `fex`/`featuresEx` field confirms dart_cast's decoding.
+
+Two things worth reading off this table:
+
+- Neither third-party receiver advertises AirPlay 1 video, so the old V1-first
+  `/play` probe was always a request they had said they do not accept.
+- Both want transient pairing, which needs no PIN and no user interaction — so
+  the PIN flow the package used to be limited to could never have worked on
+  them unattended.
+
+Chromecast, by contrast, is verified working against the same TV — there is a
+complete successful local-file cast to it in `test/integration/logs.txt`.
+
+To run the verification yourself, follow
+[`doc/specs/2026-07-25-airplay-hardware-test-plan.md`](doc/specs/2026-07-25-airplay-hardware-test-plan.md):
+
+```bash
+dart run tool/airplay_probe.dart                       # decode what is on the network
+dart run tool/airplay_hardware_check.dart <TV_IP>      # full connect → play → poll trace
 ```
 
 ## Error Handling
@@ -375,7 +479,7 @@ try {
 | `DiscoveryException`           | Discovery failed (permissions denied, no network)            |
 | `ProtocolException`            | Protocol-specific error (bad SOAP response, protobuf err)    |
 | `UnsupportedFeatureException`  | AirPlay device lacks the required feature (e.g. video bits)  |
-| `PlaybackException`            | AirPlay device rejected /play after all format attempts      |
+| `PlaybackException`            | AirPlay device rejected `/play`, or the `/rate` that must follow it |
 
 All exceptions carry a `message` and optional `cause`.
 

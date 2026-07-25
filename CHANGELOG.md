@@ -1,35 +1,69 @@
-## Unreleased
+## 0.7.0
 
-### Fixed
-- **DLNA + HLS: the renderer now gets the real duration.** Remote HLS is piped
-  to DLNA as one continuous MPEG-TS with no `Content-Length`, so the TV had no
-  way to work out how long the content was and reported `00:00:01` with no
-  scrub bar. The playlist is now probed up front (VOD only — a live playlist's
-  length is not fixed) and the total is advertised in the DIDL-Lite `<res>`
-  element. Verified on a TCL Google TV: `00:00:01` -> `00:10:34`.
-- **DLNA + HLS: seeking no longer stops playback.** The piped route advertised
-  `DLNA.ORG_OP=01`, claiming byte-range seek, while serving
-  `Accept-Ranges: none`. A seek made the renderer go straight to `STOPPED`.
-  Piped routes now advertise `DLNA.ORG_OP=10` (time seek), the proxy honours
-  `TimeSeekRange.dlna.org`, and — for renderers that only ever send
-  `Range: bytes=0-` and never a time seek, which is what the TCL does — the
-  session re-points the renderer at the same route with the offset in the URL
-  so the pipe restarts at the right segment. Positions stay absolute across
-  such a restart.
-- A renderer's placeholder duration no longer overwrites one we determined
-  ourselves, which used to collapse the corrected duration back to 1 second on
-  the first poll.
-- Client-aborted proxy connections (`Connection reset by peer`, `Broken pipe`)
-  are logged at debug rather than error. Renderers abandon connections
-  routinely while buffering and seeking; logging each as an error buried real
-  failures during normal playback.
+Two protocols were taken to real hardware for the first time. AirPlay's video
+path turned out to be broken in six compounding ways; DLNA's HLS path reported
+the wrong duration and died on seek. Both are fixed or, where the receiver is
+at fault, documented honestly.
+
+### Breaking
+- AirPlay picks its protocol version from the device's advertised feature bits
+  instead of probing `/play`. A receiver advertising no video bit now throws
+  `UnsupportedFeatureException` immediately rather than after three rejected
+  requests.
+- `AirPlaySession.connect()` pairs with every AirPlay 2 receiver, not only ones
+  that answer 403. It can now throw `NeedsPairingException` where it previously
+  returned a session that could not actually cast.
+- `AirPlayMediaController.dispose()` returns `Future<void>`; `play()` takes
+  `startPositionSeconds:` in place of the version-ambiguous `startPosition:`.
+
+### Fixed — DLNA
+- HLS duration is probed from the source playlist, so the **session** reports
+  the real length instead of the renderer's placeholder. A piped MPEG-TS has no
+  `Content-Length`, and the TCL Google TV tested answers `GetPositionInfo` with
+  `TrackDuration` of 1 second, which used to propagate straight into
+  `durationStream`. Apps built on this package now get `0:10:34` for a 10m34s
+  stream. The duration is also sent in DIDL-Lite `<res duration>`, but that TV
+  ignores it — its own on-screen UI still shows the placeholder, which is not
+  something a sender can fix.
+- Seeking piped HLS no longer stops playback. The route claimed byte-range seek
+  (`DLNA.ORG_OP=01`) while serving `Accept-Ranges: none`. Piped routes now
+  advertise time seek, honour `TimeSeekRange.dlna.org`, and — for renderers
+  that only ever send `Range: bytes=0-` — restart the pipe at the requested
+  offset via the URL. Positions stay absolute across the restart.
+- A renderer's placeholder duration no longer overwrites a known-good one.
+- Client-aborted proxy connections are logged at debug, not error.
+
+### Fixed — AirPlay
+- The AirPlay 2 path is reachable at all: the encrypted media controller is
+  built for every AirPlay 2 receiver, not only ones returning 403.
+- Transient pairing (`X-Apple-HKP: 4`) implemented — the flow both observed
+  smart TVs actually want, and which needs no PIN.
+- RTSP `SETUP` advertises a live UDP timing server (`timingProtocol: NTP`) and
+  names the sender's IP; a rejected `SETUP`/`RECORD` throws instead of being
+  marked successful.
+- `POST /rate` follows `/play`. Without it an AirPlay 2 receiver stays paused.
+- `/playback-info` is decoded as a binary plist, so position and duration stop
+  reading as zero forever; receiver-reported errors surface.
+- Requests on the encrypted socket are serialized, so the feedback loop can no
+  longer steal a response or desynchronise the ChaCha20 nonces.
+- `requiresHapPairing` includes bit 43; `MdnsServiceInfo.supportsVideo` accepts
+  bit 49; `media.startPosition` reaches the device; the pair-verify socket
+  subscription is released.
 
 ### New
-- `HlsParser.extractSegments`, `HlsParser.totalDuration`,
-  `HlsParser.isCompletePlaylist`
-- `MediaProxy.probeHlsDuration` and `MediaProxy.parseTimeSeekRange`
-- `tool/dlna_hardware_check.dart` — end-to-end DLNA verification against a real
-  renderer, with and without a sidecar subtitle track
+- `AirPlayTimingServer`, AirPlay transient pairing, `PlaybackInfo.error`
+- `HlsParser.totalDuration` / `extractSegments`, `MediaProxy.probeHlsDuration`
+  and `parseTimeSeekRange`
+- `tool/airplay_probe.dart`, `tool/airplay_hardware_check.dart`,
+  `tool/dlna_hardware_check.dart` — hardware verification scripts
+
+### Known limitations
+- **AirPlay video does not play on the TV tested, and cannot.** That receiver
+  exports only `/command`, `/feedback`, `/info` and `/server-info` — there is
+  no `/play` — and AirPlay video from Apple's own QuickTime fails on it
+  identically. Use Chromecast. See
+  `doc/specs/2026-07-25-airplay-hardware-results.md`.
+- Sidecar subtitles over DLNA did not render on the TV tested; embed SRT in MKV.
 
 ## 0.6.0
 
@@ -202,8 +236,8 @@ final session = await device.connect(
 - `UnsupportedFeatureException` thrown immediately when a device lacks video support bits (0 and 49)
 - `PlaybackException` thrown when all `/play` format attempts are rejected by the device
 - Breaking: `HapSession` no longer has `play`, `stop`, `scrub`, or `rate` methods — use `AirPlayMediaController` instead
-- Added `docs/PROTOCOL_REFERENCES.md` with links to AirPlay, Chromecast, and DLNA specs
-- Added `docs/FUTURE_WORK.md` documenting AirPlay screen mirroring and RAOP audio streaming roadmap
+- Added `doc/PROTOCOL_REFERENCES.md` with links to AirPlay, Chromecast, and DLNA specs
+- Added `doc/FUTURE_WORK.md` documenting AirPlay screen mirroring and RAOP audio streaming roadmap
 
 ## 0.1.0
 

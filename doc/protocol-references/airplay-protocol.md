@@ -690,7 +690,22 @@ This is complex to implement and Apple does not publish official documentation f
 
 Third-party AirPlay receivers (Samsung TVs, LG TVs, Roku, VIZIO, etc.) generally **do not require FairPlay-SAP authentication**. They accept unauthenticated AirPlay 1 connections using the plain HTTP endpoints documented in this reference.
 
-**Practical recommendation:** Target third-party receivers first. The plain HTTP protocol described in sections 1-4 works with these devices. Apple TV authentication is a significant additional effort.
+> **Correction (2026-07-25).** The recommendation that used to follow this
+> paragraph — "target third-party receivers first, the plain HTTP protocol works
+> with these devices" — is contradicted by every third-party receiver we have
+> actually measured. A real discovery run (`test/integration/logs.txt`) found a
+> Roku Express advertising `0x038bcf46007f8ad0` and a TCL Google TV advertising
+> `0x000bcf46007f8ad0`. Both have **bit 0 (`SupportsAirPlayVideoV1`) clear** and
+> **bit 49 (`SupportsAirPlayVideoV2`) set**, and both advertise bits 43 and 48,
+> which means they expect *transient* pairing and an encrypted channel.
+>
+> In other words: the plain HTTP AirPlay 1 path in sections 1–4 is the one path
+> these devices do **not** implement. Sending them a V1 `POST /play` gets a 404,
+> correctly. Modern third-party receivers are AirPlay 2 receivers; only the
+> macOS receiver on that same network still advertises bit 0.
+>
+> Decide from the bitmask, never from a trial request. See
+> `doc/specs/2026-07-25-airplay-v2-video-hardware-verification-design.md`.
 
 ### Determining Authentication Requirements
 

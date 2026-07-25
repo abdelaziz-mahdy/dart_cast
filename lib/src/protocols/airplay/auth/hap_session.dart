@@ -86,7 +86,16 @@ class HapHttpResponse {
   });
 
   /// Returns the body decoded as UTF-8 text.
-  String get bodyText => utf8.decode(body);
+  ///
+  /// AirPlay 2 answers many endpoints with a *binary* plist, which is not
+  /// valid UTF-8 — use [body] together with [contentType] for those, and only
+  /// reach for this on responses known to be textual. Malformed sequences are
+  /// replaced rather than thrown so diagnostics logging cannot crash a
+  /// session.
+  String get bodyText => utf8.decode(body, allowMalformed: true);
+
+  /// The response `Content-Type`, or an empty string when absent.
+  String get contentType => headers['content-type'] ?? '';
 
   @override
   String toString() =>
@@ -141,6 +150,15 @@ class HapSession {
 
   /// Whether the periodic feedback loop is active.
   bool _feedbackActive = false;
+
+  /// Tail of the request queue.
+  ///
+  /// Every exchange on this socket runs to completion before the next one
+  /// starts. Without this the 2-second `/feedback` loop shares one reader and
+  /// one completer with foreground commands, so `/play` can be handed the
+  /// feedback response — and two concurrent writers desynchronise the
+  /// ChaCha20 nonce counters, after which every frame fails MAC verification.
+  Future<void>? _requestQueue;
 
   /// Buffer for incomplete encrypted data received from the device.
   final BytesBuilder _receiveBuffer = BytesBuilder(copy: false);
@@ -224,6 +242,40 @@ class HapSession {
 
   /// The current session ID.
   String get sessionId => _sessionId;
+
+  /// The sender's local IP address on this connection.
+  ///
+  /// AirPlay 2 expects the RTSP URI to name the *sender*, not the receiver
+  /// (`pyatv/support/rtsp.py`, `RtspSession.uri`).
+  String get localIp {
+    try {
+      return _socket.address.address;
+    } catch (_) {
+      return host;
+    }
+  }
+
+  /// The RTSP URI in use for this session, once [setupRtspSession] has run.
+  String? get rtspUri => _rtspUri;
+
+  /// Whether SETUP + RECORD have completed successfully.
+  bool get isRtspSessionSetUp => _rtspSessionSetUp;
+
+  /// Runs [action] once every previously queued exchange has finished.
+  Future<T> _serialized<T>(Future<T> Function() action) async {
+    final previous = _requestQueue;
+    final completer = Completer<void>();
+    _requestQueue = completer.future;
+    if (previous != null) {
+      // A failed predecessor must not poison the queue.
+      await previous.catchError((Object _) {});
+    }
+    try {
+      return await action();
+    } finally {
+      completer.complete();
+    }
+  }
 
   /// Visible for testing: the current output (encrypt) nonce counter.
   int get outputCounter => _outputCounter;
@@ -343,7 +395,26 @@ class HapSession {
   }
 
   /// Sends an HTTP request through the encrypted channel and returns the response.
+  ///
+  /// Exchanges are serialized: a request issued while another is in flight
+  /// waits its turn rather than racing it on the shared socket.
   Future<HapHttpResponse> sendRequest(
+    String method,
+    String path, {
+    Map<String, String>? headers,
+    List<int>? body,
+    Map<String, String>? queryParameters,
+  }) => _serialized(
+    () => _sendRequestLocked(
+      method,
+      path,
+      headers: headers,
+      body: body,
+      queryParameters: queryParameters,
+    ),
+  );
+
+  Future<HapHttpResponse> _sendRequestLocked(
     String method,
     String path, {
     Map<String, String>? headers,
@@ -415,12 +486,22 @@ class HapSession {
     String uri, {
     Map<String, String>? headers,
     List<int>? body,
+  }) => _serialized(
+    () => _sendRtspRequestLocked(method, uri, headers: headers, body: body),
+  );
+
+  Future<HapHttpResponse> _sendRtspRequestLocked(
+    String method,
+    String uri, {
+    Map<String, String>? headers,
+    List<int>? body,
   }) async {
     _cseq++;
-    CastLogger.debug('HAP session: sendRtspRequest $method $uri (CSeq=$_cseq)');
+    final cseq = _cseq;
+    CastLogger.debug('HAP session: sendRtspRequest $method $uri (CSeq=$cseq)');
 
     final requestHeaders = <String, String>{
-      'CSeq': '$_cseq',
+      'CSeq': '$cseq',
       'DACP-ID': _dacpId,
       'Active-Remote': '$_activeRemote',
       'Client-Instance': _dacpId,
@@ -463,7 +544,20 @@ class HapSession {
     CastLogger.debug(
       'HAP session: received ${responseBytes.length} decrypted RTSP response bytes',
     );
-    return _parseHttpResponse(responseBytes);
+    final response = _parseHttpResponse(responseBytes);
+
+    // Receivers echo the CSeq. A mismatch means the reply belongs to another
+    // in-flight exchange, which serialization is supposed to make impossible —
+    // log it loudly rather than silently treating it as our answer.
+    final responseCseq = int.tryParse(response.headers['cseq'] ?? '');
+    if (responseCseq != null && responseCseq != cseq) {
+      CastLogger.warning(
+        'HAP session: RTSP response CSeq $responseCseq does not match '
+        'request CSeq $cseq ($method $uri)',
+      );
+    }
+
+    return response;
   }
 
   /// Performs AirPlay 2 RTSP session setup required before `/play`.
@@ -471,20 +565,33 @@ class HapSession {
   /// This sends SETUP (with device info) and RECORD over the HAP encrypted
   /// channel, which is required by AirPlay 2 devices before they will accept
   /// media commands like `/play`.
-  Future<void> setupRtspSession() async {
+  ///
+  /// [timingPort] is the UDP port of a running [AirPlayTimingServer]. It must
+  /// be non-zero: a receiver told `timingProtocol: "NTP"` will send timing
+  /// requests there, and one told `"None"` may refuse to play at all. Passing
+  /// 0 declares no timing server, which is what the AirPlay 1 path wants.
+  ///
+  /// Throws [HapSessionException] if SETUP or RECORD is rejected. Continuing
+  /// past a rejected SETUP was how this code previously reported success on
+  /// sessions the receiver had already refused.
+  Future<void> setupRtspSession({int timingPort = 0}) async {
     if (_rtspSessionSetUp) return;
 
-    // Generate a session ID used as the RTSP URI path
-    // pyatv uses: rtsp://host/session_id for all RTSP commands
+    // Generate a session ID used as the RTSP URI path.
+    // pyatv uses rtsp://<sender ip>/<session id> for all RTSP commands — the
+    // URI names the sender, not the receiver.
     final rtspSessionId = Random.secure().nextInt(0x7FFFFFFF);
-    _rtspUri = 'rtsp://$host/$rtspSessionId';
+    _rtspUri = 'rtsp://$localIp/$rtspSessionId';
 
-    CastLogger.info('HAP session: RTSP SETUP (uri=$_rtspUri)');
+    CastLogger.info(
+      'HAP session: RTSP SETUP (uri=$_rtspUri, timingPort=$timingPort)',
+    );
 
     final setupBodyBytes = BinaryPlistEncoder.encode({
       'deviceID': 'AA:BB:CC:DD:EE:FF',
       'sessionUUID': _generateUuid().toUpperCase(),
-      'timingProtocol': 'None',
+      if (timingPort > 0) 'timingPort': timingPort,
+      'timingProtocol': timingPort > 0 ? 'NTP' : 'None',
       'isMultiSelectAirPlay': true,
       'groupContainsGroupLeader': false,
       'macAddress': 'AA:BB:CC:DD:EE:FF',
@@ -507,6 +614,13 @@ class HapSession {
     CastLogger.info(
       'HAP session: RTSP SETUP response: ${setupResp.statusCode} body(${setupResp.body.length}B)',
     );
+
+    if (setupResp.statusCode != 200) {
+      throw HapSessionException(
+        'RTSP SETUP rejected with ${setupResp.statusCode} '
+        '${setupResp.reasonPhrase}',
+      );
+    }
 
     // Parse eventPort from the binary plist response body
     int? eventPort;
@@ -555,15 +669,15 @@ class HapSession {
       'HAP session: RTSP RECORD response: ${recordResp.statusCode} body: ${recordResp.bodyText}',
     );
 
-    if (recordResp.statusCode == 200) {
-      _rtspSessionSetUp = true;
-    } else {
-      CastLogger.warning(
-        'HAP session: RECORD failed (${recordResp.statusCode}), '
-        'proceeding anyway — /play may still work',
+    if (recordResp.statusCode != 200) {
+      _stopFeedbackLoop();
+      throw HapSessionException(
+        'RTSP RECORD rejected with ${recordResp.statusCode} '
+        '${recordResp.reasonPhrase}',
       );
-      _rtspSessionSetUp = true;
     }
+
+    _rtspSessionSetUp = true;
   }
 
   /// Sets up the AirPlay 2 event channel on the given [eventPort].
@@ -895,11 +1009,14 @@ class HapSession {
 
   /// Resets the RTSP session state so a new SETUP + RECORD can be performed.
   /// Does NOT send any network request — only resets local state.
+  ///
+  /// `CSeq` deliberately keeps counting up. Restarting it at 0 on a live
+  /// connection produces two different exchanges carrying the same sequence
+  /// number, which makes correlating responses impossible.
   void resetRtspSession() {
     _stopFeedbackLoop();
     _sessionId = _generateUuid();
     _rtspSessionSetUp = false;
-    _cseq = 0;
   }
 
   /// Closes the underlying socket, event channel, and cancels the persistent

@@ -6,18 +6,26 @@ import 'package:dart_cast/src/protocols/airplay/airplay_features.dart';
 import 'package:dart_cast/src/protocols/airplay/auth/binary_plist.dart';
 import 'package:dart_cast/src/protocols/airplay/auth/hap_session.dart';
 import 'package:dart_cast/src/protocols/airplay/plist_codec.dart';
+import 'package:dart_cast/src/protocols/airplay/timing_server.dart';
 import 'package:dart_cast/src/utils/logger.dart';
 
 /// Controls AirPlay video playback (play, pause, seek, stop, etc.) over an
 /// existing [HapSession].
 ///
-/// Handles V1/V2 format auto-negotiation:
-/// - **V1 binary plist** (`application/x-apple-binary-plist`, no RTSP setup)
-/// - **V1 text/parameters** (legacy plain-text body, no RTSP setup)
-/// - **V2 binary plist** (requires RTSP SETUP + RECORD first)
+/// The protocol version is chosen **from the device's advertised feature
+/// bits**, never by probing:
 ///
-/// All control commands go through the HTTP/1.1 channel (`sendRequest`), not
-/// the RTSP channel.
+/// - bit 38 or bit 48 set → AirPlay 2. Requires bit 49 (`SupportsAirPlayVideoV2`),
+///   an RTSP `SETUP`/`RECORD` handshake with a live UDP timing server, and a
+///   `/rate` command after `/play`.
+/// - otherwise → AirPlay 1. Requires bit 0 (`SupportsAirPlayVideoV1`) and needs
+///   no RTSP setup.
+///
+/// A device that advertises neither video bit is rejected before a single byte
+/// goes out. The package used to send a V1 `/play` first and walk a 404/415
+/// fallback ladder; every AirPlay 2–only receiver answers that first request
+/// with 404, which is the device correctly refusing a request it never claimed
+/// to support.
 class AirPlayMediaController {
   /// The encrypted HAP session used for all communication.
   final HapSession session;
@@ -25,8 +33,15 @@ class AirPlayMediaController {
   /// Feature flags for the target AirPlay device.
   final AirPlayFeatures features;
 
+  /// The UDP timing server used for AirPlay 2 playback.
+  final AirPlayTimingServer timingServer;
+
   /// Creates an [AirPlayMediaController].
-  AirPlayMediaController({required this.session, required this.features});
+  AirPlayMediaController({
+    required this.session,
+    required this.features,
+    AirPlayTimingServer? timingServer,
+  }) : timingServer = timingServer ?? AirPlayTimingServer();
 
   // ---------------------------------------------------------------------------
   // Play commands
@@ -34,12 +49,19 @@ class AirPlayMediaController {
 
   /// Sends a V1 binary plist `/play` request.
   ///
+  /// [startPositionFraction] is a 0.0–1.0 *fraction* of the media, which is
+  /// what the AirPlay 1 `Start-Position` parameter means. AirPlay 2's
+  /// `Start-Position-Seconds` is absolute instead — see [playV2].
+  ///
   /// Does NOT set up an RTSP session first — V1 works over plain HTTP/1.1.
-  Future<HapHttpResponse> playV1(String url, double startPosition) async {
+  Future<HapHttpResponse> playV1(
+    String url,
+    double startPositionFraction,
+  ) async {
     CastLogger.debug('AirPlayMediaController: playV1 url=$url');
     final body = BinaryPlistEncoder.encode({
       'Content-Location': url,
-      'Start-Position': startPosition,
+      'Start-Position': startPositionFraction,
       'X-Apple-Session-ID': session.sessionId,
     });
     return session.sendRequest(
@@ -56,9 +78,18 @@ class AirPlayMediaController {
   /// Sends a V1 text/parameters `/play` request.
   ///
   /// Uses the legacy plain-text body format. Does NOT set up an RTSP session.
-  Future<HapHttpResponse> playV1Text(String url, double startPosition) async {
+  /// [startPositionFraction] carries the same 0.0–1.0 meaning as in [playV1].
+  ///
+  /// Kept for receivers that reject the binary plist body; it is never used
+  /// automatically, because a receiver's feature bits already say which major
+  /// version it speaks.
+  Future<HapHttpResponse> playV1Text(
+    String url,
+    double startPositionFraction,
+  ) async {
     CastLogger.debug('AirPlayMediaController: playV1Text url=$url');
-    final bodyStr = 'Content-Location: $url\nStart-Position: $startPosition\n';
+    final bodyStr =
+        'Content-Location: $url\nStart-Position: $startPositionFraction\n';
     return session.sendRequest(
       'POST',
       '/play',
@@ -73,15 +104,25 @@ class AirPlayMediaController {
 
   /// Sends a V2 binary plist `/play` request.
   ///
-  /// Calls [HapSession.setupRtspSession] first (SETUP + feedback + RECORD),
-  /// then sends the extended AirPlay 2 plist body via HTTP/1.1.
-  Future<HapHttpResponse> playV2(String url, double startPosition) async {
+  /// Binds the [timingServer] and calls [HapSession.setupRtspSession] first
+  /// (SETUP with the timing port + feedback + RECORD), then sends the extended
+  /// AirPlay 2 plist body via HTTP/1.1.
+  ///
+  /// [startPositionSeconds] is an absolute offset in seconds.
+  ///
+  /// This does NOT send the post-`/play` command sequence — [play] does that.
+  Future<HapHttpResponse> playV2(
+    String url,
+    double startPositionSeconds,
+  ) async {
     CastLogger.debug('AirPlayMediaController: playV2 url=$url');
-    await session.setupRtspSession();
+
+    final timingPort = await timingServer.bind();
+    await session.setupRtspSession(timingPort: timingPort);
 
     final body = BinaryPlistEncoder.encode({
       'Content-Location': url,
-      'Start-Position-Seconds': startPosition,
+      'Start-Position-Seconds': startPositionSeconds,
       'uuid': _generateUuid(),
       'streamType': 1,
       'mediaType': 'file',
@@ -110,82 +151,162 @@ class AirPlayMediaController {
     );
   }
 
-  /// Auto-selects the best play format and starts video playback.
+  /// Starts video playback, choosing the protocol version from [features].
   ///
-  /// Selection order:
-  /// 1. V1 binary plist (`application/x-apple-binary-plist`)
-  /// 2. V1 text/parameters (if V1 plist returns 404 or 415)
-  /// 3. V2 with RTSP setup (if V1 text also returns 404 or 415)
+  /// [startPositionSeconds] is an absolute offset. AirPlay 1 cannot express
+  /// that — its `Start-Position` is a fraction of a duration the sender does
+  /// not know yet — so a non-zero value is dropped with a warning on the V1
+  /// path rather than being silently reinterpreted as "99% of the way in".
   ///
-  /// Throws [UnsupportedFeatureException] if the device does not support video.
-  /// Throws [PlaybackException] if all formats are rejected.
-  Future<void> play(String url, {double startPosition = 0.0}) async {
-    if (!features.supportsVideo) {
-      throw UnsupportedFeatureException(
-        'Device does not support video URL cast via AirPlay',
-      );
-    }
-
-    CastLogger.info('AirPlayMediaController: play (auto-negotiate)');
-    CastLogger.debug('AirPlayMediaController: play url=$url');
-
-    // Try V1 binary plist first
-    var resp = await playV1(url, startPosition);
-    CastLogger.debug(
-      'AirPlayMediaController: playV1 response: ${resp.statusCode}',
-    );
-    if (resp.statusCode == 200) {
-      CastLogger.info('AirPlayMediaController: playV1 accepted');
-      return;
-    }
-
-    if (resp.statusCode == 404 || resp.statusCode == 415) {
-      // Try V1 text/parameters
-      resp = await playV1Text(url, startPosition);
-      CastLogger.debug(
-        'AirPlayMediaController: playV1Text response: ${resp.statusCode}',
-      );
-      if (resp.statusCode == 200) {
-        CastLogger.info('AirPlayMediaController: playV1Text accepted');
-        return;
+  /// Throws [UnsupportedFeatureException] if the device advertises no usable
+  /// video bit, and [PlaybackException] if the receiver rejects `/play` or the
+  /// mandatory `/rate` that follows it.
+  Future<void> play(String url, {double startPositionSeconds = 0.0}) async {
+    if (features.isV2Protocol) {
+      if (!features.supportsVideoV2) {
+        throw UnsupportedFeatureException(
+          'AirPlay 2 receiver does not advertise video URL playback '
+          '(bit 49 clear, features=$features). It is most likely a '
+          'mirroring-only or audio-only receiver — try Chromecast or DLNA.',
+        );
       }
-    }
-
-    if (resp.statusCode == 404 || resp.statusCode == 415) {
-      // Try V2 with RTSP
-      resp = await playV2(url, startPosition);
+      CastLogger.info('AirPlayMediaController: play via AirPlay 2 (bit 49)');
+      final resp = await playV2(url, startPositionSeconds);
       CastLogger.debug(
         'AirPlayMediaController: playV2 response: ${resp.statusCode}',
       );
-      if (resp.statusCode == 200) {
-        CastLogger.info('AirPlayMediaController: playV2 accepted');
-        return;
+      if (resp.statusCode == 404) {
+        // Verified on a TCL Google TV running Apple's licensed AirPlay
+        // receiver SDK 3.5.0.244: the handshake up to and including RECORD is
+        // accepted, but the receiver exports only /command, /feedback, /info
+        // and /server-info. There is no /play, /playback-info, /rate or
+        // /scrub, and the string "Content-Location" does not appear in its
+        // binary at all — the AirPlay 1-era REST endpoints simply are not
+        // implemented. Such receivers drive playback over AirPlay 2 unified
+        // media control (feature bit 38) instead, which this package does not
+        // speak yet.
+        throw UnsupportedFeatureException(
+          'Receiver completed the AirPlay 2 handshake but has no /play '
+          'endpoint (404). It uses AirPlay 2 unified media control, which '
+          'dart_cast does not implement — use Chromecast or DLNA for this '
+          'device. See doc/specs/2026-07-25-airplay-hardware-results.md.',
+        );
       }
+      if (resp.statusCode != 200) {
+        throw PlaybackException(
+          'Device rejected AirPlay 2 /play: ${resp.statusCode}',
+          statusCode: resp.statusCode,
+        );
+      }
+      await sendPostPlaySequence();
+      return;
     }
 
-    throw PlaybackException(
-      'Device rejected /play: ${resp.statusCode}',
-      statusCode: resp.statusCode,
+    if (!features.supportsVideoV1) {
+      throw UnsupportedFeatureException(
+        'Device advertises no AirPlay video support '
+        '(bits 0 and 49 clear, features=$features). '
+        'Try Chromecast or DLNA for this device.',
+      );
+    }
+
+    if (startPositionSeconds != 0.0) {
+      CastLogger.warning(
+        'AirPlayMediaController: AirPlay 1 Start-Position is a 0.0-1.0 '
+        'fraction, not seconds — starting from the beginning instead of '
+        '${startPositionSeconds}s',
+      );
+    }
+
+    CastLogger.info('AirPlayMediaController: play via AirPlay 1 (bit 0)');
+    final resp = await playV1(url, 0.0);
+    CastLogger.debug(
+      'AirPlayMediaController: playV1 response: ${resp.statusCode}',
     );
+    if (resp.statusCode != 200) {
+      throw PlaybackException(
+        'Device rejected AirPlay 1 /play: ${resp.statusCode}',
+        statusCode: resp.statusCode,
+      );
+    }
+  }
+
+  /// Sends the commands an AirPlay 2 receiver expects after `/play`.
+  ///
+  /// Order and payloads follow pyatv's `AirPlayV2.play_url`
+  /// (`pyatv/protocols/raop/protocols/airplayv2.py`):
+  ///
+  /// 1. `PUT /setProperty?isInterestedInDateRange`
+  /// 2. `PUT /setProperty?actionAtItemEnd`
+  /// 3. `POST /rate?value=1.000000`
+  /// 4. `PUT /setProperty?forwardEndTime`
+  /// 5. `PUT /setProperty?reverseEndTime`
+  ///
+  /// `/rate` is the one that matters: **an AirPlay 2 `/play` starts the item
+  /// paused**, so a session without it shows a black screen no matter how
+  /// correct the rest of the handshake is. Its failure is fatal; the
+  /// `/setProperty` calls are best-effort.
+  Future<void> sendPostPlaySequence() async {
+    await _setProperty('isInterestedInDateRange', {'value': true});
+    await _setProperty('actionAtItemEnd', {'value': 0});
+
+    CastLogger.info('AirPlayMediaController: POST /rate?value=1.000000');
+    final rateResp = await session.sendRtspRequest(
+      'POST',
+      '/rate?value=1.000000',
+    );
+    if (rateResp.statusCode != 200) {
+      throw PlaybackException(
+        'Device rejected /rate after /play: ${rateResp.statusCode}. '
+        'AirPlay 2 playback starts paused without it.',
+        statusCode: rateResp.statusCode,
+      );
+    }
+
+    const zeroTime = {'flags': 0, 'value': 0, 'epoch': 0, 'timescale': 0};
+    await _setProperty('forwardEndTime', {'value': zeroTime});
+    await _setProperty('reverseEndTime', {'value': zeroTime});
+  }
+
+  Future<void> _setProperty(String property, Map<String, dynamic> body) async {
+    try {
+      final resp = await session.sendRtspRequest(
+        'PUT',
+        '/setProperty?$property',
+        headers: {'Content-Type': 'application/x-apple-binary-plist'},
+        body: BinaryPlistEncoder.encode(body),
+      );
+      if (resp.statusCode != 200) {
+        CastLogger.debug(
+          'AirPlayMediaController: /setProperty?$property returned '
+          '${resp.statusCode} — continuing',
+        );
+      }
+    } catch (e) {
+      CastLogger.debug(
+        'AirPlayMediaController: /setProperty?$property failed: $e — '
+        'continuing',
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Control commands
   // ---------------------------------------------------------------------------
 
-  /// Pauses playback by sending `POST /rate?value=0`.
+  /// Pauses playback by sending `/rate?value=0`.
   Future<void> pause() async {
     CastLogger.info('AirPlayMediaController: pause');
     await _sendControl('POST', '/rate', queryParameters: {'value': '0'});
   }
 
-  /// Resumes playback by sending `POST /rate?value=1`.
+  /// Resumes playback by sending `/rate?value=1`.
   Future<void> resume() async {
     CastLogger.info('AirPlayMediaController: resume');
     await _sendControl('POST', '/rate', queryParameters: {'value': '1'});
   }
 
-  /// Seeks to [positionSeconds] by sending `POST /scrub?position=<pos>`.
+  /// Seeks to [positionSeconds] by sending `/scrub?position=<pos>`.
   Future<void> seek(double positionSeconds) async {
     CastLogger.info('AirPlayMediaController: seek to $positionSeconds');
     await _sendControl(
@@ -195,7 +316,7 @@ class AirPlayMediaController {
     );
   }
 
-  /// Stops playback by sending `POST /stop`.
+  /// Stops playback by sending `/stop`.
   Future<void> stop() async {
     CastLogger.info('AirPlayMediaController: stop');
     await _sendControl('POST', '/stop');
@@ -206,34 +327,63 @@ class AirPlayMediaController {
   // ---------------------------------------------------------------------------
 
   /// Fetches current playback state from the device via `GET /playback-info`.
+  ///
+  /// AirPlay 2 answers with a binary plist, AirPlay 1 with XML; both are
+  /// handled by decoding the raw body against the response `Content-Type`.
   Future<PlaybackInfo> getPlaybackInfo() async {
     CastLogger.debug('AirPlayMediaController: getPlaybackInfo');
     final resp = await session.sendRequest('GET', '/playback-info');
-    return PlistCodec.parsePlaybackInfo(resp.bodyText);
+    return PlistCodec.parsePlaybackInfoBytes(
+      resp.body,
+      contentType: resp.contentType,
+    );
   }
 
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
 
-  /// Releases any resources held by this controller.
+  /// Releases resources held by this controller.
   ///
-  /// Does NOT close the underlying [session] — the session is owned by the
-  /// caller and should be closed separately.
-  void dispose() {
-    // Nothing to release; the session is externally owned.
+  /// Closes the UDP timing server. Does NOT close the underlying [session] —
+  /// that is owned by the caller and should be closed separately.
+  Future<void> dispose() async {
+    await timingServer.close();
   }
 
   // ---------------------------------------------------------------------------
   // Internals
   // ---------------------------------------------------------------------------
 
+  /// Whether control commands should travel over RTSP rather than HTTP.
+  ///
+  /// pyatv issues `/rate` and friends as RTSP exchanges once an AirPlay 2
+  /// session is up; AirPlay 1 receivers only understand the HTTP form.
+  bool get _useRtspControl =>
+      features.isV2Protocol && session.isRtspSessionSetUp;
+
   Future<void> _sendControl(
     String method,
     String path, {
     Map<String, String>? queryParameters,
   }) async {
+    if (_useRtspControl) {
+      final query = _buildQuery(queryParameters);
+      await session.sendRtspRequest(method, '$path$query');
+      return;
+    }
     await session.sendRequest(method, path, queryParameters: queryParameters);
+  }
+
+  static String _buildQuery(Map<String, String>? queryParameters) {
+    if (queryParameters == null || queryParameters.isEmpty) return '';
+    final encoded = queryParameters.entries
+        .map(
+          (e) =>
+              '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value)}',
+        )
+        .join('&');
+    return '?$encoded';
   }
 
   static final _random = Random.secure();
