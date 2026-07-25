@@ -525,6 +525,20 @@ class MediaProxy {
     return '$_baseUrl/ts-stream/$token';
   }
 
+  /// Probes an HLS playlist for its total duration.
+  ///
+  /// Returns null for live streams or when the playlist cannot be read.
+  /// Used by DLNA, which pipes HLS as a length-less TS stream and therefore
+  /// cannot work out the duration by itself.
+  Future<Duration?> probeHlsDuration(
+    String m3u8Url, {
+    Map<String, String> headers = const {},
+  }) async {
+    final handler = _hlsStreamHandler;
+    if (handler == null) return null;
+    return handler.probeDuration(m3u8Url, headers);
+  }
+
   /// Optional planner / muxer for alt-audio routes. Created lazily on
   /// first use; closed in [stop].
   HlsAltAudioPlanner? _altAudioPlanner;
@@ -962,11 +976,74 @@ class MediaProxy {
       return;
     }
 
+    // DLNA renderers seek a non-seekable stream with TimeSeekRange.dlna.org
+    // rather than a byte Range. Honour it by restarting the pipe at the
+    // segment covering that offset.
+    final seekHeader =
+        request.headers.value('TimeSeekRange.dlna.org') ??
+        request.headers.value('X-Seek-Range');
+    var startAt = parseTimeSeekRange(seekHeader);
+
+    // Renderers that only ever ask for `Range: bytes=0-` cannot express a
+    // time seek at all. For those the sender re-points them at the same route
+    // with `?t=<seconds>`, which restarts the pipe at that offset.
+    if (startAt == Duration.zero) {
+      final t = request.uri.queryParameters['t'];
+      final seconds = t == null ? null : double.tryParse(t);
+      if (seconds != null && seconds > 0) {
+        startAt = Duration(milliseconds: (seconds * 1000).round());
+      }
+    }
+    CastLogger.info(
+      'MediaProxy: ts-stream request '
+      '(TimeSeekRange=${seekHeader ?? 'none'}, '
+      'Range=${request.headers.value('Range') ?? 'none'}, '
+      'startAt=${startAt.inSeconds}s)',
+    );
+
     await _hlsStreamHandler!.streamAsTransportStream(
       route.url,
       route.headers,
       request.response,
+      startAt: startAt,
     );
+  }
+
+  /// Parses a DLNA `TimeSeekRange.dlna.org` header value into a start offset.
+  ///
+  /// Accepts the normal-play-time forms DLNA senders use, e.g.
+  /// `npt=120.5-`, `npt=120.5-300.0` and `npt=0:02:00.500-`. Returns
+  /// [Duration.zero] when the header is absent or unparseable, which makes the
+  /// stream behave exactly as it did before time seeking existed.
+  static Duration parseTimeSeekRange(String? value) {
+    if (value == null || value.isEmpty) return Duration.zero;
+
+    final match = RegExp(
+      r'npt\s*=\s*([^-\s]+)',
+      caseSensitive: false,
+    ).firstMatch(value);
+    if (match == null) return Duration.zero;
+
+    final start = match.group(1)!;
+
+    // Plain seconds, possibly fractional.
+    final asSeconds = double.tryParse(start);
+    if (asSeconds != null) {
+      if (asSeconds <= 0) return Duration.zero;
+      return Duration(milliseconds: (asSeconds * 1000).round());
+    }
+
+    // hh:mm:ss(.fff) form.
+    final parts = start.split(':');
+    if (parts.length < 2 || parts.length > 3) return Duration.zero;
+    var seconds = 0.0;
+    for (final part in parts) {
+      final v = double.tryParse(part);
+      if (v == null) return Duration.zero;
+      seconds = seconds * 60 + v;
+    }
+    if (seconds <= 0) return Duration.zero;
+    return Duration(milliseconds: (seconds * 1000).round());
   }
 
   Future<void> _handleStreamRequest(HttpRequest request, String token) async {
@@ -1381,7 +1458,19 @@ class MediaProxy {
         contentType: contentType,
       );
     } catch (e) {
-      CastLogger.error('MediaProxy: raw socket file serve error: $e');
+      // A renderer that seeks, buffers ahead or opens several connections
+      // routinely abandons one mid-body. "Connection reset by peer" and
+      // "Broken pipe" are that, not a server fault — logging them as errors
+      // buries real failures under noise during normal playback.
+      final message = e.toString();
+      final clientAborted =
+          message.contains('Connection reset by peer') ||
+          message.contains('Broken pipe');
+      if (clientAborted) {
+        CastLogger.debug('MediaProxy: client closed the connection: $e');
+      } else {
+        CastLogger.error('MediaProxy: raw socket file serve error: $e');
+      }
     } finally {
       await socket.close();
     }

@@ -41,11 +41,41 @@ class HlsStreamHandler {
   /// against each `EXT-X-MEDIA:TYPE=AUDIO` rendition's `NAME` attribute
   /// when the source uses alt-audio, falling back to `DEFAULT=YES` then
   /// the first rendition.
+  /// Resolves [m3u8Url] and returns the total duration of the media it
+  /// describes, or null when that cannot be determined.
+  ///
+  /// A DLNA renderer fed a piped TS has no way to work out how long the
+  /// content is — there is no container header and no `Content-Length` — so it
+  /// shows `00:00:01` and refuses to draw a scrub bar. Probing the playlist
+  /// here lets the caller advertise the real duration in DIDL-Lite.
+  ///
+  /// Returns null for live playlists, whose duration is not fixed.
+  Future<Duration?> probeDuration(
+    String m3u8Url,
+    Map<String, String> headers,
+  ) async {
+    try {
+      var content = await _fetchString(m3u8Url, headers);
+
+      if (HlsParser.isMasterPlaylist(content)) {
+        final variants = HlsParser.extractVariants(content, m3u8Url);
+        if (variants.isEmpty) return null;
+        content = await _fetchString(variants.first.url, headers);
+      }
+
+      return HlsParser.totalDuration(content);
+    } catch (e) {
+      CastLogger.debug('HlsStreamHandler: duration probe failed: $e');
+      return null;
+    }
+  }
+
   Future<void> streamAsTransportStream(
     String m3u8Url,
     Map<String, String> headers,
     HttpResponse response, {
     String? preferredAudioLanguage,
+    Duration startAt = Duration.zero,
   }) async {
     try {
       final playlistContent = await _fetchString(m3u8Url, headers);
@@ -88,6 +118,7 @@ class HlsStreamHandler {
           mediaPlaylistContent: mediaPlaylistContent,
           headers: headers,
           response: response,
+          startAt: startAt,
         );
         return;
       }
@@ -98,6 +129,7 @@ class HlsStreamHandler {
         mediaPlaylistContent: playlistContent,
         headers: headers,
         response: response,
+        startAt: startAt,
       );
     } catch (e, stack) {
       CastLogger.error(
@@ -119,21 +151,70 @@ class HlsStreamHandler {
     required String mediaPlaylistContent,
     required Map<String, String> headers,
     required HttpResponse response,
+    Duration startAt = Duration.zero,
   }) async {
-    final segmentUrls = HlsParser.extractSegmentUrls(
+    final segments = HlsParser.extractSegments(
       mediaPlaylistContent,
       mediaPlaylistUrl,
     );
-    if (segmentUrls.isEmpty) {
+    if (segments.isEmpty) {
       response.statusCode = HttpStatus.badGateway;
       await response.close();
       return;
     }
 
+    // Seeking a piped TS is done by dropping whole segments: find the first
+    // segment whose time range covers the requested offset and start there.
+    // Byte ranges are meaningless here — the body is generated on the fly and
+    // its length is not known in advance.
+    final total = HlsParser.totalDuration(mediaPlaylistContent);
+    var skipped = 0;
+    var startSeconds = 0.0;
+    if (startAt > Duration.zero) {
+      final target = startAt.inMilliseconds / 1000.0;
+      var elapsed = 0.0;
+      for (final segment in segments) {
+        if (elapsed + segment.duration > target) break;
+        elapsed += segment.duration;
+        skipped++;
+      }
+      startSeconds = elapsed;
+      if (skipped >= segments.length) {
+        // Seek past the end — nothing left to send.
+        response.statusCode = HttpStatus.ok;
+        response.headers.contentType = ContentType('video', 'mp2t');
+        await response.close();
+        return;
+      }
+      CastLogger.info(
+        'HlsStreamHandler: time seek to ${target.toStringAsFixed(1)}s — '
+        'skipping $skipped/${segments.length} segments, starting at '
+        '${startSeconds.toStringAsFixed(1)}s',
+      );
+    }
+
+    final segmentUrls = segments.skip(skipped).map((s) => s.url);
+
     response.statusCode = HttpStatus.ok;
     response.headers.contentType = ContentType('video', 'mp2t');
+    // The stream is generated on demand: byte ranges cannot be honoured, but
+    // time-based seeking can, so advertise exactly that.
     response.headers.set('Accept-Ranges', 'none');
     response.headers.set('Access-Control-Allow-Origin', '*');
+    if (total != null) {
+      final totalSeconds = total.inMilliseconds / 1000.0;
+      response.headers.set(
+        'TimeSeekRange.dlna.org',
+        'npt=${startSeconds.toStringAsFixed(3)}-'
+            '${totalSeconds.toStringAsFixed(3)}/'
+            '${totalSeconds.toStringAsFixed(3)}',
+      );
+      response.headers.set(
+        'X-Seek-Range',
+        'npt=${startSeconds.toStringAsFixed(3)}-'
+            '${totalSeconds.toStringAsFixed(3)}',
+      );
+    }
 
     for (final segmentUrl in segmentUrls) {
       try {

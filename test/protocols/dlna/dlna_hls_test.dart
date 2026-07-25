@@ -229,6 +229,51 @@ void main() {
       expect(setUri.body, isNot(contains('example.com/video.m3u8')));
       // Should use video/mp2t protocolInfo
       expect(setUri.body, contains('video/mp2t'));
+      // DLNA.ORG_OP is "<time-seek><byte-seek>". A piped TS is generated on
+      // demand and answers `Accept-Ranges: none`, so claiming byte-range seek
+      // (OP=01) is a lie — the TCL Google TV responded to a seek by going
+      // straight to STOPPED. Time seek is the only one this route can honour.
+      expect(setUri.body, contains('DLNA.ORG_OP=10'));
+      expect(setUri.body, isNot(contains('DLNA.ORG_OP=01')));
+
+      session.dispose();
+    });
+
+    test('byte-seekable routes still advertise byte-range seek', () async {
+      final device = CastDevice(
+        id: 'uuid:ts-op-test',
+        name: 'TS TV',
+        protocol: CastProtocol.dlna,
+        address: InternetAddress('127.0.0.1'),
+        port: 8080,
+      );
+
+      final description = DlnaDeviceDescription(
+        friendlyName: 'TS TV',
+        udn: 'uuid:ts-op-test',
+        avTransportControlUrl: '$serverUrl/AVTransport/control',
+        renderingControlUrl: '$serverUrl/RenderingControl/control',
+        locationUrl: serverUrl,
+      );
+
+      final session = DlnaSession(device: device, description: description);
+
+      await session.connect();
+      await session.loadMedia(
+        const CastMedia(
+          url: 'http://example.com/video.mp4',
+          type: CastMediaType.mp4,
+          title: 'MP4 Video',
+        ),
+      );
+
+      final setUri = capturedActions.firstWhere(
+        (a) => a.action == 'SetAVTransportURI',
+      );
+
+      // A real file served through the proxy can honour byte ranges, and
+      // seeking one worked on hardware — that path must keep OP=01.
+      expect(setUri.body, contains('DLNA.ORG_OP=01'));
 
       session.dispose();
     });
