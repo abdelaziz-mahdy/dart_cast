@@ -1,3 +1,5 @@
+import 'media_source.dart';
+
 /// Media type for casting.
 enum CastMediaType {
   /// HTTP Live Streaming (m3u8 playlist with TS/fMP4 segments).
@@ -51,6 +53,16 @@ class CastMedia {
   /// Whether this media is a local file (vs. a remote HTTP URL).
   final bool isLocalFile;
 
+  /// Extension appended to the served URL for [CastMedia.source], e.g. `.mp4`.
+  final String? fileExtension;
+
+  /// Bytes supplied by the application rather than read from [url].
+  ///
+  /// Set by [CastMedia.source] for content this package cannot open itself —
+  /// Android `content://` URIs, Flutter assets, decrypted bytes. When present
+  /// the proxy serves these bytes and [url] is ignored.
+  final MediaSource? source;
+
   /// HTTP headers to include when fetching the media (remote URLs only).
   final Map<String, String> httpHeaders;
 
@@ -82,7 +94,9 @@ class CastMedia {
     this.startPosition,
     this.duration,
     this.subtitles = const [],
-  }) : isLocalFile = false;
+  }) : isLocalFile = false,
+       source = null,
+       fileExtension = null;
 
   /// Creates a [CastMedia] for a local file.
   ///
@@ -99,5 +113,29 @@ class CastMedia {
     this.subtitles = const [],
   }) : url = filePath,
        isLocalFile = true,
+       source = null,
+       fileExtension = null,
+       httpHeaders = const {};
+
+  /// Creates a [CastMedia] backed by application-supplied bytes.
+  ///
+  /// Use for content the package cannot open itself — an Android
+  /// `content://` URI, a Flutter asset, decrypted bytes. The proxy serves
+  /// [source] with byte-range support, so seeking works exactly as it does
+  /// for a local file, on Chromecast, DLNA and AirPlay alike.
+  ///
+  /// [fileExtension] is appended to the served URL (e.g. `.mp4`); many
+  /// renderers sniff it to choose a demuxer, so supply it when known.
+  const CastMedia.source(
+    MediaSource this.source, {
+    required this.type,
+    this.fileExtension,
+    this.title,
+    this.imageUrl,
+    this.startPosition,
+    this.duration,
+    this.subtitles = const [],
+  }) : url = '',
+       isLocalFile = false,
        httpHeaders = const {};
 }

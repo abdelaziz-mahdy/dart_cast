@@ -65,8 +65,13 @@ class DefaultMediaTransformer implements MediaTransformer {
   @override
   Future<TransformedMedia> transform(CastMedia media, MediaProxy proxy) async {
     // Register media with proxy
+    // A caller-supplied byte source is served like a local file — same
+    // route, same byte-range support — so it works on every protocol.
+    final source = media.source;
     final proxyUrl =
-        media.isLocalFile
+        source != null
+            ? proxy.registerSource(source, fileExtension: media.fileExtension)
+            : media.isLocalFile
             ? proxy.registerFile(media.url)
             : proxy.registerMedia(media.url, headers: media.httpHeaders);
 

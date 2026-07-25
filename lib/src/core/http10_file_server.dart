@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../utils/logger.dart';
+import 'media_source.dart';
 
 /// Serves files using raw HTTP/1.0 responses over detached sockets.
 ///
@@ -37,8 +38,27 @@ class Http10FileServer {
     HttpRequest request, {
     ContentType? contentType,
   }) async {
-    final fileLength = await file.length();
-    final mime = contentType?.mimeType ?? 'application/octet-stream';
+    final source = MediaSource(
+      length: await file.length(),
+      contentType: contentType?.mimeType ?? 'application/octet-stream',
+      read: file.openRead,
+    );
+    return serveSource(socket, source, request);
+  }
+
+  /// Serves any [MediaSource] over a detached socket, with the same HTTP/1.0
+  /// framing and range handling [serve] gives a file.
+  ///
+  /// This is what lets content that is not a file on disk — a Flutter asset,
+  /// an Android `content://` URI, decrypted bytes — reach a DLNA renderer
+  /// while still supporting seeking.
+  static Future<void> serveSource(
+    Socket socket,
+    MediaSource source,
+    HttpRequest request,
+  ) async {
+    final fileLength = source.length;
+    final mime = source.contentType;
     final rangeHeader = request.headers.value('Range');
 
     int start = 0;
@@ -92,7 +112,7 @@ class Http10FileServer {
     headers.write('\r\n');
 
     CastLogger.debug(
-      'Http10FileServer: ${request.method} '
+      'Http10FileServer: ${request.method} $mime '
       '${start == 0 && end == fileLength - 1 ? 'full file' : 'bytes $start-$end/$fileLength'} '
       '($length bytes) status=$statusCode',
     );
@@ -104,7 +124,8 @@ class Http10FileServer {
       return;
     }
 
-    // Stream file data
-    await file.openRead(start, end + 1).pipe(socket);
+    // Stream the requested range. `end` is inclusive here, and
+    // MediaSourceReader takes an exclusive end, matching File.openRead.
+    await source.read(start, end + 1).pipe(socket);
   }
 }

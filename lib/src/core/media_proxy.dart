@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'hls_alt_audio_proxy.dart';
 import 'hls_parser.dart';
+import 'media_source.dart';
 import 'hls_stream_proxy.dart';
 import 'http10_file_server.dart';
 import 'subtitle_converter.dart';
@@ -14,7 +15,7 @@ import 'ts_dvb_stripper.dart';
 import 'ts_keyframe_scanner.dart';
 
 /// Route type for proxy routing.
-enum _RouteType { remote, localFile, hlsStream, altAudioMuxed }
+enum _RouteType { remote, localFile, source, hlsStream, altAudioMuxed }
 
 /// Synthetic content served directly by the proxy (e.g., generated playlists).
 class _SyntheticContent {
@@ -27,6 +28,9 @@ class _SyntheticContent {
 /// A registered proxy route.
 class _ProxyRoute {
   final _RouteType type;
+
+  /// For [_RouteType.source] routes — the caller-supplied byte source.
+  final MediaSource? source;
   final String url; // remote URL or local file path
   final Map<String, String> headers;
 
@@ -44,6 +48,7 @@ class _ProxyRoute {
   _ProxyRoute({
     required this.type,
     required this.url,
+    this.source,
     this.headers = const {},
     this.altAudioPlan,
     this.stripDvbTables = true,
@@ -188,6 +193,35 @@ class MediaProxy {
       url: filePath,
     );
     return '$_baseUrl/file/$token$ext';
+  }
+
+  /// Registers a caller-supplied [MediaSource] for serving.
+  ///
+  /// Use this for content the proxy cannot open itself — Android
+  /// `content://` URIs, Flutter assets, decrypted bytes, anything behind an
+  /// API this package does not depend on. The application provides the bytes;
+  /// the proxy handles HTTP, byte ranges and seeking.
+  ///
+  /// [fileExtension] is appended to the returned URL (e.g. `.mp4`). Many DLNA
+  /// renderers and Chromecast sniff the extension to pick a demuxer, so supply
+  /// it whenever the container is known.
+  ///
+  /// The returned URL is served over the same path local files use, so it
+  /// works for Chromecast, DLNA and AirPlay alike.
+  String registerSource(MediaSource source, {String? fileExtension}) {
+    final token = _generateToken();
+    final ext = _normaliseExtension(fileExtension);
+    _routes['$token$ext'] = _ProxyRoute(
+      type: _RouteType.source,
+      url: '',
+      source: source,
+    );
+    return '$_baseUrl/file/$token$ext';
+  }
+
+  static String _normaliseExtension(String? extension) {
+    if (extension == null || extension.isEmpty) return '';
+    return extension.startsWith('.') ? extension : '.$extension';
   }
 
   /// Wraps a media URL in a single-segment HLS playlist.
@@ -1348,6 +1382,32 @@ class MediaProxy {
 
   Future<void> _handleFileRequest(HttpRequest request, String token) async {
     final route = _routes[token];
+
+    // Caller-supplied byte sources share this route so they get the same
+    // HTTP/1.0 framing and byte-range handling local files get — that is what
+    // DLNA renderers need, and Chromecast and AirPlay accept it too.
+    if (route != null && route.type == _RouteType.source) {
+      final socket = await request.response.detachSocket(writeHeaders: false);
+      try {
+        await Http10FileServer.serveSource(socket, route.source!, request);
+      } catch (e) {
+        final message = e.toString();
+        final clientAborted =
+            message.contains('Connection reset by peer') ||
+            message.contains('Broken pipe');
+        if (clientAborted) {
+          CastLogger.debug('MediaProxy: client closed the connection: $e');
+        } else {
+          CastLogger.error('MediaProxy: source serve error: $e');
+        }
+      } finally {
+        try {
+          await socket.close();
+        } catch (_) {}
+      }
+      return;
+    }
+
     if (route == null || route.type != _RouteType.localFile) {
       request.response.statusCode = HttpStatus.notFound;
       _addCorsHeaders(request.response, request.headers.value('Origin'));
