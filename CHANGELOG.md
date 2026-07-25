@@ -1,3 +1,36 @@
+## Unreleased
+
+### Fixed
+- **DLNA + HLS: the renderer now gets the real duration.** Remote HLS is piped
+  to DLNA as one continuous MPEG-TS with no `Content-Length`, so the TV had no
+  way to work out how long the content was and reported `00:00:01` with no
+  scrub bar. The playlist is now probed up front (VOD only — a live playlist's
+  length is not fixed) and the total is advertised in the DIDL-Lite `<res>`
+  element. Verified on a TCL Google TV: `00:00:01` -> `00:10:34`.
+- **DLNA + HLS: seeking no longer stops playback.** The piped route advertised
+  `DLNA.ORG_OP=01`, claiming byte-range seek, while serving
+  `Accept-Ranges: none`. A seek made the renderer go straight to `STOPPED`.
+  Piped routes now advertise `DLNA.ORG_OP=10` (time seek), the proxy honours
+  `TimeSeekRange.dlna.org`, and — for renderers that only ever send
+  `Range: bytes=0-` and never a time seek, which is what the TCL does — the
+  session re-points the renderer at the same route with the offset in the URL
+  so the pipe restarts at the right segment. Positions stay absolute across
+  such a restart.
+- A renderer's placeholder duration no longer overwrites one we determined
+  ourselves, which used to collapse the corrected duration back to 1 second on
+  the first poll.
+- Client-aborted proxy connections (`Connection reset by peer`, `Broken pipe`)
+  are logged at debug rather than error. Renderers abandon connections
+  routinely while buffering and seeking; logging each as an error buried real
+  failures during normal playback.
+
+### New
+- `HlsParser.extractSegments`, `HlsParser.totalDuration`,
+  `HlsParser.isCompletePlaylist`
+- `MediaProxy.probeHlsDuration` and `MediaProxy.parseTimeSeekRange`
+- `tool/dlna_hardware_check.dart` — end-to-end DLNA verification against a real
+  renderer, with and without a sidecar subtitle track
+
 ## 0.6.0
 
 ### New

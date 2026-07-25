@@ -21,6 +21,23 @@ class DlnaSession extends CastSession {
   final DlnaHttpClient _httpClient;
   final MediaProxy _proxy;
   final MediaTransformer _mediaTransformer;
+
+  /// Duration we determined ourselves (explicit or probed from the source).
+  /// Preferred over whatever the renderer reports for piped streams.
+  Duration? _knownDuration;
+
+  /// Whether the current route is a generated TS pipe rather than a real file.
+  bool _isPipedStream = false;
+
+  /// Title of the current item, reused when a piped stream is restarted.
+  String? _currentTitle;
+
+  /// Offset the current piped stream was restarted at.
+  ///
+  /// A restarted pipe begins at zero as far as the renderer is concerned, so
+  /// this is added back to reported positions to keep the scrub bar absolute.
+  Duration _pipedStartOffset = Duration.zero;
+
   Timer? _pollTimer;
   bool _isPolling = false;
   bool _isLoadingMedia = false;
@@ -152,31 +169,51 @@ class DlnaSession extends CastSession {
     // renderer knows the codec without probing the stream.
     const dlnaFlags = '01700000000000000000000000000000';
 
+    // Piped-TS routes are generated on the fly: there is no Content-Length and
+    // byte ranges cannot be served. DLNA.ORG_OP is "<time-seek><byte-seek>",
+    // so those routes must advertise 10 (time seek only) rather than 01.
+    // Claiming byte-range seek on a stream that answers `Accept-Ranges: none`
+    // is what made this TV stop playback the moment a seek was issued.
+    const opByteSeek = 'DLNA.ORG_OP=01';
+    const opTimeSeek = 'DLNA.ORG_OP=10';
+    var isPipedStream = false;
+    Duration? probedDuration;
+
     if (media.type == CastMediaType.hls) {
       // Remote HLS → pipe as continuous MPEG-TS stream for DLNA. The
       // handler internally detects alternate-audio HLS and muxes
       // video+audio per segment via [TsAltAudioRemuxer] so the TV
       // gets one continuous TS regardless of source layout.
+      isPipedStream = true;
+      // Probe the source playlist before piping it: a renderer given a
+      // length-less TS otherwise reports a 1-second duration and draws no
+      // scrub bar.
+      probedDuration = await _proxy.probeHlsDuration(
+        media.url,
+        headers: media.httpHeaders,
+      );
       proxyUrl = _proxy.registerHlsAsStream(
         media.url,
         headers: media.httpHeaders,
       );
       protocolInfo =
-          'http-get:*:video/mp2t:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+          'http-get:*:video/mp2t:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;$opTimeSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
     } else if (transformed.effectiveType == CastMediaType.hls) {
       // Transformer wrapped media in HLS → pipe as TS stream for DLNA
+      isPipedStream = true;
+      probedDuration = await _proxy.probeHlsDuration(proxyUrl);
       proxyUrl = _proxy.registerHlsAsStream(proxyUrl);
       protocolInfo =
-          'http-get:*:video/mp2t:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+          'http-get:*:video/mp2t:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;$opTimeSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
     } else if (transformed.effectiveType == CastMediaType.mpegTs) {
       protocolInfo =
-          'http-get:*:video/mp2t:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+          'http-get:*:video/mp2t:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;$opByteSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
     } else if (transformed.effectiveType == CastMediaType.mkv) {
       protocolInfo =
-          'http-get:*:video/x-matroska:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+          'http-get:*:video/x-matroska:$opByteSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
     } else {
       protocolInfo =
-          'http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_HP_HD_AAC;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+          'http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_HP_HD_AAC;$opByteSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
     }
 
     _currentProxyUrl = proxyUrl;
@@ -200,11 +237,20 @@ class DlnaSession extends CastSession {
       );
     }
 
-    // Build duration string for DIDL-Lite <res> element (HH:MM:SS)
+    // Build duration string for DIDL-Lite <res> element (HH:MM:SS).
+    // An explicit media.duration wins; otherwise use whatever the HLS probe
+    // found, so piped streams still get a scrub bar.
+    final effectiveDuration = media.duration ?? probedDuration;
     final durationStr =
-        media.duration != null
-            ? NetworkUtils.formatDuration(media.duration!)
+        effectiveDuration != null
+            ? NetworkUtils.formatDuration(effectiveDuration)
             : null;
+    if (isPipedStream) {
+      CastLogger.info(
+        'DLNA: piped TS route, seek mode=time, '
+        'duration=${durationStr ?? 'unknown'}',
+      );
+    }
 
     // File size for local files — helps DLNA renderer know the content length
     final fileSize = media.isLocalFile ? File(media.url).lengthSync() : null;
@@ -224,8 +270,12 @@ class DlnaSession extends CastSession {
 
     // Set known duration immediately if available (the TV may report 0
     // for piped streams since it doesn't know the total size upfront)
-    if (media.duration != null) {
-      updateDuration(media.duration!);
+    _knownDuration = effectiveDuration;
+    _isPipedStream = isPipedStream;
+    _currentTitle = media.title;
+    _pipedStartOffset = Duration.zero;
+    if (effectiveDuration != null) {
+      updateDuration(effectiveDuration);
     }
 
     // Send Play
@@ -277,10 +327,51 @@ class DlnaSession extends CastSession {
   @override
   Future<void> seek(Duration position) async {
     CastLogger.info('DLNA: Seek to ${position.inSeconds}s');
+
+    if (_isPipedStream) {
+      // A piped TS has no length and no byte offsets, so a renderer cannot
+      // seek inside it — the TCL Google TV answers a REL_TIME Seek by simply
+      // going to STOPPED. Re-point it at the same route with the offset
+      // encoded instead: the proxy restarts the stream at that segment, which
+      // is a seek from the viewer's point of view.
+      await _reloadPipedStreamAt(position);
+      _pipedStartOffset = position;
+      updatePosition(position);
+      return;
+    }
+
     await _sendAvTransport('Seek', DlnaSoapBuilder.buildSeek(position));
     // Update position immediately so the UI reflects the seek without
     // waiting for the next polling cycle.
     updatePosition(position);
+  }
+
+  /// Restarts a piped-TS route at [position] by re-issuing SetAVTransportURI.
+  Future<void> _reloadPipedStreamAt(Duration position) async {
+    final baseUrl = _currentProxyUrl;
+    final protocolInfo = _currentProtocolInfo;
+    if (baseUrl == null || protocolInfo == null) return;
+
+    final seconds = position.inMilliseconds / 1000.0;
+    final separator = baseUrl.contains('?') ? '&' : '?';
+    final seekUrl = '$baseUrl${separator}t=${seconds.toStringAsFixed(3)}';
+
+    CastLogger.info('DLNA: restarting piped stream at ${position.inSeconds}s');
+
+    await _sendAvTransport('Stop', DlnaSoapBuilder.buildStop());
+    await _sendAvTransport(
+      'SetAVTransportURI',
+      DlnaSoapBuilder.buildSetAVTransportURI(
+        seekUrl,
+        title: _currentTitle,
+        protocolInfo: protocolInfo,
+        duration:
+            _knownDuration != null
+                ? NetworkUtils.formatDuration(_knownDuration!)
+                : null,
+      ),
+    );
+    await _sendAvTransport('Play', DlnaSoapBuilder.buildPlay());
   }
 
   @override
@@ -440,11 +531,17 @@ class DlnaSession extends CastSession {
       CastLogger.debug(
         'DLNA: poll position=${posInfo.position.inSeconds}s, duration=${posInfo.duration.inSeconds}s',
       );
-      updatePosition(posInfo.position);
-      // Only update duration from device if it reports a non-zero value.
-      // Piped TS streams may report 0 — keep the known duration instead.
-      if (posInfo.duration > Duration.zero) {
-        updateDuration(posInfo.duration);
+      updatePosition(posInfo.position + _pipedStartOffset);
+      // Only trust the device's duration when we have nothing better.
+      // A renderer fed a length-less piped TS reports a placeholder — this TV
+      // says 0:00:01 — which would otherwise clobber the real duration probed
+      // from the HLS playlist and collapse the scrub bar.
+      final deviceDuration = posInfo.duration;
+      final known = _knownDuration;
+      final devicePlaceholder = deviceDuration <= const Duration(seconds: 2);
+      if (deviceDuration > Duration.zero &&
+          !(known != null && devicePlaceholder)) {
+        updateDuration(deviceDuration);
       }
 
       // Get transport info for state detection
