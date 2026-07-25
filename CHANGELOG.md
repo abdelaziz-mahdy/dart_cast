@@ -11,10 +11,9 @@ AirPlay 2 and DLNA HLS fixes, driven by testing against a TCL Google TV.
 - DLNA: seeking works when casting HLS — it previously stopped playback outright
 - DLNA: HLS casts report the real duration instead of one second
 - DLNA: routine connection churn no longer floods the log with errors
-- AirPlay: AirPlay 2 receivers are handled properly — pairing (no PIN needed on most smart TVs), session setup and keep-alive. The package used to fall back to a legacy path these devices reject
-- AirPlay: devices that cannot cast video fail immediately with a clear reason instead of failing silently
-- AirPlay: playback position and duration report correctly instead of staying at zero, and receiver errors surface instead of being swallowed
-- AirPlay: `startPosition` is honoured instead of always starting from the beginning
+- AirPlay: AirPlay 2 receivers pair and establish a session correctly — PIN-less transient pairing, RTSP setup and keep-alive, all confirmed against a real TV. The package previously fell back to a legacy path these devices reject
+- AirPlay: failures report a cause instead of being swallowed — an unsupported device, a rejected handshake or a receiver-reported error now surfaces
+- AirPlay: further video-path corrections (protocol version selection, playback-state parsing, request ordering, `startPosition`). **Unverified end to end** — no receiver tested accepts a video URL, so nothing past the handshake can be exercised yet
 
 ### New
 - `AirPlayTimingServer`, transient pairing, `PlaybackInfo.error`
