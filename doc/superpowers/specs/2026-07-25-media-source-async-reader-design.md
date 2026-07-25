@@ -65,6 +65,33 @@ existing implementation keeps compiling unchanged: `MediaSource.bytes`,
 `MediaSource.file`, the test sources, and the reader in
 `tool/chromecast_hardware_check.dart`. Callers gain an option; none lose one.
 
+**Corrected during implementation.** That claim holds for anyone *supplying* a
+reader, which is the normal way the API is used. It does not hold for anyone
+*calling* `source.read(...)` directly: the result is now a `FutureOr` and must
+be awaited before the stream is usable. The only in-tree caller is
+`Http10FileServer.serveSource`, and one test that read a source directly needed
+the same one-line change. `MediaSource.read` is a public field, so a consumer
+could in principle be affected — worth naming rather than glossing.
+
+### `async*` readers need a declared return type
+
+Also found during implementation: an inline `async*` closure does not infer
+correctly against a `FutureOr` context. Dart resolves
+
+```dart
+read: (start, end) async* { ... }
+```
+
+to `Stream<FutureOr<Stream<List<int>>>>` and rejects the argument. An `async*`
+reader must therefore be a function with a declared signature:
+
+```dart
+Stream<List<int>> readRange(int start, int end) async* { ... }
+```
+
+`async` (non-generator) closures infer fine. The doc comment shows both shapes,
+because this is exactly the trap the reporting user would hit first.
+
 ### Call site
 
 One place consumes the reader:

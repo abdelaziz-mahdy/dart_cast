@@ -1,3 +1,8 @@
+## 0.7.3
+
+### New
+- `MediaSource` readers may now open asynchronously — an `async` function satisfies the reader, so sources backed by Android `content://` URIs, network handles or a decrypt handshake no longer need a `Stream.fromFuture(...)` workaround ([#12](https://github.com/abdelaziz-mahdy/dart_cast/issues/12)). Existing synchronous readers are unaffected; an `async*` reader needs a declared return type, which the `MediaSource` docs show
+
 ## 0.7.2
 
 ### Fixed
