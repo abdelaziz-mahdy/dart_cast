@@ -21,13 +21,13 @@ Cast media to Chromecast, AirPlay, and DLNA devices from pure Dart.
 
 ## Protocol Status
 
-**Use Chromecast.** It is the only protocol with a recorded end-to-end success
-against real hardware in this repository.
+**Chromecast and DLNA both play media on real hardware.** AirPlay does not —
+its handshake is verified but no tested receiver accepts a video URL.
 
 | Protocol | Hardware-verified? | Evidence | Use it? |
 |---|---|---|---|
 | **Chromecast** | **Yes** — media actually played | Full local-file cast to a TCL Google TV captured in [`test/integration/logs.txt`](test/integration/logs.txt) (`Local file loaded successfully`) | **Recommended** |
-| **DLNA** | Discovery only | Devices discovered in the same capture; no playback trace is recorded in this repo. Playback is covered by mock-server tests and developer reports, not by a captured device session | Reasonable second choice, especially for local MKV |
+| **DLNA** | **Yes** — media actually played | Local MP4 and remote HLS both played on a TCL Google TV on 2026-07-25: correct duration, position advancing, pause/resume/seek all working (`tool/dlna_hardware_check.dart`). Sidecar subtitles did **not** render | Good second choice, especially for local MKV |
 | **AirPlay** | Handshake yes, playback **no** | Pairing, RTSP `SETUP` with timing server, event channel and `RECORD` all verified against a real receiver on 2026-07-25. `/play` returns 404 — see below | **Not for video.** Use Chromecast or DLNA |
 
 > **A passing test suite is not hardware verification.** All 750+ tests here run
