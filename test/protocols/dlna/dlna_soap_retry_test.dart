@@ -35,8 +35,18 @@ class _FlakyRenderer {
   void _handle(Socket socket) {
     _seen++;
     final mine = _seen;
+
+    // A request does not necessarily arrive in one read. Windows in
+    // particular delivers the headers and the body as separate events, so
+    // respond exactly once per connection — writing twice throws
+    // "StreamSink is bound to a stream" as the second write races the flush.
+    var answered = false;
+
     socket.listen(
       (_) {
+        if (answered) return;
+        answered = true;
+
         if (mine <= failures) {
           // Close mid-exchange, exactly as the reported renderer does.
           socket.destroy();
@@ -52,7 +62,7 @@ class _FlakyRenderer {
           'Content-Length: ${soap.length}\r\n'
           '\r\n$soap',
         );
-        socket.flush().then((_) => socket.destroy());
+        socket.flush().then((_) => socket.destroy()).catchError((Object _) {});
       },
       onError: (Object _) {},
       cancelOnError: true,
