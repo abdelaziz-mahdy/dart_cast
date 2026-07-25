@@ -1,7 +1,131 @@
+import 'dart:convert';
+
+import 'package:dart_cast/src/protocols/airplay/auth/binary_plist.dart';
 import 'package:dart_cast/src/protocols/airplay/plist_codec.dart';
 import 'package:test/test.dart';
 
 void main() {
+  group('PlistCodec binary plist support', () {
+    // AirPlay 2 answers /playback-info with a binary plist. Feeding that
+    // through utf8.decode and an XML regex parser — the only path that
+    // existed — yields an all-zero PlaybackInfo, so the session never left
+    // `loading` and position/duration stayed at 0 forever.
+    Map<String, dynamic> playbackInfoDict({
+      double rate = 1.0,
+      Map<String, dynamic>? error,
+    }) => {
+      'duration': 5400.0,
+      'position': 123.5,
+      'rate': rate,
+      'readyToPlay': true,
+      'playbackBufferEmpty': false,
+      'playbackLikelyToKeepUp': true,
+      if (error != null) 'error': error,
+    };
+
+    test('isBinaryPlist recognises the bplist00 magic', () {
+      final binary = BinaryPlistEncoder.encode(playbackInfoDict());
+      expect(PlistCodec.isBinaryPlist(binary), isTrue);
+      expect(PlistCodec.isBinaryPlist(utf8.encode('<plist>')), isFalse);
+      expect(PlistCodec.isBinaryPlist(const []), isFalse);
+      expect(PlistCodec.isBinaryPlist(const [0x62, 0x70]), isFalse);
+    });
+
+    test('parses a binary plist body declared by Content-Type', () {
+      final body = BinaryPlistEncoder.encode(playbackInfoDict());
+
+      final info = PlistCodec.parsePlaybackInfoBytes(
+        body,
+        contentType: PlistCodec.binaryPlistContentType,
+      );
+
+      expect(info.duration, closeTo(5400.0, 0.001));
+      expect(info.position, closeTo(123.5, 0.001));
+      expect(info.rate, closeTo(1.0, 0.001));
+      expect(info.readyToPlay, isTrue);
+      expect(info.hasDuration, isTrue);
+    });
+
+    test('sniffs a binary plist when the Content-Type header is missing', () {
+      final body = BinaryPlistEncoder.encode(playbackInfoDict(rate: 0.0));
+
+      final info = PlistCodec.parsePlaybackInfoBytes(body);
+
+      expect(info.duration, closeTo(5400.0, 0.001));
+      expect(info.rate, isZero);
+    });
+
+    test('still parses an XML body on the same entry point', () {
+      const xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>duration</key><real>300.0</real>
+    <key>position</key><real>45.0</real>
+    <key>rate</key><real>1.0</real>
+</dict>
+</plist>''';
+
+      final info = PlistCodec.parsePlaybackInfoBytes(
+        utf8.encode(xml),
+        contentType: 'text/x-apple-plist+xml',
+      );
+
+      expect(info.duration, closeTo(300.0, 0.001));
+      expect(info.position, closeTo(45.0, 0.001));
+    });
+
+    test('falls back to XML when a body is mislabelled as binary', () {
+      const xml =
+          '<plist version="1.0"><dict>'
+          '<key>rate</key><real>1.0</real></dict></plist>';
+
+      final info = PlistCodec.parsePlaybackInfoBytes(
+        utf8.encode(xml),
+        contentType: PlistCodec.binaryPlistContentType,
+      );
+
+      expect(info.rate, closeTo(1.0, 0.001));
+    });
+
+    test('surfaces the error dict a receiver reports', () {
+      final body = BinaryPlistEncoder.encode(
+        playbackInfoDict(error: {'code': -12645, 'domain': 'NSURLErrorDomain'}),
+      );
+
+      final info = PlistCodec.parsePlaybackInfoBytes(
+        body,
+        contentType: PlistCodec.binaryPlistContentType,
+      );
+
+      expect(info.error, isNotNull);
+      expect(info.error!.code, equals(-12645));
+      expect(info.error!.domain, equals('NSURLErrorDomain'));
+      expect(info.error.toString(), contains('NSURLErrorDomain'));
+    });
+
+    test('hasDuration distinguishes "nothing playing" from duration 0', () {
+      final idle = PlistCodec.parsePlaybackInfoBytes(
+        BinaryPlistEncoder.encode({'position': 0.0, 'rate': 0.0}),
+      );
+      expect(idle.hasDuration, isFalse);
+      expect(idle.duration, isZero);
+
+      final zeroLength = PlistCodec.parsePlaybackInfoBytes(
+        BinaryPlistEncoder.encode({'duration': 0.0, 'rate': 0.0}),
+      );
+      expect(zeroLength.hasDuration, isTrue);
+    });
+
+    test('returns an empty result for an empty or unparseable body', () {
+      expect(PlistCodec.parsePlist(const []), isEmpty);
+      expect(PlistCodec.parsePlist(utf8.encode('not a plist')), isEmpty);
+
+      final info = PlistCodec.parsePlaybackInfoBytes(const []);
+      expect(info.duration, isZero);
+      expect(info.error, isNull);
+    });
+  });
+
   group('PlistCodec', () {
     group('parseXmlPlist', () {
       test('parses dict with real values', () {

@@ -48,6 +48,26 @@ Future<void> _sendResponse(
   await serverSock.flush();
 }
 
+/// Answers [request] with a 200, matching its protocol (RTSP or HTTP) and
+/// echoing the request's CSeq so the client can correlate the response.
+Future<void> _respondOk(
+  HapSession serverSess,
+  Socket serverSock,
+  String request,
+) async {
+  if (!request.contains('RTSP/1.0')) {
+    await _sendResponse(serverSess, serverSock, 200, 'OK');
+    return;
+  }
+  final cseq = RegExp(r'CSeq: (\d+)').firstMatch(request)?.group(1) ?? '1';
+  final resp = 'RTSP/1.0 200 OK\r\nCSeq: $cseq\r\nContent-Length: 0\r\n\r\n';
+  final encrypted = await serverSess.encrypt(
+    Uint8List.fromList(utf8.encode(resp)),
+  );
+  serverSock.add(encrypted);
+  await serverSock.flush();
+}
+
 /// Creates an encrypted client/server pair with a fixed known key.
 Future<({ServerSocket server, HapSession client})> createEncryptedPair() async {
   final key = Uint8List(32);
@@ -522,50 +542,131 @@ void main() {
       expect(requestCount, equals(1));
     });
 
-    test('falls back to V1 text on 404 from V1 plist', () async {
-      final pair = await createEncryptedPair();
-      server = pair.server;
-      client = pair.client;
+    test(
+      'never falls back to text/parameters when V1 /play is refused',
+      () async {
+        final pair = await createEncryptedPair();
+        server = pair.server;
+        client = pair.client;
 
-      final controller = AirPlayMediaController(
-        session: client,
-        features: _featuresV1,
-      );
+        final controller = AirPlayMediaController(
+          session: client,
+          features: _featuresV1,
+        );
 
-      final requests = <String>[];
-      server.listen((sock) async {
-        final srvSess = _serverSession(sock, server.port);
-        while (true) {
-          try {
-            final data = await srvSess.readDecryptedData(
-              timeout: const Duration(milliseconds: 500),
-            );
-            final req = utf8.decode(data, allowMalformed: true);
-            requests.add(req);
-            // First call: 404, second call: 200
-            final code = requests.length == 1 ? 404 : 200;
-            final phrase = code == 200 ? 'OK' : 'Not Found';
-            await _sendResponse(srvSess, sock, code, phrase);
-          } catch (_) {
-            break;
+        final requests = <String>[];
+        server.listen((sock) async {
+          final srvSess = _serverSession(sock, server.port);
+          while (true) {
+            try {
+              final data = await srvSess.readDecryptedData(
+                timeout: const Duration(milliseconds: 500),
+              );
+              requests.add(utf8.decode(data, allowMalformed: true));
+              await _sendResponse(srvSess, sock, 404, 'Not Found');
+            } catch (_) {
+              break;
+            }
           }
-        }
-      });
+        });
 
-      await controller.play('https://example.com/video.m3u8');
+        await expectLater(
+          controller.play('https://example.com/video.m3u8'),
+          throwsA(isA<PlaybackException>()),
+        );
 
-      expect(requests.length, equals(2));
-      // First request: binary plist (application/x-apple-binary-plist)
-      expect(
-        requests[0].toLowerCase(),
-        contains('content-type: application/x-apple-binary-plist'),
-      );
-      // Second request: text/parameters
-      expect(
-        requests[1].toLowerCase(),
-        contains('content-type: text/parameters'),
-      );
-    });
+        // A refused /play used to trigger a text/parameters retry and then a
+        // full V2 RTSP handshake. The device's feature bits already said which
+        // version it speaks — retrying is how the real bug stayed hidden.
+        expect(requests.length, equals(1));
+        expect(
+          requests.single.toLowerCase(),
+          contains('content-type: application/x-apple-binary-plist'),
+        );
+      },
+    );
+
+    test(
+      'bit-49-only device goes straight to V2, never sends a V1 /play',
+      () async {
+        final pair = await createEncryptedPair();
+        server = pair.server;
+        client = pair.client;
+
+        // Roku Express / TCL Google TV shape: video V2 only, no video V1.
+        const featuresV2Only = AirPlayFeatures(0x000bcf46007f8ad0);
+        final controller = AirPlayMediaController(
+          session: client,
+          features: featuresV2Only,
+        );
+        addTearDown(controller.dispose);
+
+        final requests = <String>[];
+        server.listen((sock) async {
+          final srvSess = _serverSession(sock, server.port);
+          while (true) {
+            try {
+              final data = await srvSess.readDecryptedData(
+                timeout: const Duration(milliseconds: 500),
+              );
+              final req = utf8.decode(data, allowMalformed: true);
+              requests.add(req);
+              await _respondOk(srvSess, sock, req);
+            } catch (_) {
+              break;
+            }
+          }
+        });
+
+        await controller.play('https://example.com/video.m3u8');
+
+        final playRequests =
+            requests.where((r) => r.contains('/play')).toList();
+        expect(playRequests, hasLength(1));
+        expect(
+          playRequests.single.toLowerCase(),
+          isNot(contains('content-type: text/parameters')),
+        );
+        expect(
+          playRequests.single,
+          contains('X-Apple-ProtocolVersion: 1'),
+          reason: 'the single /play must be the AirPlay 2 form',
+        );
+        // The V2 handshake must have run first.
+        expect(requests.any((r) => r.contains('SETUP')), isTrue);
+      },
+    );
+
+    test(
+      'AirPlay 2 receiver without bit 49 is rejected before any request',
+      () async {
+        final pair = await createEncryptedPair();
+        server = pair.server;
+        client = pair.client;
+
+        // Bits 38/48 set (AirPlay 2), bit 49 clear: mirroring-only receiver.
+        const mirroringOnly = AirPlayFeatures((1 << 38) | (1 << 48));
+        final controller = AirPlayMediaController(
+          session: client,
+          features: mirroringOnly,
+        );
+
+        var requestCount = 0;
+        server.listen((sock) async {
+          final srvSess = _serverSession(sock, server.port);
+          try {
+            await srvSess.readDecryptedData();
+            requestCount++;
+          } catch (_) {}
+        });
+
+        await expectLater(
+          controller.play('https://example.com/video.m3u8'),
+          throwsA(isA<UnsupportedFeatureException>()),
+        );
+        expect(requestCount, isZero);
+      },
+    );
   });
 
   group('AirPlayMediaController.pause()', () {
