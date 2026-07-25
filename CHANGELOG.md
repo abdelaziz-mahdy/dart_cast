@@ -1,3 +1,8 @@
+## Unreleased
+
+### New
+- `MediaSource` + `MediaProxy.registerSource()` + `CastMedia.source()` — cast bytes the package cannot open itself: Android `content://` URIs, Flutter assets, decrypted or in-memory content ([#12](https://github.com/abdelaziz-mahdy/dart_cast/issues/12)). The application supplies a range-aware reader; the proxy handles HTTP, byte ranges and seeking. Works on Chromecast, DLNA and AirPlay, since it uses the same route local files already use
+
 ## 0.7.0
 
 AirPlay 2 and DLNA HLS fixes, driven by testing against a TCL Google TV.
