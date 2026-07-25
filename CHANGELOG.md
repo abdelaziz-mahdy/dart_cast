@@ -8,16 +8,13 @@ AirPlay 2 and DLNA HLS fixes, driven by testing against a TCL Google TV. Full Ai
 - `AirPlayMediaController.dispose()` returns `Future<void>`; `play()` takes `startPositionSeconds:` instead of `startPosition:`
 
 ### Fixed
-- DLNA: seeking piped HLS no longer stops playback — the route advertised byte-range seek while serving `Accept-Ranges: none`; it now uses time seek and restarts the pipe at the requested offset
-- DLNA: `durationStream` reports the duration probed from the HLS playlist instead of the renderer's 1-second placeholder (the renderer's own on-screen readout is unaffected)
-- DLNA: client-aborted proxy connections log at debug, not error
-- AirPlay: the AirPlay 2 path is reachable at all — the encrypted controller is built for every AirPlay 2 receiver, not only ones returning 403
-- AirPlay: transient pairing (`X-Apple-HKP: 4`) implemented — the PIN-less flow modern smart TVs actually use
-- AirPlay: RTSP `SETUP` advertises a live UDP timing server and the sender's IP; a rejected `SETUP`/`RECORD` throws instead of being marked successful
-- AirPlay: `POST /rate` follows `/play`, without which an AirPlay 2 receiver stays paused
-- AirPlay: `/playback-info` decodes as a binary plist, so position and duration stop reading as zero; receiver errors surface
-- AirPlay: requests on the encrypted socket are serialized, so `/feedback` cannot steal a response or desynchronise the ChaCha20 nonces
-- AirPlay: `requiresHapPairing` includes bit 43, `MdnsServiceInfo.supportsVideo` accepts bit 49, `media.startPosition` reaches the device, pair-verify releases its socket
+- DLNA: seeking works when casting HLS — it previously stopped playback outright
+- DLNA: HLS casts report the real duration instead of one second
+- DLNA: routine connection churn no longer floods the log with errors
+- AirPlay: AirPlay 2 receivers are handled properly — pairing (no PIN needed on most smart TVs), session setup and keep-alive. The package used to fall back to a legacy path these devices reject
+- AirPlay: devices that cannot cast video fail immediately with a clear reason instead of failing silently
+- AirPlay: playback position and duration report correctly instead of staying at zero, and receiver errors surface instead of being swallowed
+- AirPlay: `startPosition` is honoured instead of always starting from the beginning
 
 ### New
 - `AirPlayTimingServer`, transient pairing, `PlaybackInfo.error`
