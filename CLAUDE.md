@@ -39,6 +39,63 @@ Things that have actually broken CI here:
 `flutter pub outdated` (run in repo root *and* `example/`) is the canonical
 way to decide whether a bump is needed — prefer it over pub.dev scraping.
 
+## Changelog entries are written for readers, not authors
+
+`### Fixed` says what changes for someone *using* the package. `### Breaking`
+and `### New` may carry exact API names, because a developer deciding whether to
+upgrade needs them. Mechanism belongs in the commit message and, for protocol
+work, in `doc/specs/`.
+
+```
+- DLNA: seeking works when casting HLS — it previously stopped playback outright
+```
+
+not
+
+```
+- DLNA: the route advertised DLNA.ORG_OP=01 while serving Accept-Ranges: none,
+  so it now advertises time seek and honours TimeSeekRange.dlna.org
+```
+
+Nobody scanning a changelog to decide on an upgrade knows what `DLNA.ORG_OP`,
+a ChaCha20 nonce or feature bit 43 is, and they should not have to.
+
+## Do not overstate what was tested
+
+This package is cast to physical TVs regularly, and that testing predates any
+given session. Never write "first release verified on hardware", "has never
+worked on a real device", or similar. If a recorded trace is missing, say the
+*result was not recorded* — do not imply the testing never happened.
+
+State only what was measured, name the device, and keep untested paths marked
+untested. `README.md`'s protocol table and `doc/specs/*-hardware-results.md` are
+the places where hardware claims live; keep them consistent with each other.
+
+## A tool's own arithmetic is not verification
+
+Hardware scripts under `tool/` must judge success on values the **device**
+reports, never on a number the tool computed. Both of these shipped a false
+PASS during the 0.7.0 work:
+
+- a DLNA seek check added its own offset to the device position and printed
+  `position=60s` while the TV sat on a "Loading…" screen
+- a duration fix was reported as "the renderer now gets the real duration" when
+  the renderer still answered `GetPositionInfo` with 1 second — only *our*
+  session value had changed
+
+Rules that follow from that:
+
+- Assert on device-reported progress plus device-reported state (still
+  `PLAYING`, position still advancing several seconds later).
+- A mock server proves the code does what its author expected, nothing more.
+  Make mocks adversarial — `test/protocols/airplay/mock_airplay2_server.dart`
+  rejects `SETUP` without a timing port and holds `rate` at 0 until `/rate`.
+- `adb exec-out screencap` cannot capture the video plane on a Google TV: a
+  black frame is not evidence of a black screen. UI overlays *do* capture, so
+  it is still useful for reading pairing codes and transport UI.
+- When the user says something did not work, believe them over a green check
+  and go find the independent measurement.
+
 ## Versioning
 
 Pre-1.0 semver is in force: breaking changes (SDK floor bump, major
