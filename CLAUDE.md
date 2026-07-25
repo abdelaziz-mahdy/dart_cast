@@ -71,22 +71,39 @@ State only what was measured, name the device, and keep untested paths marked
 untested. `README.md`'s protocol table and `doc/specs/*-hardware-results.md` are
 the places where hardware claims live; keep them consistent with each other.
 
-## A tool's own arithmetic is not verification
+## Changing code is not fixing behaviour
 
-Hardware scripts under `tool/` must judge success on values the **device**
-reports, never on a number the tool computed. Both of these shipped a false
-PASS during the 0.7.0 work:
+Three claims went out during the 0.7.0 work that no measurement supported. They
+failed in two distinct ways, and both are easy to repeat.
 
-- a DLNA seek check added its own offset to the device position and printed
-  `position=60s` while the TV sat on a "Loading…" screen
-- a duration fix was reported as "the renderer now gets the real duration" when
-  the renderer still answered `GetPositionInfo` with 1 second — only *our*
-  session value had changed
+**1. The check marked its own homework.** Hardware scripts under `tool/` must
+judge success on values the **device** reports, never on a number the tool
+computed.
 
-Rules that follow from that:
+- A DLNA seek check added its own offset to the device position and printed
+  `position=60s` while the TV sat on a "Loading…" screen.
+- A duration fix was written up as "the renderer now gets the real duration"
+  when the renderer still answered `GetPositionInfo` with 1 second. Only *our*
+  session value had changed.
 
-- Assert on device-reported progress plus device-reported state (still
-  `PLAYING`, position still advancing several seconds later).
+Assert on device-reported progress **and** device-reported state — still
+`PLAYING`, position still advancing several seconds later.
+
+**2. The code path was never executed.** A diff that looks correct is not a
+fixed behaviour. AirPlay changes to `/rate`, playback-state parsing and
+`startPosition` were listed as fixes, but playback never starts on any tested
+receiver, so none of that code has ever run outside a mock.
+
+Before writing that something is fixed, answer: *has this line executed against
+real hardware, and what did the device do?* If the answer is "only in tests",
+say so in the same breath — `**Unverified end to end**` is a perfectly good
+changelog entry. Describe the change, not an outcome nobody observed.
+
+A cheap self-check: if the entry contradicts the `Known limitations` section a
+few lines below it, one of the two is wrong.
+
+Also worth remembering:
+
 - A mock server proves the code does what its author expected, nothing more.
   Make mocks adversarial — `test/protocols/airplay/mock_airplay2_server.dart`
   rejects `SETUP` without a timing port and holds `rate` at 0 until `/rate`.
@@ -94,7 +111,7 @@ Rules that follow from that:
   black frame is not evidence of a black screen. UI overlays *do* capture, so
   it is still useful for reading pairing codes and transport UI.
 - When the user says something did not work, believe them over a green check
-  and go find the independent measurement.
+  and go find the independent measurement. They were right all three times.
 
 ## Versioning
 
