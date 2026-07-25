@@ -25,7 +25,7 @@ Cast media to Chromecast, AirPlay, and DLNA devices from pure Dart.
 |---|---|---|
 | **Chromecast** | Streaming, local files, subtitles | **Recommended** |
 | **DLNA** | Local files, especially MKV with embedded subtitles | Works |
-| **AirPlay** | — | **Not for video** — see [`doc/AIRPLAY.md`](doc/AIRPLAY.md) |
+| **AirPlay** | Pairing and session setup | Video fails on the devices tested so far — [reports welcome](doc/AIRPLAY.md) |
 
 > For local file casting, remux `.ts` to `.mp4` with ffmpeg.
 > See [`doc/LOCAL_FILE_CASTING.md`](doc/LOCAL_FILE_CASTING.md).
@@ -34,16 +34,19 @@ Cast media to Chromecast, AirPlay, and DLNA devices from pure Dart.
 
 | Use Case | Chromecast | DLNA | AirPlay |
 |----------|-----------|------|---------|
-| Stream HLS (remote) | Yes | Partial (piped as TS) | No |
-| Stream MP4 (remote) | Yes | No | No |
-| Local MP4 / TS files | Yes | Yes | No |
-| Local MKV files | No | Yes | No |
-| Custom byte sources (`content://`, assets) | Yes | Yes | No |
-| Subtitles (sidecar VTT) | Yes | No | No |
+| Stream HLS (remote) | Yes | Partial (piped as TS) | Not yet* |
+| Stream MP4 (remote) | Yes | No | Not yet* |
+| Local MP4 / TS files | Yes | Yes | Not yet* |
+| Local MKV files | No | Yes | Not yet* |
+| Custom byte sources (`content://`, assets) | Yes | Yes | Not yet* |
+| Subtitles (sidecar VTT) | Yes | No | Unimplemented |
 | Subtitles (MKV embedded) | — | Yes | — |
-| Seeking / resume from position | Yes | Yes | No |
-| Volume control | Yes | Yes | No |
-| Subtitle switching | Yes | Requires reload | No |
+| Seeking / resume from position | Yes | Yes | Not yet* |
+| Volume control | Yes | Yes | Unimplemented |
+| Subtitle switching | Yes | Requires reload | Unimplemented |
+
+\* Implemented, but blocked by the receivers tested rather than by missing code
+— see [`doc/AIRPLAY.md`](doc/AIRPLAY.md).
 
 ### Protocol Notes
 
@@ -61,12 +64,12 @@ Cast media to Chromecast, AirPlay, and DLNA devices from pure Dart.
 - Local file seeking via byte-range requests (206 Partial Content)
 
 **AirPlay**
-- Pairing and session setup work; video casting does not on any tested receiver — see [`doc/AIRPLAY.md`](doc/AIRPLAY.md)
+- Pairing and session setup work. Video casting fails on every receiver tested so far; no Apple TV has been tried. See [`doc/AIRPLAY.md`](doc/AIRPLAY.md) — results from other devices are very welcome
 - Screen mirroring and RAOP audio unimplemented
 
 ### Known Limitations
 
-- **AirPlay video**: does not work on tested receivers -- see [`doc/AIRPLAY.md`](doc/AIRPLAY.md). Screen mirroring is unimplemented.
+- **AirPlay video**: fails on the receivers tested so far -- see [`doc/AIRPLAY.md`](doc/AIRPLAY.md), which explains why and how to test your own device. Screen mirroring is unimplemented.
 - **Local TS on Chromecast**: `TsHlsMediaTransformer` has per-segment buffering and subtitle drift. Remux to MP4 via ffmpeg instead -- see [`example/lib/ffmpeg_media_transformer.dart`](example/lib/ffmpeg_media_transformer.dart).
 - **DLNA streaming**: HLS is piped as MPEG-TS, so a renderer's own on-screen duration may show a placeholder even though `durationStream` reports the real length.
 - **DLNA subtitle styling**: The TV controls styling, not the app.
@@ -372,9 +375,10 @@ try {
 
 ### Hardware status
 
-AirPlay video does not work on any receiver tested, and the reason is not
-something a sender can fix. See [`doc/AIRPLAY.md`](doc/AIRPLAY.md) for which
-devices were tested, why they fail, and how to check your own.
+AirPlay video fails on every receiver tested so far, for a reason specific to
+those devices rather than to this package. No Apple TV has been tried. See
+[`doc/AIRPLAY.md`](doc/AIRPLAY.md) for which devices were tested, why they fail,
+and how to check your own — results from other hardware are welcome.
 
 ## Error Handling
 

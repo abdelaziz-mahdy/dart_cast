@@ -1,10 +1,17 @@
 # AirPlay status
 
-**Short version: don't use AirPlay for video casting. Use Chromecast or DLNA.**
+**Short version: video casting fails on the receivers tested so far. If you
+need it working today, use Chromecast or DLNA.**
 
-Pairing and session setup work. Video casting does not work on any receiver
-tested — and on the one examined closely, it cannot, because the device does not
-implement the endpoint video casting needs.
+Pairing and session setup work. Video casting has not succeeded on any device
+tried — and on the one examined closely it cannot, because that device does not
+implement the endpoint video casting needs. That is a property of that receiver,
+not a general statement about AirPlay: a receiver that does implement `/play`
+should work, and none has been tested.
+
+**If you have other hardware — an Apple TV especially — results are very
+welcome.** See [Trying it on your own device](#trying-it-on-your-own-device);
+it takes two commands.
 
 ## What works
 
