@@ -103,6 +103,42 @@ class AirPlayClient {
     return PlistCodec.parseServerInfo(response.body);
   }
 
+  /// Probes the device for its capability map.
+  ///
+  /// Tries `GET /info` (the AirPlay 2 endpoint) first and falls back to
+  /// `GET /server-info` (AirPlay 1). A non-200 from either is reported as an
+  /// empty map rather than an error: pyatv treats a missing `/info` the same
+  /// way, and a receiver that implements only one of the two must not fail at
+  /// connect time before playback is even attempted.
+  ///
+  /// [authRequired] is set when the device answered 403, which means the
+  /// caller has to pair before it can talk to it.
+  Future<({Map<String, dynamic> properties, bool authRequired})>
+  probeDeviceInfo() async {
+    bool authRequired = false;
+
+    // Network failures propagate — those mean the device is unreachable,
+    // which is a genuine connect error.
+    for (final path in const ['/info', '/server-info']) {
+      final response = await _httpClient.get(_uri(path), headers: _headers);
+      if (response.statusCode == 403) {
+        authRequired = true;
+        continue;
+      }
+      if (response.statusCode != 200) continue;
+      final properties = PlistCodec.parsePlist(
+        response.bodyBytes,
+        contentType: response.headers['content-type'] ?? '',
+      );
+      // An empty 200 tells us nothing about the device, and stopping here
+      // would hide a 403 from the endpoint we have not tried yet.
+      if (properties.isEmpty) continue;
+      return (properties: properties, authRequired: false);
+    }
+
+    return (properties: <String, dynamic>{}, authRequired: authRequired);
+  }
+
   /// Gets the current scrub position as (duration, position) in seconds.
   Future<({double duration, double position})> getScrubPosition() async {
     final response = await _httpClient.get(_uri('/scrub'), headers: _headers);
