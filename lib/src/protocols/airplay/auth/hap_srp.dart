@@ -52,6 +52,13 @@ class HapSrp {
   // Ed25519 key pair generated for this pairing
   SimpleKeyPair? _signingKeyPair;
 
+  /// The SRP shared secret `K = H(S)`, available once [step2] has run.
+  ///
+  /// Transient pairing stops at M4 and derives the HAP channel keys straight
+  /// from this value, so it needs to be readable without going through the
+  /// M5/M6 credential exchange.
+  Uint8List? get sharedKey => _sharedSecret;
+
   /// Initializes the SRP client state.
   ///
   /// Returns the client's SRP public key 'A'.
