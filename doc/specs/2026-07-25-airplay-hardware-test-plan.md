@@ -9,9 +9,9 @@
 
 ## Why this document exists
 
-The package has 757 passing tests and an AirPlay implementation that has never
-once succeeded against a physical receiver. Every one of those tests runs
-against a mock. A mock proves the code does what its author expected; it cannot
+The package has 757 passing tests and an AirPlay implementation that hardware
+testing had already shown failing, without the repository recording why. Every
+one of those tests runs against a mock. A mock proves the code does what its author expected; it cannot
 prove the receiver agrees.
 
 The mock in `test/protocols/airplay/mock_airplay2_server.dart` was written to be
@@ -239,7 +239,7 @@ Only meaningful once Phase 3 passes.
 - [ ] **4.3 — Seek** to the middle of the file; confirm the picture jumps.
 - [ ] **4.4 — Resume from position:** cast with `CastMedia(startPosition: Duration(seconds: 90))`
       and confirm playback begins ~90s in. This path was dropped entirely before
-      this change and has never run against hardware.
+      this change, so it has no recorded hardware result.
 - [ ] **4.5 — Stop**, then cast again on the same session. Catches state that
       `resetRtspSession` fails to clear.
 - [ ] **4.6 — Long run:** leave it playing for 5+ minutes. The `/feedback` loop
@@ -276,7 +276,7 @@ Create `doc/specs/2026-07-25-airplay-hardware-results.md` containing:
 
 Then update the hardware matrix in `README.md`, replacing the "not yet verified
 against hardware" note with what was actually observed. That matrix is the
-artefact this repository has never had, and the reason the previous README
+artefact this repository has been missing, and the reason the previous README
 claim ("reliable only on Apple TV") was wrong: no Apple TV has ever been tested.
 
 ---

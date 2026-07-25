@@ -32,8 +32,8 @@ its handshake is verified but no tested receiver accepts a video URL.
 
 > **A passing test suite is not hardware verification.** All 750+ tests here run
 > against mock servers. The AirPlay work is the cautionary tale: 666 tests passed
-> for four months against a protocol path that had never once succeeded on a real
-> device. Where this README says "verified", it means a captured session with a
+> for months against a protocol path that hardware testing had already shown
+> failing — the suite simply could not see it. Where this README says "verified", it means a captured session with a
 > physical device; where it doesn't, assume it hasn't been.
 
 ### AirPlay: read this before using it
