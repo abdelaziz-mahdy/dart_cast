@@ -1,6 +1,6 @@
 ## 0.7.0
 
-AirPlay and DLNA HLS taken to a real TV for the first time. Full AirPlay findings in `doc/specs/2026-07-25-airplay-hardware-results.md`.
+AirPlay 2 and DLNA HLS fixes, driven by testing against a TCL Google TV. Full AirPlay findings in `doc/specs/2026-07-25-airplay-hardware-results.md`.
 
 ### Breaking
 - AirPlay selects its protocol version from the advertised feature bits instead of probing `/play`; devices with no video bit throw `UnsupportedFeatureException` immediately
