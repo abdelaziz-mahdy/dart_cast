@@ -1,16 +1,6 @@
-## Unreleased
-
-### New
-- `MediaSource` + `MediaProxy.registerSource()` + `CastMedia.source()` — cast bytes the package cannot open itself: Android `content://` URIs, Flutter assets, decrypted or in-memory content ([#12](https://github.com/abdelaziz-mahdy/dart_cast/issues/12)). The application supplies a range-aware reader; the proxy handles HTTP, byte ranges and seeking. Works on Chromecast, DLNA and AirPlay, since it uses the same route local files already use
-- `tool/chromecast_hardware_check.dart` — end-to-end Chromecast verification against a real receiver, covering local files, remote HLS and byte sources, with pause/resume/seek judged on receiver-reported position
-
-### Fixed
-- DLNA: a playback command no longer throws `ClientException: Connection closed before full header was received` when the renderer drops an idle connection — the action is retried once on a fresh connection ([#9](https://github.com/abdelaziz-mahdy/dart_cast/issues/9)). Reproduced against a mock renderer; the LG smartshare device from the report was not available to confirm
-- DLNA: a renderer that accepts a connection and then stalls now fails after 10s instead of hanging the caller forever
-
 ## 0.7.0
 
-AirPlay 2 and DLNA HLS fixes, driven by testing against a TCL Google TV.
+AirPlay 2 and DLNA fixes plus caller-supplied byte sources, driven by testing against a TCL Google TV.
 
 ### Breaking
 - AirPlay selects its protocol version from the advertised feature bits instead of probing `/play`; devices with no video bit throw `UnsupportedFeatureException` immediately
@@ -20,15 +10,18 @@ AirPlay 2 and DLNA HLS fixes, driven by testing against a TCL Google TV.
 ### Fixed
 - DLNA: seeking works when casting HLS — it previously stopped playback outright
 - DLNA: HLS casts report the real duration instead of one second
+- DLNA: a playback command no longer crashes with `ClientException: Connection closed before full header was received` when the renderer drops an idle connection — the action is retried once ([#9](https://github.com/abdelaziz-mahdy/dart_cast/issues/9))
+- DLNA: a renderer that accepts a connection then stalls fails after 10s instead of hanging the caller forever
 - DLNA: routine connection churn no longer floods the log with errors
 - AirPlay: AirPlay 2 receivers pair and establish a session correctly — PIN-less transient pairing, RTSP setup and keep-alive, all confirmed against a real TV. The package previously fell back to a legacy path these devices reject
 - AirPlay: failures report a cause instead of being swallowed — an unsupported device, a rejected handshake or a receiver-reported error now surfaces
 - AirPlay: further video-path corrections (protocol version selection, playback-state parsing, request ordering, `startPosition`). **Unverified end to end** — no receiver tested accepts a video URL, so nothing past the handshake can be exercised yet
 
 ### New
+- `MediaSource` + `MediaProxy.registerSource()` + `CastMedia.source()` — cast bytes the package cannot open itself: Android `content://` URIs, Flutter assets, decrypted or in-memory content ([#12](https://github.com/abdelaziz-mahdy/dart_cast/issues/12)). The application supplies a range-aware reader; the proxy handles HTTP, byte ranges and seeking. Works on Chromecast, DLNA and AirPlay, since it uses the same route local files already use
 - `AirPlayTimingServer`, transient pairing, `PlaybackInfo.error`
 - `HlsParser.totalDuration` / `extractSegments`, `MediaProxy.probeHlsDuration` / `parseTimeSeekRange`
-- `tool/airplay_probe.dart`, `tool/airplay_hardware_check.dart`, `tool/dlna_hardware_check.dart` — hardware verification scripts
+- `tool/airplay_probe.dart`, `tool/airplay_hardware_check.dart`, `tool/dlna_hardware_check.dart`, `tool/chromecast_hardware_check.dart` — hardware verification scripts
 
 ### Known limitations
 - AirPlay video does not play on the TV tested and cannot: that receiver exposes no `/play` endpoint, and Apple's own QuickTime fails on it identically — use Chromecast
