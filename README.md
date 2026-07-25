@@ -26,7 +26,7 @@ its handshake is verified but no tested receiver accepts a video URL.
 
 | Protocol | Hardware-verified? | Evidence | Use it? |
 |---|---|---|---|
-| **Chromecast** | **Yes** — media actually played | Full local-file cast to a TCL Google TV captured in [`test/integration/logs.txt`](test/integration/logs.txt) (`Local file loaded successfully`) | **Recommended** |
+| **Chromecast** | **Yes** — media actually played | Local file, remote HLS and a caller-supplied `MediaSource` all cast to a TCL Google TV on 2026-07-25, with pause, resume and seek confirmed against receiver-reported position (`tool/chromecast_hardware_check.dart`) | **Recommended** |
 | **DLNA** | **Yes** — media actually played | Local MP4 and remote HLS both played on a TCL Google TV on 2026-07-25: correct duration, position advancing, pause/resume/seek all working (`tool/dlna_hardware_check.dart`). Sidecar subtitles did **not** render | Good second choice, especially for local MKV |
 | **AirPlay** | Handshake yes, playback **no** | Pairing, RTSP `SETUP` with timing server, event channel and `RECORD` all verified against a real receiver on 2026-07-25. `/play` returns 404 — see below | **Not for video.** Use Chromecast or DLNA |
 
