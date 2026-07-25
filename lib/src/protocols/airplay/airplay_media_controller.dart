@@ -175,6 +175,23 @@ class AirPlayMediaController {
       CastLogger.debug(
         'AirPlayMediaController: playV2 response: ${resp.statusCode}',
       );
+      if (resp.statusCode == 404) {
+        // Verified on a TCL Google TV running Apple's licensed AirPlay
+        // receiver SDK 3.5.0.244: the handshake up to and including RECORD is
+        // accepted, but the receiver exports only /command, /feedback, /info
+        // and /server-info. There is no /play, /playback-info, /rate or
+        // /scrub, and the string "Content-Location" does not appear in its
+        // binary at all — the AirPlay 1-era REST endpoints simply are not
+        // implemented. Such receivers drive playback over AirPlay 2 unified
+        // media control (feature bit 38) instead, which this package does not
+        // speak yet.
+        throw UnsupportedFeatureException(
+          'Receiver completed the AirPlay 2 handshake but has no /play '
+          'endpoint (404). It uses AirPlay 2 unified media control, which '
+          'dart_cast does not implement — use Chromecast or DLNA for this '
+          'device. See doc/specs/2026-07-25-airplay-hardware-results.md.',
+        );
+      }
       if (resp.statusCode != 200) {
         throw PlaybackException(
           'Device rejected AirPlay 2 /play: ${resp.statusCode}',
