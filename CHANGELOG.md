@@ -1,6 +1,6 @@
 ## 0.7.0
 
-First release verified against real hardware. Full AirPlay findings in `doc/specs/2026-07-25-airplay-hardware-results.md`.
+AirPlay and DLNA HLS taken to a real TV for the first time. Full AirPlay findings in `doc/specs/2026-07-25-airplay-hardware-results.md`.
 
 ### Breaking
 - AirPlay selects its protocol version from the advertised feature bits instead of probing `/play`; devices with no video bit throw `UnsupportedFeatureException` immediately
