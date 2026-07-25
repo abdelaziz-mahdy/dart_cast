@@ -1,8 +1,12 @@
 ## Unreleased
 
 ### New
-- `tool/chromecast_hardware_check.dart` — end-to-end Chromecast verification against a real receiver, covering local files, remote HLS and byte sources, with pause/resume/seek judged on receiver-reported position
 - `MediaSource` + `MediaProxy.registerSource()` + `CastMedia.source()` — cast bytes the package cannot open itself: Android `content://` URIs, Flutter assets, decrypted or in-memory content ([#12](https://github.com/abdelaziz-mahdy/dart_cast/issues/12)). The application supplies a range-aware reader; the proxy handles HTTP, byte ranges and seeking. Works on Chromecast, DLNA and AirPlay, since it uses the same route local files already use
+- `tool/chromecast_hardware_check.dart` — end-to-end Chromecast verification against a real receiver, covering local files, remote HLS and byte sources, with pause/resume/seek judged on receiver-reported position
+
+### Fixed
+- DLNA: a playback command no longer throws `ClientException: Connection closed before full header was received` when the renderer drops an idle connection — the action is retried once on a fresh connection ([#9](https://github.com/abdelaziz-mahdy/dart_cast/issues/9)). Reproduced against a mock renderer; the LG smartshare device from the report was not available to confirm
+- DLNA: a renderer that accepts a connection and then stalls now fails after 10s instead of hanging the caller forever
 
 ## 0.7.0
 

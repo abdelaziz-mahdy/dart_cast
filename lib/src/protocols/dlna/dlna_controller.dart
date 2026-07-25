@@ -280,9 +280,25 @@ class DlnaHttpClient {
   /// Creates a [DlnaHttpClient] with an optional HTTP client for testing.
   DlnaHttpClient({http.Client? client}) : _client = client ?? http.Client();
 
+  /// How long to wait for a renderer to answer a SOAP action.
+  ///
+  /// Without this a renderer that accepts the connection and then stalls
+  /// blocks the caller forever; playback controls are user-facing, so failing
+  /// is better than hanging.
+  static const Duration actionTimeout = Duration(seconds: 10);
+
   /// Sends a SOAP action to the given control URL.
   ///
   /// Returns the response body as a string.
+  ///
+  /// Retried once when the connection drops before a complete response. Many
+  /// renderers close an idle keep-alive connection without telling the client,
+  /// so the first write after a pause lands on a socket the device has already
+  /// discarded — reported as
+  /// `ClientException: Connection closed before full header was received`.
+  /// Retrying on a fresh connection is the standard mitigation; the action
+  /// itself is re-sent, so it must be one that tolerates being repeated
+  /// (`Play`, `Pause`, `Seek`, `Stop` and the getters all do).
   Future<String> sendAction(
     String controlUrl,
     String serviceType,
@@ -295,14 +311,16 @@ class DlnaHttpClient {
         action != 'GetVolume') {
       CastLogger.debug('DLNA: SOAP $action request body:\n$body');
     }
-    final response = await _client.post(
-      Uri.parse(controlUrl),
-      headers: {
-        'Content-Type': 'text/xml; charset=utf-8',
-        'SOAPAction': '"$serviceType#$action"',
-      },
-      body: body,
-    );
+
+    http.Response response;
+    try {
+      response = await _post(controlUrl, serviceType, action, body);
+    } on http.ClientException catch (e) {
+      CastLogger.warning(
+        'DLNA: SOAP $action lost the connection ($e) — retrying once',
+      );
+      response = await _post(controlUrl, serviceType, action, body);
+    }
 
     if (response.statusCode >= 400) {
       CastLogger.error(
@@ -316,6 +334,33 @@ class DlnaHttpClient {
     }
 
     return response.body;
+  }
+
+  Future<http.Response> _post(
+    String controlUrl,
+    String serviceType,
+    String action,
+    String body,
+  ) {
+    return _client
+        .post(
+          Uri.parse(controlUrl),
+          headers: {
+            'Content-Type': 'text/xml; charset=utf-8',
+            'SOAPAction': '"$serviceType#$action"',
+          },
+          body: body,
+        )
+        .timeout(
+          actionTimeout,
+          onTimeout:
+              () =>
+                  throw ProtocolException(
+                    'DLNA SOAP $action timed out after '
+                    '${actionTimeout.inSeconds}s',
+                    CastProtocol.dlna,
+                  ),
+        );
   }
 
   /// Closes the underlying HTTP client.
