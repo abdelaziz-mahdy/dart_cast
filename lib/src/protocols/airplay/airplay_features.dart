@@ -59,8 +59,26 @@ class AirPlayFeatures {
   /// Whether the device supports audio streaming (bit 9).
   bool get supportsAudio => _hasBit(9);
 
-  /// Whether the device requires HAP pairing (bit 46 or bit 48).
-  bool get requiresHapPairing => _hasBit(46) || _hasBit(48);
+  /// Whether the device supports legacy (pre-HAP) pairing (bit 27).
+  bool get supportsLegacyPairing => _hasBit(27);
+
+  /// Whether the device advertises system pairing (bit 43).
+  bool get supportsSystemPairing => _hasBit(43);
+
+  /// Whether the device supports CoreUtils pairing and encryption (bit 48).
+  bool get supportsCoreUtilsPairing => _hasBit(48);
+
+  /// Whether the device requires HAP pairing (bit 43, 46 or 48).
+  ///
+  /// pyatv treats bit 43 (`SupportsSystemPairing`) as requiring credentials
+  /// alongside bit 48, see `pyatv/protocols/airplay/auth/__init__.py`.
+  bool get requiresHapPairing => _hasBit(43) || _hasBit(46) || _hasBit(48);
+
+  /// Whether the device accepts *transient* pairing (bit 43 or bit 48).
+  ///
+  /// Transient pairing needs no PIN and no persisted credentials — pyatv
+  /// selects it whenever either bit is present.
+  bool get supportsTransientPairing => _hasBit(43) || _hasBit(48);
 
   /// Whether the device uses the AirPlay 2 protocol (bit 38 or bit 48).
   bool get isV2Protocol => _hasBit(38) || _hasBit(48);
