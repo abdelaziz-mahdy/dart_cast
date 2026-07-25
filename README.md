@@ -93,7 +93,7 @@ Chromecast column has a captured hardware session behind it.
 - Uses HTTP/1.0 raw socket server -- Dart's HTTP/1.1 breaks some TVs (e.g., TCL Google TV)
 - Embed SRT in MKV for subtitles (most TVs ignore sidecar files)
 - TV controls subtitle styling
-- HLS piped as TS: works, but reports zero duration and cannot seek
+- HLS piped as TS: plays, and seeking now works (the pipe restarts at the requested offset). The session reports the real duration probed from the playlist; the TV's own on-screen readout may still show a placeholder, which a sender cannot change
 - Local file seeking via byte-range requests (206 Partial Content)
 
 **AirPlay**
@@ -105,7 +105,7 @@ Chromecast column has a captured hardware session behind it.
 
 - **AirPlay video**: the AirPlay 2 handshake is hardware-verified, but no tested receiver accepts `/play` -- modern smart TVs use AirPlay 2 unified media control (`/command`), which is unimplemented. See the hardware matrix below. Screen mirroring is also unimplemented.
 - **Local TS on Chromecast**: `TsHlsMediaTransformer` has per-segment buffering and subtitle drift. Remux to MP4 via ffmpeg instead -- see [`example/lib/ffmpeg_media_transformer.dart`](example/lib/ffmpeg_media_transformer.dart).
-- **DLNA streaming**: HLS piped as TS works, but reports zero duration and cannot seek.
+- **DLNA streaming**: HLS is piped as MPEG-TS. Seeking works via a pipe restart, and `durationStream` carries the real length; a renderer's own UI may still show a placeholder duration because the stream has no `Content-Length`.
 - **DLNA subtitle styling**: The TV controls styling, not the app.
 
 ## Supported Platforms
