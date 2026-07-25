@@ -1,3 +1,11 @@
+## 0.7.1
+
+Documentation only — no code changes.
+
+- AirPlay's status, the reason video fails on the receivers tested, and how to check your own device moved out of the README into [`doc/AIRPLAY.md`](doc/AIRPLAY.md)
+- Protocol status is scoped to the devices actually tested rather than reading as a verdict on AirPlay itself; results from other hardware, an Apple TV especially, are welcome
+- The feature table distinguishes "implemented but blocked by the receiver" from "not built yet"
+
 ## 0.7.0
 
 AirPlay 2 and DLNA fixes plus caller-supplied byte sources, driven by testing against a TCL Google TV.
