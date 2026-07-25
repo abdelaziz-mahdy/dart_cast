@@ -17,10 +17,14 @@ at fault, documented honestly.
   `startPositionSeconds:` in place of the version-ambiguous `startPosition:`.
 
 ### Fixed — DLNA
-- HLS duration is probed from the source playlist and advertised to the
-  renderer. A piped MPEG-TS has no `Content-Length`, so TVs reported
-  `00:00:01` and drew no scrub bar. Verified on a TCL Google TV:
-  `00:00:01` → `00:10:34`.
+- HLS duration is probed from the source playlist, so the **session** reports
+  the real length instead of the renderer's placeholder. A piped MPEG-TS has no
+  `Content-Length`, and the TCL Google TV tested answers `GetPositionInfo` with
+  `TrackDuration` of 1 second, which used to propagate straight into
+  `durationStream`. Apps built on this package now get `0:10:34` for a 10m34s
+  stream. The duration is also sent in DIDL-Lite `<res duration>`, but that TV
+  ignores it — its own on-screen UI still shows the placeholder, which is not
+  something a sender can fix.
 - Seeking piped HLS no longer stops playback. The route claimed byte-range seek
   (`DLNA.ORG_OP=01`) while serving `Accept-Ranges: none`. Piped routes now
   advertise time seek, honour `TimeSeekRange.dlna.org`, and — for renderers
