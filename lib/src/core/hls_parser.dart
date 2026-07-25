@@ -217,6 +217,88 @@ class HlsParser {
     return segments;
   }
 
+  /// Extracts segment URLs together with their `#EXTINF` durations.
+  ///
+  /// Same parsing rules as [extractSegmentUrls], but each entry also carries
+  /// the segment's declared duration in seconds. A segment whose `#EXTINF`
+  /// cannot be parsed gets `0.0`, which keeps the list aligned with
+  /// [extractSegmentUrls] rather than silently dropping entries.
+  static List<({String url, double duration})> extractSegments(
+    String content,
+    String baseUrl,
+  ) {
+    final lines = content.split('\n');
+    final segments = <({String url, double duration})>[];
+    var expectUri = false;
+    var pendingDuration = 0.0;
+
+    for (final line in lines) {
+      final trimmed = line.trim();
+      if (trimmed.isEmpty) continue;
+
+      if (trimmed.startsWith('#EXTINF:')) {
+        expectUri = true;
+        // "#EXTINF:10.5,title" — the duration ends at the comma.
+        final value = trimmed.substring('#EXTINF:'.length).split(',').first;
+        pendingDuration = double.tryParse(value.trim()) ?? 0.0;
+        continue;
+      }
+
+      if (trimmed.startsWith('#EXT-X-BYTERANGE:') && expectUri) {
+        continue;
+      }
+
+      if (expectUri && !trimmed.startsWith('#')) {
+        segments.add((
+          url: resolveUrl(trimmed, baseUrl),
+          duration: pendingDuration,
+        ));
+        expectUri = false;
+        pendingDuration = 0.0;
+        continue;
+      }
+
+      if (trimmed.startsWith('#')) {
+        if (!trimmed.startsWith('#EXT-X-BYTERANGE:')) {
+          expectUri = false;
+        }
+        continue;
+      }
+
+      expectUri = false;
+    }
+
+    return segments;
+  }
+
+  /// Whether [content] is a complete (VOD) playlist rather than a live one.
+  ///
+  /// Only a playlist ending in `#EXT-X-ENDLIST` has a total duration that
+  /// will not change, so only those can be advertised to a renderer.
+  static bool isCompletePlaylist(String content) =>
+      content.contains('#EXT-X-ENDLIST');
+
+  /// Total duration of a media playlist, or null when it cannot be trusted.
+  ///
+  /// Returns null for live playlists (no `#EXT-X-ENDLIST`) and for playlists
+  /// with no parseable `#EXTINF` durations. DLNA renderers use this to show a
+  /// scrub bar; advertising a duration that later changes is worse than
+  /// advertising none.
+  static Duration? totalDuration(String content) {
+    if (!isCompletePlaylist(content)) return null;
+
+    var seconds = 0.0;
+    for (final line in content.split('\n')) {
+      final trimmed = line.trim();
+      if (!trimmed.startsWith('#EXTINF:')) continue;
+      final value = trimmed.substring('#EXTINF:'.length).split(',').first;
+      seconds += double.tryParse(value.trim()) ?? 0.0;
+    }
+
+    if (seconds <= 0) return null;
+    return Duration(milliseconds: (seconds * 1000).round());
+  }
+
   /// Given a master playlist, extract variant playlist URLs sorted by
   /// bandwidth (highest first).
   ///

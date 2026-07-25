@@ -1,58 +1,65 @@
-## Unreleased
+## 0.7.0
 
-### Changed (behaviour)
-- **AirPlay no longer probes `/play`.** The protocol version is chosen from the
-  device's advertised feature bits before any request is sent, so a receiver
-  that advertises no video bit now throws `UnsupportedFeatureException` earlier
-  than it used to — at `play()`, rather than after up to three rejected
-  requests. The V1 → V1-text → V2 fallback ladder is gone.
-- `AirPlaySession.connect()` opens an encrypted, paired session for every
-  AirPlay 2 receiver (feature bit 38 or 48), not only for devices that answer
-  `/server-info` with 403. Connecting to such a device now performs transient
-  pairing, so it can fail with `NeedsPairingException` where it previously
-  succeeded into a session that could not actually cast.
-- `AirPlayMediaController.dispose()` returns `Future<void>` (it now closes the
-  UDP timing server). `play()` takes `startPositionSeconds:` in place of
-  `startPosition:`, which was ambiguous between the two protocol versions.
+Two protocols were taken to real hardware for the first time. AirPlay's video
+path turned out to be broken in six compounding ways; DLNA's HLS path reported
+the wrong duration and died on seek. Both are fixed or, where the receiver is
+at fault, documented honestly.
+
+### Breaking
+- AirPlay picks its protocol version from the device's advertised feature bits
+  instead of probing `/play`. A receiver advertising no video bit now throws
+  `UnsupportedFeatureException` immediately rather than after three rejected
+  requests.
+- `AirPlaySession.connect()` pairs with every AirPlay 2 receiver, not only ones
+  that answer 403. It can now throw `NeedsPairingException` where it previously
+  returned a session that could not actually cast.
+- `AirPlayMediaController.dispose()` returns `Future<void>`; `play()` takes
+  `startPositionSeconds:` in place of the version-ambiguous `startPosition:`.
+
+### Fixed — DLNA
+- HLS duration is probed from the source playlist and advertised to the
+  renderer. A piped MPEG-TS has no `Content-Length`, so TVs reported
+  `00:00:01` and drew no scrub bar. Verified on a TCL Google TV:
+  `00:00:01` → `00:10:34`.
+- Seeking piped HLS no longer stops playback. The route claimed byte-range seek
+  (`DLNA.ORG_OP=01`) while serving `Accept-Ranges: none`. Piped routes now
+  advertise time seek, honour `TimeSeekRange.dlna.org`, and — for renderers
+  that only ever send `Range: bytes=0-` — restart the pipe at the requested
+  offset via the URL. Positions stay absolute across the restart.
+- A renderer's placeholder duration no longer overwrites a known-good one.
+- Client-aborted proxy connections are logged at debug, not error.
+
+### Fixed — AirPlay
+- The AirPlay 2 path is reachable at all: the encrypted media controller is
+  built for every AirPlay 2 receiver, not only ones returning 403.
+- Transient pairing (`X-Apple-HKP: 4`) implemented — the flow both observed
+  smart TVs actually want, and which needs no PIN.
+- RTSP `SETUP` advertises a live UDP timing server (`timingProtocol: NTP`) and
+  names the sender's IP; a rejected `SETUP`/`RECORD` throws instead of being
+  marked successful.
+- `POST /rate` follows `/play`. Without it an AirPlay 2 receiver stays paused.
+- `/playback-info` is decoded as a binary plist, so position and duration stop
+  reading as zero forever; receiver-reported errors surface.
+- Requests on the encrypted socket are serialized, so the feedback loop can no
+  longer steal a response or desynchronise the ChaCha20 nonces.
+- `requiresHapPairing` includes bit 43; `MdnsServiceInfo.supportsVideo` accepts
+  bit 49; `media.startPosition` reaches the device; the pair-verify socket
+  subscription is released.
 
 ### New
-- AirPlay 2 transient pairing (`X-Apple-HKP: 4`, fixed PIN `3939`, `Flags`
-  TLV `TransientPairing`) — no PIN prompt, no persisted credentials
-- `AirPlayTimingServer` — UDP timing server bound for the life of a playback,
-  advertised to the receiver as `timingProtocol: "NTP"` in RTSP `SETUP`
-- The post-`/play` command sequence AirPlay 2 requires, including the mandatory
-  `POST /rate?value=1.000000` — without it the receiver stays paused
-- `AirPlayFeatures.supportsTransientPairing`, `.supportsSystemPairing`,
-  `.supportsCoreUtilsPairing`, `.supportsLegacyPairing`
-- `PlaybackInfo.error` and `.hasDuration`; `PlistCodec.parsePlaybackInfoBytes()`
-- `tool/airplay_probe.dart` — mDNS + feature-bit + reachability probe
-- `tool/airplay_hardware_check.dart` — end-to-end connect → pair → play → poll
-  trace for verifying against a real receiver
-- `doc/specs/2026-07-25-airplay-hardware-test-plan.md` — the procedure for that
-  verification, and `README.md` now carries a hardware matrix instead of
-  unsupported claims
+- `AirPlayTimingServer`, AirPlay transient pairing, `PlaybackInfo.error`
+- `HlsParser.totalDuration` / `extractSegments`, `MediaProxy.probeHlsDuration`
+  and `parseTimeSeekRange`
+- `tool/airplay_probe.dart`, `tool/airplay_hardware_check.dart`,
+  `tool/dlna_hardware_check.dart` — hardware verification scripts
 
-### Fixed
-- AirPlay 2 `/playback-info` is decoded as a binary plist. It was run through
-  `utf8.decode` into an XML parser, so every poll yielded an all-zero result:
-  position and duration stayed at 0 and the session never left `loading`
-- RTSP `SETUP` advertises a real timing port instead of `timingProtocol: "None"`
-- The RTSP URI names the sender's IP, not the receiver's
-- A non-200 `SETUP` or `RECORD` throws instead of logging a warning and marking
-  the session set up anyway
-- Requests on the HAP encrypted socket are serialized, so the 2-second
-  `/feedback` loop can no longer be handed the response belonging to `/play`,
-  and concurrent writers can no longer desynchronise the ChaCha20 nonce
-  counters into permanent MAC-verification failures
-- `requiresHapPairing` includes bit 43 (`SupportsSystemPairing`)
-- `MdnsServiceInfo.supportsVideo` accepts bit 49, not only bit 0
-- `media.startPosition` reaches the device instead of being replaced with 0.0
-- The pair-verify socket subscription is released before the socket is handed
-  to `HapSession`, instead of buffering every encrypted byte for the session's
-  lifetime
-- `/playback-info` polling failures are logged at warning level, and a
-  receiver-reported error ends the session rather than leaving it in `loading`
-- Stale `docs/` paths in `README.md` and `CHANGELOG.md` corrected to `doc/`
+### Known limitations
+- **AirPlay video does not play on the TV tested, and cannot.** That receiver
+  exports only `/command`, `/feedback`, `/info` and `/server-info` — there is
+  no `/play` — and AirPlay video from Apple's own QuickTime fails on it
+  identically. Use Chromecast. See
+  `doc/specs/2026-07-25-airplay-hardware-results.md`.
+- Sidecar subtitles over DLNA did not render on the TV tested; embed SRT in MKV.
 
 ## 0.6.0
 
