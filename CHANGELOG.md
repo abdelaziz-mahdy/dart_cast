@@ -1,3 +1,8 @@
+## Unreleased
+
+### Fixed
+- AirPlay: receivers advertising **both** AirPlay 1 and AirPlay 2 video (Apple TVs, the macOS receiver) now get one AirPlay 1 attempt if the AirPlay 2 `/play` returns 404. 0.7.0 sent every AirPlay 2 device down the V2 path and never offered V1, so a device implementing only the older endpoints could not play at all. The retry is gated on the device advertising bit 0 — it is not a return of the blind version probe 0.7.0 removed
+
 ## 0.7.1
 
 Documentation only — no code changes.
