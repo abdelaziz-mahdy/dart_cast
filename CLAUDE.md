@@ -73,8 +73,8 @@ the places where hardware claims live; keep them consistent with each other.
 
 ## Changing code is not fixing behaviour
 
-Three claims went out during the 0.7.0 work that no measurement supported. They
-failed in two distinct ways, and both are easy to repeat.
+Claims went out repeatedly during the 0.7.x work that no measurement supported.
+They failed in three distinct ways, all easy to repeat.
 
 **1. The check marked its own homework.** Hardware scripts under `tool/` must
 judge success on values the **device** reports, never on a number the tool
@@ -102,6 +102,27 @@ changelog entry. Describe the change, not an outcome nobody observed.
 A cheap self-check: if the entry contradicts the `Known limitations` section a
 few lines below it, one of the two is wrong.
 
+**3. The check only ran where it was written.** A green local run is one
+platform's answer, not the answer. A mock renderer that replied on every socket
+`data` event passed on macOS and failed on `windows-latest`, because Windows
+delivered the request headers and body as separate reads and the mock answered
+twice. Anything touching raw sockets, chunking, path separators or line endings
+is a platform assumption until CI says otherwise — so wait for CI before
+tagging a release, not just before merging.
+
+Two more surfaces where the same error hides:
+
+- **Prose handed to a user is a claim.** A code snippet in a changelog, a doc
+  or an issue reply carries the same weight as a test assertion, and gets less
+  scrutiny. If an example was written from a dependency's README rather than
+  compiled against it, say so in the same message.
+- **A design document asserts things too.** "Non-breaking by construction" was
+  reasoned carefully and was still half wrong — widening a typedef is
+  source-compatible for implementers but not for direct callers, which only the
+  compiler revealed. Have the plan's first step prove the design's central
+  claim rather than assume it, and correct the spec when implementation
+  disagrees with it.
+
 Also worth remembering:
 
 - A mock server proves the code does what its author expected, nothing more.
@@ -111,13 +132,22 @@ Also worth remembering:
   black frame is not evidence of a black screen. UI overlays *do* capture, so
   it is still useful for reading pairing codes and transport UI.
 - When the user says something did not work, believe them over a green check
-  and go find the independent measurement. They were right all three times.
+  and go find the independent measurement. Across the 0.7.x work they were
+  right every single time.
 
 ## Versioning
 
 Pre-1.0 semver is in force: breaking changes (SDK floor bump, major
 dependency bump that's observable through transitive deps) go in a minor
 release (`0.X.0`), not a patch.
+
+## Documentation lives in `doc/`, never `docs/`
+
+`dart pub publish` fails with exit 65 if a top-level `docs/` directory exists.
+This matters because tooling defaults fight it — the superpowers planning skill
+writes to `docs/superpowers/plans/` unless told otherwise. Specs and plans in
+this repo go under `doc/superpowers/`, and a stray `docs/` will not surface
+until the publish step of a release.
 
 ## Release tags
 
