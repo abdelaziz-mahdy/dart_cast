@@ -1,3 +1,9 @@
+## Unreleased
+
+### Fixed
+- DLNA: a playback command no longer throws `ClientException: Connection closed before full header was received` when the renderer drops an idle connection — the action is retried once on a fresh connection ([#9](https://github.com/abdelaziz-mahdy/dart_cast/issues/9)). Reproduced against a mock renderer; the LG smartshare device from the report was not available to confirm
+- DLNA: a renderer that accepts a connection and then stalls now fails after 10s instead of hanging the caller forever
+
 ## 0.7.0
 
 AirPlay 2 and DLNA HLS fixes, driven by testing against a TCL Google TV.
