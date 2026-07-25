@@ -176,6 +176,20 @@ class AirPlayMediaController {
         'AirPlayMediaController: playV2 response: ${resp.statusCode}',
       );
       if (resp.statusCode == 404) {
+        // A receiver that advertises AirPlay 1 video as well gets one attempt
+        // at it. This is NOT the old fallback ladder: that probed V1 first on
+        // every device, including ones whose bits said they do not speak it,
+        // and read the resulting 404 as "cannot cast video". This fires only
+        // when bit 0 is actually set, so the request is one the device said it
+        // accepts. Apple TVs and the macOS receiver advertise both versions.
+        if (features.supportsVideoV1) {
+          CastLogger.info(
+            'AirPlayMediaController: AirPlay 2 /play returned 404 and this '
+            'device also advertises AirPlay 1 video (bit 0) — retrying on V1',
+          );
+          return _playV1AfterV2Fallback(url, startPositionSeconds);
+        }
+
         // Verified on a TCL Google TV running Apple's licensed AirPlay
         // receiver SDK 3.5.0.244: the handshake up to and including RECORD is
         // accepted, but the receiver exports only /command, /feedback, /info
@@ -187,9 +201,10 @@ class AirPlayMediaController {
         // speak yet.
         throw UnsupportedFeatureException(
           'Receiver completed the AirPlay 2 handshake but has no /play '
-          'endpoint (404). It uses AirPlay 2 unified media control, which '
-          'dart_cast does not implement — use Chromecast or DLNA for this '
-          'device. See doc/specs/2026-07-25-airplay-hardware-results.md.',
+          'endpoint (404), and advertises no AirPlay 1 video either. It uses '
+          'AirPlay 2 unified media control, which dart_cast does not '
+          'implement — use Chromecast or DLNA for this device. See '
+          'doc/AIRPLAY.md.',
         );
       }
       if (resp.statusCode != 200) {
@@ -230,6 +245,43 @@ class AirPlayMediaController {
       );
     }
   }
+
+  /// Retries playback over AirPlay 1 after an AirPlay 2 `/play` returned 404.
+  ///
+  /// Only reachable for receivers advertising bit 0. The RTSP session stays up
+  /// — it was accepted, and tearing it down gains nothing — but control
+  /// commands switch to the HTTP forms, because a receiver answering the V1
+  /// `/play` expects the V1 control endpoints too.
+  Future<void> _playV1AfterV2Fallback(
+    String url,
+    double startPositionSeconds,
+  ) async {
+    if (startPositionSeconds != 0.0) {
+      CastLogger.warning(
+        'AirPlayMediaController: AirPlay 1 Start-Position is a 0.0-1.0 '
+        'fraction, not seconds — starting from the beginning instead of '
+        '${startPositionSeconds}s',
+      );
+    }
+
+    final resp = await playV1(url, 0.0);
+    CastLogger.debug(
+      'AirPlayMediaController: V1 fallback response: ${resp.statusCode}',
+    );
+    if (resp.statusCode != 200) {
+      throw PlaybackException(
+        'Device rejected both the AirPlay 2 /play (404) and the AirPlay 1 '
+        '/play (${resp.statusCode}), despite advertising both versions.',
+        statusCode: resp.statusCode,
+      );
+    }
+
+    _usingV1Fallback = true;
+    CastLogger.info('AirPlayMediaController: AirPlay 1 fallback accepted');
+  }
+
+  /// Whether playback fell back to AirPlay 1 after a 404 from the V2 `/play`.
+  bool _usingV1Fallback = false;
 
   /// Sends the commands an AirPlay 2 receiver expects after `/play`.
   ///
@@ -360,7 +412,7 @@ class AirPlayMediaController {
   /// pyatv issues `/rate` and friends as RTSP exchanges once an AirPlay 2
   /// session is up; AirPlay 1 receivers only understand the HTTP form.
   bool get _useRtspControl =>
-      features.isV2Protocol && session.isRtspSessionSetUp;
+      features.isV2Protocol && session.isRtspSessionSetUp && !_usingV1Fallback;
 
   Future<void> _sendControl(
     String method,

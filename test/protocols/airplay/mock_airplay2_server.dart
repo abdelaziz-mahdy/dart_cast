@@ -105,6 +105,10 @@ class MockAirPlay2Server {
   /// Status code returned for `POST /play`.
   int playStatus = 200;
 
+  /// Optional per-request override for `/play`, so a test can answer the
+  /// AirPlay 2 form differently from the AirPlay 1 one.
+  int Function(RecordedRequest request)? onPlay;
+
   /// Status code returned for `POST /rate`.
   int rateStatus = 200;
 
@@ -290,13 +294,14 @@ class MockAirPlay2Server {
 
     switch (request.path) {
       case '/play':
-        if (playStatus == 200) _playing = true;
+        final status = onPlay?.call(request) ?? playStatus;
+        if (status == 200) _playing = true;
         await _send(
           session,
           socket,
           request,
-          playStatus,
-          playStatus == 200 ? 'OK' : 'Error',
+          status,
+          status == 200 ? 'OK' : 'Error',
         );
         return;
 
