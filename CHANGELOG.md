@@ -1,3 +1,59 @@
+## Unreleased
+
+### Changed (behaviour)
+- **AirPlay no longer probes `/play`.** The protocol version is chosen from the
+  device's advertised feature bits before any request is sent, so a receiver
+  that advertises no video bit now throws `UnsupportedFeatureException` earlier
+  than it used to — at `play()`, rather than after up to three rejected
+  requests. The V1 → V1-text → V2 fallback ladder is gone.
+- `AirPlaySession.connect()` opens an encrypted, paired session for every
+  AirPlay 2 receiver (feature bit 38 or 48), not only for devices that answer
+  `/server-info` with 403. Connecting to such a device now performs transient
+  pairing, so it can fail with `NeedsPairingException` where it previously
+  succeeded into a session that could not actually cast.
+- `AirPlayMediaController.dispose()` returns `Future<void>` (it now closes the
+  UDP timing server). `play()` takes `startPositionSeconds:` in place of
+  `startPosition:`, which was ambiguous between the two protocol versions.
+
+### New
+- AirPlay 2 transient pairing (`X-Apple-HKP: 4`, fixed PIN `3939`, `Flags`
+  TLV `TransientPairing`) — no PIN prompt, no persisted credentials
+- `AirPlayTimingServer` — UDP timing server bound for the life of a playback,
+  advertised to the receiver as `timingProtocol: "NTP"` in RTSP `SETUP`
+- The post-`/play` command sequence AirPlay 2 requires, including the mandatory
+  `POST /rate?value=1.000000` — without it the receiver stays paused
+- `AirPlayFeatures.supportsTransientPairing`, `.supportsSystemPairing`,
+  `.supportsCoreUtilsPairing`, `.supportsLegacyPairing`
+- `PlaybackInfo.error` and `.hasDuration`; `PlistCodec.parsePlaybackInfoBytes()`
+- `tool/airplay_probe.dart` — mDNS + feature-bit + reachability probe
+- `tool/airplay_hardware_check.dart` — end-to-end connect → pair → play → poll
+  trace for verifying against a real receiver
+- `doc/specs/2026-07-25-airplay-hardware-test-plan.md` — the procedure for that
+  verification, and `README.md` now carries a hardware matrix instead of
+  unsupported claims
+
+### Fixed
+- AirPlay 2 `/playback-info` is decoded as a binary plist. It was run through
+  `utf8.decode` into an XML parser, so every poll yielded an all-zero result:
+  position and duration stayed at 0 and the session never left `loading`
+- RTSP `SETUP` advertises a real timing port instead of `timingProtocol: "None"`
+- The RTSP URI names the sender's IP, not the receiver's
+- A non-200 `SETUP` or `RECORD` throws instead of logging a warning and marking
+  the session set up anyway
+- Requests on the HAP encrypted socket are serialized, so the 2-second
+  `/feedback` loop can no longer be handed the response belonging to `/play`,
+  and concurrent writers can no longer desynchronise the ChaCha20 nonce
+  counters into permanent MAC-verification failures
+- `requiresHapPairing` includes bit 43 (`SupportsSystemPairing`)
+- `MdnsServiceInfo.supportsVideo` accepts bit 49, not only bit 0
+- `media.startPosition` reaches the device instead of being replaced with 0.0
+- The pair-verify socket subscription is released before the socket is handed
+  to `HapSession`, instead of buffering every encrypted byte for the session's
+  lifetime
+- `/playback-info` polling failures are logged at warning level, and a
+  receiver-reported error ends the session rather than leaving it in `loading`
+- Stale `docs/` paths in `README.md` and `CHANGELOG.md` corrected to `doc/`
+
 ## 0.6.0
 
 ### New
@@ -169,8 +225,8 @@ final session = await device.connect(
 - `UnsupportedFeatureException` thrown immediately when a device lacks video support bits (0 and 49)
 - `PlaybackException` thrown when all `/play` format attempts are rejected by the device
 - Breaking: `HapSession` no longer has `play`, `stop`, `scrub`, or `rate` methods — use `AirPlayMediaController` instead
-- Added `docs/PROTOCOL_REFERENCES.md` with links to AirPlay, Chromecast, and DLNA specs
-- Added `docs/FUTURE_WORK.md` documenting AirPlay screen mirroring and RAOP audio streaming roadmap
+- Added `doc/PROTOCOL_REFERENCES.md` with links to AirPlay, Chromecast, and DLNA specs
+- Added `doc/FUTURE_WORK.md` documenting AirPlay screen mirroring and RAOP audio streaming roadmap
 
 ## 0.1.0
 

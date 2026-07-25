@@ -85,8 +85,14 @@ void main() {
         );
       });
       test('supportsLegacyPairing checks bit 27', () {
-        expect(AirPlayFeatures.parse('0x8000000').supportsLegacyPairing, isTrue);
-        expect(AirPlayFeatures.parse('0x4000000').supportsLegacyPairing, isFalse);
+        expect(
+          AirPlayFeatures.parse('0x8000000').supportsLegacyPairing,
+          isTrue,
+        );
+        expect(
+          AirPlayFeatures.parse('0x4000000').supportsLegacyPairing,
+          isFalse,
+        );
       });
       test('isV2Protocol checks bit 38 or 48', () {
         final f38 = AirPlayFeatures.parse('0x0,0x40');
@@ -111,7 +117,11 @@ void main() {
         expect(macOsReceiver.supportsVideoV1, isTrue, reason: 'bit 0');
         expect(macOsReceiver.supportsVideoV2, isTrue, reason: 'bit 49');
         expect(macOsReceiver.supportsSystemPairing, isTrue, reason: 'bit 43');
-        expect(macOsReceiver.supportsCoreUtilsPairing, isTrue, reason: 'bit 48');
+        expect(
+          macOsReceiver.supportsCoreUtilsPairing,
+          isTrue,
+          reason: 'bit 48',
+        );
         expect(macOsReceiver.supportsLegacyPairing, isTrue, reason: 'bit 27');
         expect(macOsReceiver.isV2Protocol, isTrue);
       });
