@@ -1,3 +1,13 @@
+## 0.7.4
+
+### New
+- `CastMedia.defaultSubtitle` names the subtitle track playback starts with (matched by URL against `subtitles`). Honoured by Chromecast (`activeTrackIds` on LOAD) and DLNA (picked over `subtitles.first`)
+
+### Fixed
+- Chromecast no longer activates the **first** subtitle track when none was chosen — the track-list order silently picked the on-screen language (a French-first list produced French subtitles regardless of what the app showed as selected). No `defaultSubtitle` now means no subtitle shown
+- Chromecast re-asserts the active subtitle after every pause → resume, including pauses from the TV remote. The Default Media Receiver can stop rendering cues after a pause/resume cycle while still reporting the track active; toggling the track set (deactivate + reactivate) re-attaches its renderer, which is what users were doing by hand
+- Chromecast LOAD retries are no longer failed by the *previous* attempt's dying receiver session. An unsolicited `IDLE`/`ERROR` broadcast from a session that neither answers the in-flight LOAD's `requestId` nor matches its session id is now ignored as a stale corpse (and its session deprecated). Observed live: a next-episode LOAD was declared failed 1ms after being sent — the corpse of the failed first attempt — while the receiver went on to play the episode fine, leaving the app convinced the old episode was still playing
+
 ## 0.7.3
 
 ### New

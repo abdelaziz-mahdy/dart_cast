@@ -84,6 +84,15 @@ class CastMedia {
   /// Subtitle tracks for this media.
   final List<CastSubtitle> subtitles;
 
+  /// The subtitle track to start active, or null for no subtitles.
+  ///
+  /// Match one of [subtitles] by URL. Receivers used to activate the FIRST
+  /// track when none was named, which silently made the track-list *order*
+  /// choose the on-screen language — a French-first list produced French
+  /// subtitles on a TV whose user wanted English. No default means no
+  /// track is activated.
+  final CastSubtitle? defaultSubtitle;
+
   /// Creates a [CastMedia] for a remote URL.
   const CastMedia({
     required this.url,
@@ -94,6 +103,7 @@ class CastMedia {
     this.startPosition,
     this.duration,
     this.subtitles = const [],
+    this.defaultSubtitle,
   }) : isLocalFile = false,
        source = null,
        fileExtension = null;
@@ -111,6 +121,7 @@ class CastMedia {
     this.startPosition,
     this.duration,
     this.subtitles = const [],
+    this.defaultSubtitle,
   }) : url = filePath,
        isLocalFile = true,
        source = null,
@@ -135,6 +146,7 @@ class CastMedia {
     this.startPosition,
     this.duration,
     this.subtitles = const [],
+    this.defaultSubtitle,
   }) : url = '',
        isLocalFile = false,
        httpHeaders = const {};

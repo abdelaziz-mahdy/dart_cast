@@ -92,6 +92,11 @@ class CastMediaChannel {
   // ---------------------------------------------------------------------------
 
   /// Builds a LOAD command.
+  ///
+  /// [activeTrackIds] names the tracks that start active. Null or empty
+  /// means playback starts with no subtitle shown. This used to default to
+  /// the first subtitle track, which let the track-list order pick the
+  /// language on the TV — the caller decides now.
   String buildLoad({
     required String contentId,
     required String contentType,
@@ -99,6 +104,7 @@ class CastMediaChannel {
     String? imageUrl,
     double? startPosition,
     List<CastMediaTrack>? subtitles,
+    List<int>? activeTrackIds,
     String streamType = 'BUFFERED',
   }) {
     final media = <String, dynamic>{
@@ -130,9 +136,8 @@ class CastMediaChannel {
       'currentTime': startPosition ?? 0,
     };
 
-    // Active track IDs (activate first subtitle by default)
-    if (subtitles != null && subtitles.isNotEmpty) {
-      payload['activeTrackIds'] = [subtitles.first.trackId];
+    if (activeTrackIds != null && activeTrackIds.isNotEmpty) {
+      payload['activeTrackIds'] = activeTrackIds;
     }
 
     return jsonEncode(payload);

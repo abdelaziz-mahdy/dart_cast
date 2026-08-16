@@ -228,8 +228,11 @@ class DlnaSession extends CastSession {
     // Register subtitle in both SRT and VTT formats so the TV can pick
     // whichever it supports. Many DLNA TVs only support SRT, others VTT.
     List<({String url, String format})>? subtitleVariants;
+    // Honour the caller's declared default before falling back to the first
+    // listed track — same language-selection contract as Chromecast.
     final subtitleSource =
-        media.subtitles.isNotEmpty ? media.subtitles.first : _currentSubtitle;
+        media.defaultSubtitle ??
+        (media.subtitles.isNotEmpty ? media.subtitles.first : _currentSubtitle);
     if (subtitleSource != null) {
       subtitleVariants = _proxy.registerSubtitleVariants(
         subtitleSource.url,

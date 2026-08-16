@@ -305,24 +305,91 @@ void main() {
         );
 
         final loadFuture = session.loadMedia(media);
-        await Future<void>.delayed(const Duration(milliseconds: 80));
 
-        // Receiver simulates the silent-failure case: LOAD was acked but
-        // the player went IDLE with idleReason=ERROR (e.g. unsupported
-        // segment content-type).
+        // Receiver simulates the silent-failure case: each bisect attempt's
+        // LOAD is acked but the player goes IDLE with idleReason=ERROR
+        // (e.g. unsupported segment content-type). The error status answers
+        // the LOAD's own requestId — an unsolicited IDLE/ERROR from an
+        // unknown session would (correctly) be treated as a stale corpse
+        // of an earlier attempt and ignored.
+        for (var i = 0; i < 2; i++) {
+          final loadMsg = await _awaitSentLoad(mockChannel, skip: i);
+          mockChannel.injectMessage(
+            namespace: CastMediaChannel.mediaNamespace,
+            sourceId: 'web-4',
+            destinationId: 'sender-0',
+            payload: _mediaStatusPayload(
+              mediaSessionId: i + 1,
+              playerState: 'IDLE',
+              idleReason: 'ERROR',
+              requestId: loadMsg.payload['requestId'] as int,
+            ),
+          );
+        }
+
+        await expectLater(loadFuture, throwsA(isA<MediaLoadFailedException>()));
+        expect(session.state, SessionState.idle);
+      });
+
+      test('ignores stale IDLE/ERROR from a previous attempt\'s session while '
+          'the retried LOAD is in flight', () async {
+        final media = CastMedia(
+          url: 'http://example.com/video.m3u8',
+          type: CastMediaType.hls,
+        );
+
+        final loadFuture = session.loadMedia(media);
+
+        // Attempt 1 (bare) fails hard with a requestId-matched
+        // LOAD_FAILED — the bisect moves on to attempt 2 (muxed).
+        final firstLoad = await _awaitSentLoad(mockChannel);
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: {
+            'type': 'LOAD_FAILED',
+            'requestId': firstLoad.payload['requestId'],
+            'itemId': 1,
+          },
+        );
+
+        // Attempt 2's LOAD goes out; a beat later the receiver-side
+        // session spawned by the FAILED first attempt broadcasts its
+        // dying IDLE/ERROR — unsolicited (requestId 0) and carrying a
+        // session id the sender has never been told about. This is the
+        // exact message that used to be misread as attempt 2 failing
+        // (observed live: declared dead 1ms after the LOAD, while the
+        // receiver went on to play the media fine).
+        await _awaitSentLoad(mockChannel, skip: 1);
         mockChannel.injectMessage(
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'web-4',
           destinationId: 'sender-0',
           payload: _mediaStatusPayload(
-            mediaSessionId: 1,
+            mediaSessionId: 99,
             playerState: 'IDLE',
             idleReason: 'ERROR',
           ),
         );
 
-        await expectLater(loadFuture, throwsA(isA<MediaLoadFailedException>()));
-        expect(session.state, SessionState.idle);
+        // Give the waiter a chance to (wrongly) terminate.
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+
+        // The retried load then becomes playable.
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: _mediaStatusPayload(
+            mediaSessionId: 2,
+            playerState: 'BUFFERING',
+          ),
+        );
+
+        // Must complete normally — the corpse must not fail the load.
+        await loadFuture;
+        expect(session.state, isNot(SessionState.idle));
       });
 
       test(
@@ -411,6 +478,128 @@ void main() {
           await loadFuture;
         },
       );
+
+      test('LOAD activates the declared default subtitle, not the first '
+          'track', () async {
+        const french = CastSubtitle(
+          url: 'http://example.com/fr.vtt',
+          label: 'French',
+          language: 'fr',
+          format: 'vtt',
+        );
+        const english = CastSubtitle(
+          url: 'http://example.com/en.vtt',
+          label: 'English',
+          language: 'en',
+          format: 'vtt',
+        );
+        final media = CastMedia(
+          url: 'http://example.com/video.mp4',
+          type: CastMediaType.mp4,
+          subtitles: const [french, english],
+          defaultSubtitle: english,
+        );
+
+        final loadFuture = session.loadMedia(media);
+        final loadMsg = await _awaitSentLoad(mockChannel);
+
+        // English is listed second → trackId 2. The old behaviour
+        // activated trackId 1 (whatever language happened to be first).
+        expect(loadMsg.payload['activeTrackIds'], [2]);
+
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: _mediaStatusPayload(mediaSessionId: 1),
+        );
+        await loadFuture;
+      });
+
+      test('LOAD with no default subtitle activates no track', () async {
+        final media = CastMedia(
+          url: 'http://example.com/video.mp4',
+          type: CastMediaType.mp4,
+          subtitles: const [
+            CastSubtitle(
+              url: 'http://example.com/fr.vtt',
+              label: 'French',
+              language: 'fr',
+              format: 'vtt',
+            ),
+          ],
+        );
+
+        final loadFuture = session.loadMedia(media);
+        final loadMsg = await _awaitSentLoad(mockChannel);
+
+        expect(loadMsg.payload.containsKey('activeTrackIds'), isFalse);
+
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: _mediaStatusPayload(mediaSessionId: 1),
+        );
+        await loadFuture;
+      });
+
+      test('re-asserts the active subtitle after pause → resume', () async {
+        const english = CastSubtitle(
+          url: 'http://example.com/en.vtt',
+          label: 'English',
+          language: 'en',
+          format: 'vtt',
+        );
+        final media = CastMedia(
+          url: 'http://example.com/video.mp4',
+          type: CastMediaType.mp4,
+          subtitles: const [english],
+          defaultSubtitle: english,
+        );
+
+        final loadFuture = session.loadMedia(media);
+        await _awaitSentLoad(mockChannel);
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: _mediaStatusPayload(mediaSessionId: 1),
+        );
+        await loadFuture;
+        mockChannel.clearMessages();
+
+        // Pause, then resume — as reported by the receiver, which is the
+        // only signal there is when the pause came from the TV remote.
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            playerState: 'PAUSED',
+          ),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: _mediaStatusPayload(mediaSessionId: 1),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+
+        // The Default Media Receiver can stop rendering cues after a
+        // pause/resume cycle while still reporting the track active —
+        // the session must toggle the track set to re-attach the renderer.
+        final edits =
+            mockChannel.sentMessages
+                .where((m) => m.payload['type'] == 'EDIT_TRACKS_INFO')
+                .toList();
+        expect(edits, hasLength(2));
+        expect(edits[0].payload['activeTrackIds'], isEmpty);
+        expect(edits[1].payload['activeTrackIds'], [1]);
+      });
     });
 
     group('playback controls', () {
@@ -913,6 +1102,7 @@ Map<String, dynamic> _mediaStatusPayload({
   double currentTime = 0.0,
   double? duration,
   String? idleReason,
+  int requestId = 0,
 }) {
   final statusEntry = <String, dynamic>{
     'mediaSessionId': mediaSessionId,
@@ -931,7 +1121,7 @@ Map<String, dynamic> _mediaStatusPayload({
 
   return {
     'type': 'MEDIA_STATUS',
-    'requestId': 0,
+    'requestId': requestId,
     'status': [statusEntry],
   };
 }

@@ -91,6 +91,15 @@ class ChromecastSession extends CastSession {
   /// the first subtitle on the TV.
   final Map<String, int> _subtitleTrackIds = <String, int>{};
 
+  /// The track ids currently meant to be active on the receiver.
+  ///
+  /// Seeded at LOAD from [CastMedia.defaultSubtitle] and rewritten by
+  /// [setSubtitle]. This is the sender's record, deliberately not mirrored
+  /// from MEDIA_STATUS: the receiver never changes tracks on its own, and
+  /// [_reassertActiveTracks] needs the *intended* set even at the moment
+  /// the receiver has stopped honouring it.
+  List<int> _activeTrackIds = const [];
+
   /// MediaSession IDs we've explicitly abandoned during a retry chain.
   ///
   /// When the bisect loop falls through from one attempt to the next, the
@@ -474,6 +483,22 @@ class ChromecastSession extends CastSession {
       );
     }
 
+    // Resolve which track starts active. No default = no subtitle shown;
+    // activating subtitles[0] here is exactly the bug this replaces (the
+    // track-list order chose the language on the TV).
+    int? defaultTrackId;
+    if (media.defaultSubtitle != null) {
+      defaultTrackId = _subtitleTrackIds[media.defaultSubtitle!.url];
+      if (defaultTrackId == null) {
+        CastLogger.warning(
+          'Chromecast: defaultSubtitle url is not in the subtitle list — '
+          'starting with no active track. '
+          'url=${media.defaultSubtitle!.url}',
+        );
+      }
+    }
+    _activeTrackIds = defaultTrackId != null ? [defaultTrackId] : const [];
+
     final loadPayload = _mediaChannel.buildLoad(
       contentId: proxyUrl,
       contentType: contentType,
@@ -484,6 +509,7 @@ class ChromecastSession extends CastSession {
               ? media.startPosition!.inMilliseconds / 1000.0
               : null,
       subtitles: subtitles.isNotEmpty ? subtitles : null,
+      activeTrackIds: defaultTrackId != null ? [defaultTrackId] : null,
     );
 
     final loadRequestId =
@@ -614,6 +640,7 @@ class ChromecastSession extends CastSession {
     _requireMediaSession();
     if (subtitle == null) {
       CastLogger.info('Chromecast: EDIT_TRACKS_INFO disable subtitles');
+      _activeTrackIds = const [];
       _sendMediaCommand(
         _mediaChannel.buildEditTracksInfo(_mediaSessionId!, []),
       );
@@ -632,6 +659,7 @@ class ChromecastSession extends CastSession {
         'known=${_subtitleTrackIds.keys.take(4).join(", ")}'
         '${_subtitleTrackIds.length > 4 ? ", …" : ""}',
       );
+      _activeTrackIds = const [1];
       _sendMediaCommand(
         _mediaChannel.buildEditTracksInfo(_mediaSessionId!, [1]),
       );
@@ -641,8 +669,32 @@ class ChromecastSession extends CastSession {
       'Chromecast: EDIT_TRACKS_INFO activate trackId=$trackId '
       '(label="${subtitle.label}", lang=${subtitle.language})',
     );
+    _activeTrackIds = [trackId];
     _sendMediaCommand(
       _mediaChannel.buildEditTracksInfo(_mediaSessionId!, [trackId]),
+    );
+  }
+
+  /// Re-applies [_activeTrackIds] after a pause → resume transition.
+  ///
+  /// The Default Media Receiver can stop *rendering* subtitle cues after a
+  /// pause/resume cycle (TV-remote pause included) while MEDIA_STATUS keeps
+  /// reporting the track as active — so the sender's state looks perfectly
+  /// healthy while the screen shows nothing. Changing the active track via
+  /// EDIT_TRACKS_INFO re-attaches the cue renderer, which is exactly how
+  /// users fix it by hand. A plain re-send of the same set risks being
+  /// diffed away as a no-op, so this toggles: deactivate, then reactivate.
+  /// Cues are fetched once at LOAD and cached receiver-side — the toggle
+  /// costs two small messages, no network.
+  void _reassertActiveTracks() {
+    final sessionId = _mediaSessionId;
+    if (sessionId == null || _activeTrackIds.isEmpty) return;
+    CastLogger.info(
+      'Chromecast: re-asserting active tracks $_activeTrackIds after resume',
+    );
+    _sendMediaCommand(_mediaChannel.buildEditTracksInfo(sessionId, []));
+    _sendMediaCommand(
+      _mediaChannel.buildEditTracksInfo(sessionId, _activeTrackIds),
     );
   }
 
@@ -877,8 +929,18 @@ class ChromecastSession extends CastSession {
       _ => null,
     };
 
+    // Detected here rather than in play(): resuming from the TV remote
+    // never passes through play(), only through this status update.
+    final resumedFromPause =
+        stateMachine.state == SessionState.paused &&
+        targetState == SessionState.playing;
+
     if (targetState != null && stateMachine.canTransitionTo(targetState)) {
       stateMachine.transitionTo(targetState);
+    }
+
+    if (resumedFromPause) {
+      _reassertActiveTracks();
     }
 
     // Start/stop position polling based on playback state.
@@ -926,6 +988,16 @@ class ChromecastSession extends CastSession {
     int? priorMediaSessionId,
   }) {
     _mediaStatusSubscription?.cancel();
+
+    // The mediaSessionId the receiver assigned to OUR load, learned from
+    // the first MEDIA_STATUS that answers [expectedRequestId]. Needed to
+    // attribute *unsolicited* failure broadcasts: a LOAD that failed on a
+    // previous attempt leaves a receiver-side session behind whose dying
+    // IDLE+ERROR (requestId=0) can arrive milliseconds after the next
+    // attempt's LOAD goes out — and must not be read as that attempt
+    // failing. Seen live: the retry was declared dead 1ms after it was
+    // sent, while the receiver went on to play it fine.
+    int? ourMediaSessionId;
 
     _mediaStatusSubscription = _channel.messageStream.listen((msg) {
       final namespace = _getNamespace(msg);
@@ -1009,6 +1081,40 @@ class ChromecastSession extends CastSession {
         return;
       }
 
+      // A status answering our LOAD's requestId names our session.
+      if (parsed != null &&
+          expectedRequestId != null &&
+          responseRequestId == expectedRequestId) {
+        ourMediaSessionId ??= parsed.mediaSessionId;
+      }
+
+      // An IDLE+ERROR we cannot attribute to our LOAD — neither a direct
+      // response to its requestId nor carrying its session id — is the
+      // corpse of an earlier attempt announcing its death. Deprecate the
+      // session so the main handler drops its further chatter, and keep
+      // waiting: if OUR load is also doomed, its own attributed error or
+      // the 15s timeout ends the wait.
+      if (parsed != null &&
+          parsed.playerState == 'IDLE' &&
+          parsed.idleReason == 'ERROR') {
+        final isOurs =
+            (expectedRequestId != null &&
+                responseRequestId == expectedRequestId) ||
+            (ourMediaSessionId != null &&
+                parsed.mediaSessionId == ourMediaSessionId);
+        if (!isOurs) {
+          _deprecatedMediaSessionIds.add(parsed.mediaSessionId);
+          CastLogger.info(
+            'Chromecast: ignoring unattributed IDLE/ERROR from '
+            'mediaSessionId=${parsed.mediaSessionId} '
+            '(requestId=$responseRequestId, expected=$expectedRequestId, '
+            'ours=${ourMediaSessionId ?? "unknown"}) — '
+            'stale corpse of a previous attempt, continuing to wait',
+          );
+          return;
+        }
+      }
+
       _handleMediaStatus(payload);
 
       if (parsed == null) {
@@ -1016,7 +1122,7 @@ class ChromecastSession extends CastSession {
         return;
       }
 
-      // Hard receiver-side playback failure.
+      // Hard receiver-side playback failure (attributed to our LOAD above).
       if (parsed.playerState == 'IDLE' && parsed.idleReason == 'ERROR') {
         CastLogger.error(
           'Chromecast: receiver entered IDLE with idleReason=ERROR — '
