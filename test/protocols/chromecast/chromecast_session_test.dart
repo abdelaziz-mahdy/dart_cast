@@ -331,69 +331,66 @@ void main() {
         expect(session.state, SessionState.idle);
       });
 
-      test(
-        'ignores stale IDLE/ERROR from a previous attempt\'s session while '
-        'the retried LOAD is in flight',
-        () async {
-          final media = CastMedia(
-            url: 'http://example.com/video.m3u8',
-            type: CastMediaType.hls,
-          );
+      test('ignores stale IDLE/ERROR from a previous attempt\'s session while '
+          'the retried LOAD is in flight', () async {
+        final media = CastMedia(
+          url: 'http://example.com/video.m3u8',
+          type: CastMediaType.hls,
+        );
 
-          final loadFuture = session.loadMedia(media);
+        final loadFuture = session.loadMedia(media);
 
-          // Attempt 1 (bare) fails hard with a requestId-matched
-          // LOAD_FAILED — the bisect moves on to attempt 2 (muxed).
-          final firstLoad = await _awaitSentLoad(mockChannel);
-          mockChannel.injectMessage(
-            namespace: CastMediaChannel.mediaNamespace,
-            sourceId: 'web-4',
-            destinationId: 'sender-0',
-            payload: {
-              'type': 'LOAD_FAILED',
-              'requestId': firstLoad.payload['requestId'],
-              'itemId': 1,
-            },
-          );
+        // Attempt 1 (bare) fails hard with a requestId-matched
+        // LOAD_FAILED — the bisect moves on to attempt 2 (muxed).
+        final firstLoad = await _awaitSentLoad(mockChannel);
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: {
+            'type': 'LOAD_FAILED',
+            'requestId': firstLoad.payload['requestId'],
+            'itemId': 1,
+          },
+        );
 
-          // Attempt 2's LOAD goes out; a beat later the receiver-side
-          // session spawned by the FAILED first attempt broadcasts its
-          // dying IDLE/ERROR — unsolicited (requestId 0) and carrying a
-          // session id the sender has never been told about. This is the
-          // exact message that used to be misread as attempt 2 failing
-          // (observed live: declared dead 1ms after the LOAD, while the
-          // receiver went on to play the media fine).
-          await _awaitSentLoad(mockChannel, skip: 1);
-          mockChannel.injectMessage(
-            namespace: CastMediaChannel.mediaNamespace,
-            sourceId: 'web-4',
-            destinationId: 'sender-0',
-            payload: _mediaStatusPayload(
-              mediaSessionId: 99,
-              playerState: 'IDLE',
-              idleReason: 'ERROR',
-            ),
-          );
+        // Attempt 2's LOAD goes out; a beat later the receiver-side
+        // session spawned by the FAILED first attempt broadcasts its
+        // dying IDLE/ERROR — unsolicited (requestId 0) and carrying a
+        // session id the sender has never been told about. This is the
+        // exact message that used to be misread as attempt 2 failing
+        // (observed live: declared dead 1ms after the LOAD, while the
+        // receiver went on to play the media fine).
+        await _awaitSentLoad(mockChannel, skip: 1);
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: _mediaStatusPayload(
+            mediaSessionId: 99,
+            playerState: 'IDLE',
+            idleReason: 'ERROR',
+          ),
+        );
 
-          // Give the waiter a chance to (wrongly) terminate.
-          await Future<void>.delayed(const Duration(milliseconds: 30));
+        // Give the waiter a chance to (wrongly) terminate.
+        await Future<void>.delayed(const Duration(milliseconds: 30));
 
-          // The retried load then becomes playable.
-          mockChannel.injectMessage(
-            namespace: CastMediaChannel.mediaNamespace,
-            sourceId: 'web-4',
-            destinationId: 'sender-0',
-            payload: _mediaStatusPayload(
-              mediaSessionId: 2,
-              playerState: 'BUFFERING',
-            ),
-          );
+        // The retried load then becomes playable.
+        mockChannel.injectMessage(
+          namespace: CastMediaChannel.mediaNamespace,
+          sourceId: 'web-4',
+          destinationId: 'sender-0',
+          payload: _mediaStatusPayload(
+            mediaSessionId: 2,
+            playerState: 'BUFFERING',
+          ),
+        );
 
-          // Must complete normally — the corpse must not fail the load.
-          await loadFuture;
-          expect(session.state, isNot(SessionState.idle));
-        },
-      );
+        // Must complete normally — the corpse must not fail the load.
+        await loadFuture;
+        expect(session.state, isNot(SessionState.idle));
+      });
 
       test(
         'throws MediaLoadFailedException when receiver returns LOAD_FAILED',
@@ -578,7 +575,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'web-4',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 1, playerState: 'PAUSED'),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            playerState: 'PAUSED',
+          ),
         );
         await Future<void>.delayed(const Duration(milliseconds: 20));
         mockChannel.injectMessage(
@@ -592,9 +592,10 @@ void main() {
         // The Default Media Receiver can stop rendering cues after a
         // pause/resume cycle while still reporting the track active —
         // the session must toggle the track set to re-attach the renderer.
-        final edits = mockChannel.sentMessages
-            .where((m) => m.payload['type'] == 'EDIT_TRACKS_INFO')
-            .toList();
+        final edits =
+            mockChannel.sentMessages
+                .where((m) => m.payload['type'] == 'EDIT_TRACKS_INFO')
+                .toList();
         expect(edits, hasLength(2));
         expect(edits[0].payload['activeTrackIds'], isEmpty);
         expect(edits[1].payload['activeTrackIds'], [1]);

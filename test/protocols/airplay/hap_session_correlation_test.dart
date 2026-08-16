@@ -75,22 +75,18 @@ void main() {
       expect(secondCseq, equals(firstCseq + 1));
     });
 
-    test(
-      'a live feedback loop cannot steal the /play response',
-      () async {
-        // setupRtspSession starts the 2-second feedback loop before RECORD.
-        await client.setupRtspSession(timingPort: 51234);
-        expect(client.isRtspSessionSetUp, isTrue);
+    test('a live feedback loop cannot steal the /play response', () async {
+      // setupRtspSession starts the 2-second feedback loop before RECORD.
+      await client.setupRtspSession(timingPort: 51234);
+      expect(client.isRtspSessionSetUp, isTrue);
 
-        // Overlap the loop with a burst of foreground commands.
-        for (var i = 0; i < 6; i++) {
-          final resp = await client.sendRequest('POST', '/play');
-          expect(resp.headers['x-mock-target'], equals('POST /play'));
-          await Future<void>.delayed(const Duration(milliseconds: 400));
-        }
-      },
-      timeout: const Timeout(Duration(seconds: 30)),
-    );
+      // Overlap the loop with a burst of foreground commands.
+      for (var i = 0; i < 6; i++) {
+        final resp = await client.sendRequest('POST', '/play');
+        expect(resp.headers['x-mock-target'], equals('POST /play'));
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+      }
+    }, timeout: const Timeout(Duration(seconds: 30)));
 
     test('resetRtspSession keeps CSeq monotonic', () async {
       final before = await client.sendRtspRequest('POST', '/feedback');

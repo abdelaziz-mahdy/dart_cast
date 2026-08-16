@@ -139,37 +139,33 @@ void main() {
   });
 
   group('DlnaHttpClient.sendAction timeout', () {
-    test(
-      'a stalled renderer fails instead of hanging forever',
-      () async {
-        // Accepts the connection and then never answers.
-        final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-        addTearDown(server.close);
-        final held = <Socket>[];
-        server.listen((socket) {
-          held.add(socket);
-          socket.listen((_) {}, onError: (Object _) {});
-        });
-        addTearDown(() {
-          for (final s in held) {
-            s.destroy();
-          }
-        });
+    test('a stalled renderer fails instead of hanging forever', () async {
+      // Accepts the connection and then never answers.
+      final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      final held = <Socket>[];
+      server.listen((socket) {
+        held.add(socket);
+        socket.listen((_) {}, onError: (Object _) {});
+      });
+      addTearDown(() {
+        for (final s in held) {
+          s.destroy();
+        }
+      });
 
-        final client = DlnaHttpClient();
-        addTearDown(client.close);
+      final client = DlnaHttpClient();
+      addTearDown(client.close);
 
-        await expectLater(
-          client.sendAction(
-            'http://127.0.0.1:${server.port}/control',
-            'urn:schemas-upnp-org:service:AVTransport:1',
-            'GetPositionInfo',
-            '<soap/>',
-          ),
-          throwsA(isA<ProtocolException>()),
-        );
-      },
-      timeout: const Timeout(Duration(seconds: 60)),
-    );
+      await expectLater(
+        client.sendAction(
+          'http://127.0.0.1:${server.port}/control',
+          'urn:schemas-upnp-org:service:AVTransport:1',
+          'GetPositionInfo',
+          '<soap/>',
+        ),
+        throwsA(isA<ProtocolException>()),
+      );
+    }, timeout: const Timeout(Duration(seconds: 60)));
   });
 }

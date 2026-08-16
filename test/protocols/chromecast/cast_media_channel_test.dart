@@ -113,24 +113,28 @@ void main() {
           ),
         ];
 
-        final withActive = jsonDecode(
-          channel.buildLoad(
-            contentId: 'http://example.com/video.mp4',
-            contentType: 'video/mp4',
-            subtitles: subtitles,
-            activeTrackIds: [2],
-          ),
-        ) as Map<String, dynamic>;
+        final withActive =
+            jsonDecode(
+                  channel.buildLoad(
+                    contentId: 'http://example.com/video.mp4',
+                    contentType: 'video/mp4',
+                    subtitles: subtitles,
+                    activeTrackIds: [2],
+                  ),
+                )
+                as Map<String, dynamic>;
         expect(withActive['activeTrackIds'], [2]);
 
-        final withEmpty = jsonDecode(
-          channel.buildLoad(
-            contentId: 'http://example.com/video.mp4',
-            contentType: 'video/mp4',
-            subtitles: subtitles,
-            activeTrackIds: [],
-          ),
-        ) as Map<String, dynamic>;
+        final withEmpty =
+            jsonDecode(
+                  channel.buildLoad(
+                    contentId: 'http://example.com/video.mp4',
+                    contentType: 'video/mp4',
+                    subtitles: subtitles,
+                    activeTrackIds: [],
+                  ),
+                )
+                as Map<String, dynamic>;
         expect(withEmpty.containsKey('activeTrackIds'), isFalse);
       });
 
