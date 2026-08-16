@@ -91,8 +91,47 @@ void main() {
         expect(tracks[0]['name'], 'English');
         expect(tracks[0]['language'], 'en');
 
-        // activeTrackIds should contain first subtitle by default
-        expect(decoded['activeTrackIds'], [1]);
+        // No implicit activation: listing tracks must not turn one on.
+        // The old "first subtitle by default" behaviour let the track-list
+        // order pick the on-screen language.
+        expect(decoded.containsKey('activeTrackIds'), isFalse);
+      });
+
+      test('activeTrackIds is included only when the caller names tracks', () {
+        final subtitles = [
+          CastMediaTrack(
+            trackId: 1,
+            url: 'http://example.com/fr.vtt',
+            name: 'French',
+            language: 'fr',
+          ),
+          CastMediaTrack(
+            trackId: 2,
+            url: 'http://example.com/en.vtt',
+            name: 'English',
+            language: 'en',
+          ),
+        ];
+
+        final withActive = jsonDecode(
+          channel.buildLoad(
+            contentId: 'http://example.com/video.mp4',
+            contentType: 'video/mp4',
+            subtitles: subtitles,
+            activeTrackIds: [2],
+          ),
+        ) as Map<String, dynamic>;
+        expect(withActive['activeTrackIds'], [2]);
+
+        final withEmpty = jsonDecode(
+          channel.buildLoad(
+            contentId: 'http://example.com/video.mp4',
+            contentType: 'video/mp4',
+            subtitles: subtitles,
+            activeTrackIds: [],
+          ),
+        ) as Map<String, dynamic>;
+        expect(withEmpty.containsKey('activeTrackIds'), isFalse);
       });
 
       test('includes streamType when specified', () {
