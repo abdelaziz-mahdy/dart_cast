@@ -21,10 +21,7 @@ void main() {
     if (kDebugMode) {
       debugPrint('[dart_cast:$level] $message');
     }
-    logEntries.value = [
-      ...logEntries.value,
-      LogEntry(level, message),
-    ];
+    logEntries.value = [...logEntries.value, LogEntry(level, message)];
   });
 
   runApp(const DartCastExampleApp());
@@ -53,9 +50,7 @@ class DartCastExampleApp extends StatelessWidget {
         brightness: Brightness.dark,
       ),
       home: const DeviceDiscoveryPage(),
-      routes: {
-        '/logs': (_) => const LogViewerPage(),
-      },
+      routes: {'/logs': (_) => const LogViewerPage()},
     );
   }
 }

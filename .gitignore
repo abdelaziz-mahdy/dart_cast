@@ -4,3 +4,7 @@ build/
 pubspec.lock
 .idea/
 *.iml
+
+# local debug captures + screenshot tours
+run_logs.txt
+example/screenshots/

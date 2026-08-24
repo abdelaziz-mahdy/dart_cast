@@ -1,3 +1,13 @@
+## 0.7.5
+
+### New
+- `CastSession.volume` reports the last volume level the device announced, so an app can show the device's actual level instead of assuming a default. Without it, a UI subscribing to `volumeStream` after connect missed the level the device sent during the handshake — and the first slider touch set the TV to whatever the app had invented (observed live: a TV at 18% blasted to 100%)
+- `CastMedia.copyWith` copies a media item with changes (start position, title, subtitles) while keeping its identity — useful for resuming the same video on another device from where it left off
+
+### Changed
+- Chromecast: the debug log summarises unchanged once-a-second status replies in a single line instead of dumping the full payload each time — a session log shrinks from megabytes to something readable. Anything that actually changed still logs in full
+- Example app: playback controls live in a bar pinned to the bottom of the screen instead of scrolling away under the media list; the volume slider starts at the level the TV reports and loading media no longer resets the TV to 25%; a session can be handed to another device and resume from the same position (**unverified on hardware**); video URLs and local files can be added without disconnecting first
+
 ## 0.7.4
 
 ### New

@@ -120,6 +120,7 @@ abstract class CastSession {
 
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
+  double? _volume;
 
   /// Creates a [CastSession] for the given [device].
   CastSession(this.device);
@@ -144,6 +145,15 @@ abstract class CastSession {
   /// Stream of media duration updates.
   Stream<Duration> get durationStream => _durationController.stream;
 
+  /// Last volume level reported by the device (0.0 to 1.0), or null if the
+  /// device has not reported one yet.
+  ///
+  /// [volumeStream] is a broadcast stream, so a listener that subscribes
+  /// after connect misses the level the device announced during the
+  /// handshake — read this getter to seed UI state instead of assuming a
+  /// default.
+  double? get volume => _volume;
+
   /// Stream of volume changes.
   Stream<double> get volumeStream => _volumeController.stream;
 
@@ -163,6 +173,7 @@ abstract class CastSession {
 
   /// Updates the current volume level.
   void updateVolume(double volume) {
+    _volume = volume;
     _volumeController.add(volume);
   }
 

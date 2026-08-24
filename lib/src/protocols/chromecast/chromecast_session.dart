@@ -69,6 +69,10 @@ class ChromecastSession extends CastSession {
   String? _transportId;
   String? _sessionId; // Used for STOP app via receiver namespace.
   int? _mediaSessionId;
+
+  /// Fingerprint of the last logged MEDIA_STATUS, used to elide the payload
+  /// of unchanged 1 Hz poll answers from the debug log.
+  String? _lastMediaStatusFingerprint;
   StreamSubscription<dynamic>? _mediaStatusSubscription;
 
   /// Periodic timer that polls GET_STATUS on the media channel to keep
@@ -850,11 +854,32 @@ class ChromecastSession extends CastSession {
         namespace == CastReceiverChannel.heartbeatNamespace &&
         (type == 'PING' || type == 'PONG');
     if (!isHeartbeat) {
-      final line = 'Chromecast: RX ns=$namespace type=$type — $payload';
       if (enableReceiverDebugNamespaces) {
-        CastLogger.info(line);
+        CastLogger.info('Chromecast: RX ns=$namespace type=$type — $payload');
+      } else if (namespace == CastMediaChannel.mediaNamespace &&
+          type == 'MEDIA_STATUS') {
+        // The 1 Hz position poll answers with a full MEDIA_STATUS every
+        // second; dumping each payload floods a session log with megabytes
+        // of identical JSON. Log the full payload only when something other
+        // than the clock changed, and a one-line summary otherwise.
+        final parsed = CastMediaChannel.parseMediaStatus(payload);
+        final fingerprint =
+            '${parsed?.mediaSessionId}/${parsed?.playerState}/'
+            '${parsed?.idleReason}/${parsed?.duration}';
+        if (parsed == null || fingerprint != _lastMediaStatusFingerprint) {
+          _lastMediaStatusFingerprint = fingerprint;
+          CastLogger.debug(
+            'Chromecast: RX ns=$namespace type=$type — $payload',
+          );
+        } else {
+          CastLogger.debug(
+            'Chromecast: RX MEDIA_STATUS ${parsed.playerState} '
+            't=${parsed.currentTime.toStringAsFixed(1)}s (unchanged, '
+            'payload elided)',
+          );
+        }
       } else {
-        CastLogger.debug(line);
+        CastLogger.debug('Chromecast: RX ns=$namespace type=$type — $payload');
       }
     }
 

@@ -66,6 +66,54 @@ void main() {
       expect(media.subtitles.first.label, 'English');
     });
 
+    test('copyWith overrides startPosition and keeps everything else', () {
+      const subtitle = CastSubtitle(
+        url: 'https://example.com/subs.vtt',
+        label: 'English',
+        language: 'en',
+        format: 'vtt',
+      );
+      const media = CastMedia(
+        url: 'https://example.com/video.mp4',
+        type: CastMediaType.mp4,
+        httpHeaders: {'Authorization': 'Bearer token'},
+        title: 'My Video',
+        imageUrl: 'https://example.com/thumb.jpg',
+        startPosition: Duration(seconds: 30),
+        subtitles: [subtitle],
+        defaultSubtitle: subtitle,
+      );
+
+      final resumed = media.copyWith(
+        startPosition: const Duration(minutes: 12),
+      );
+
+      expect(resumed.url, media.url);
+      expect(resumed.type, media.type);
+      expect(resumed.httpHeaders, media.httpHeaders);
+      expect(resumed.title, media.title);
+      expect(resumed.imageUrl, media.imageUrl);
+      expect(resumed.subtitles, media.subtitles);
+      expect(resumed.defaultSubtitle, media.defaultSubtitle);
+      expect(resumed.startPosition, const Duration(minutes: 12));
+      expect(resumed.isLocalFile, isFalse);
+    });
+
+    test('copyWith preserves local-file identity', () {
+      const media = CastMedia.file(
+        filePath: '/videos/movie.mkv',
+        type: CastMediaType.mkv,
+        title: 'Movie',
+      );
+
+      final resumed = media.copyWith(startPosition: const Duration(minutes: 3));
+
+      expect(resumed.url, '/videos/movie.mkv');
+      expect(resumed.isLocalFile, isTrue);
+      expect(resumed.startPosition, const Duration(minutes: 3));
+      expect(resumed.type, CastMediaType.mkv);
+    });
+
     test('enum values are distinct', () {
       expect(CastMediaType.hls, isNot(CastMediaType.mp4));
       expect(CastMediaType.mp4, isNot(CastMediaType.mpegTs));
