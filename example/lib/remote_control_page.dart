@@ -4,7 +4,9 @@ import 'package:dart_cast/dart_cast.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'cast_connector.dart';
 import 'cast_media_demo.dart';
+import 'device_list_sheet.dart';
 
 /// Prevents slider jitter by ignoring polled values during and after user
 /// interaction.
@@ -21,7 +23,7 @@ class OptimisticSliderState {
   static const _lockDuration = Duration(seconds: 3);
 
   OptimisticSliderState({required VoidCallback onStateChanged})
-      : _onStateChanged = onStateChanged;
+    : _onStateChanged = onStateChanged;
 
   double displayValue(double polledValue) {
     return _dragValue ?? _lockedValue ?? polledValue;
@@ -67,7 +69,9 @@ class OptimisticSliderState {
 /// Demonstrates:
 /// - Reactive UI via [StreamBuilder] for position, duration, state, and volume
 /// - Loading media with [CastSession.loadMedia]
-/// - Play/pause/stop/seek/volume controls
+/// - A pinned player panel with play/pause/stop/seek/volume controls
+/// - Volume seeded from the level the device itself reports
+/// - Switching to another device mid-session, resuming from the same position
 /// - Optimistic slider state to prevent jitter
 /// - Keyboard shortcuts (Space, arrows, M)
 /// - Subtitle selection
@@ -79,12 +83,17 @@ class RemoteControlPage extends StatefulWidget {
   final CastService castService;
   final List<CastMedia> customMedia;
 
+  /// Media to load as soon as the page opens. Used when switching devices to
+  /// resume what was playing on the previous device.
+  final CastMedia? initialMedia;
+
   const RemoteControlPage({
     super.key,
     required this.session,
     required this.device,
     required this.castService,
     this.customMedia = const [],
+    this.initialMedia,
   });
 
   @override
@@ -94,35 +103,62 @@ class RemoteControlPage extends StatefulWidget {
 class _RemoteControlPageState extends State<RemoteControlPage> {
   CastMedia? _currentMedia;
   CastSubtitle? _selectedSubtitle;
-  double _volume = 0.25;
-  double _lastVolumeBeforeMute = 0.5;
+
+  /// Last known device volume. Seeded from what the device reported during
+  /// the connect handshake — never a made-up default that would blast the
+  /// TV when the user first touches the slider.
+  late double _volume;
+  late double _lastVolumeBeforeMute;
+
   StreamSubscription<SessionState>? _stateSubscription;
   StreamSubscription<double>? _volumeSubscription;
+
+  /// Set while transferring the session to another device, so the
+  /// disconnect of the old session doesn't auto-pop this page.
+  bool _switching = false;
 
   late final OptimisticSliderState _seekState;
   late final OptimisticSliderState _volumeState;
 
+  // Discovery state for the switch-device sheet.
+  final _switchDevices = ValueNotifier<List<CastDevice>>([]);
+  final _switchDiscovering = ValueNotifier<bool>(false);
+  StreamSubscription<List<CastDevice>>? _switchDiscoverySub;
+
   @override
   void initState() {
     super.initState();
-    _seekState = OptimisticSliderState(onStateChanged: () {
-      if (mounted) setState(() {});
-    });
-    _volumeState = OptimisticSliderState(onStateChanged: () {
-      if (mounted) setState(() {});
-    });
+    _volume = widget.session.volume ?? 0.5;
+    _lastVolumeBeforeMute = _volume > 0 ? _volume : 0.5;
+    _seekState = OptimisticSliderState(
+      onStateChanged: () {
+        if (mounted) setState(() {});
+      },
+    );
+    _volumeState = OptimisticSliderState(
+      onStateChanged: () {
+        if (mounted) setState(() {});
+      },
+    );
     // Track volume from the device stream.
     _volumeSubscription = widget.session.volumeStream.listen((vol) {
       _volume = vol;
     });
     // Auto-pop when the session disconnects (e.g., device-side disconnect)
     _stateSubscription = widget.session.stateStream.listen((state) {
-      if (state == SessionState.disconnected && mounted) {
+      if (state == SessionState.disconnected && mounted && !_switching) {
         if (Navigator.of(context).canPop()) {
           Navigator.of(context).pop();
         }
       }
     });
+    // Resume media handed over from a previous device.
+    final initial = widget.initialMedia;
+    if (initial != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _loadMedia(initial);
+      });
+    }
   }
 
   @override
@@ -131,8 +167,13 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     _volumeState.dispose();
     _stateSubscription?.cancel();
     _volumeSubscription?.cancel();
-    // Stop playback when closing the remote
-    widget.session.stop().catchError((_) {});
+    _switchDiscoverySub?.cancel();
+    _switchDevices.dispose();
+    _switchDiscovering.dispose();
+    // Stop playback when closing the remote (no-op if already switched away).
+    if (!_switching) {
+      widget.session.stop().catchError((_) {});
+    }
     super.dispose();
   }
 
@@ -143,60 +184,48 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
       onKeyEvent: _handleKeyEvent,
       child: Scaffold(
         appBar: AppBar(
-          title: Text(widget.device.name),
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(widget.device.name, overflow: TextOverflow.ellipsis),
+              Text(
+                '${widget.device.protocol.name.toUpperCase()} '
+                '${widget.device.address.address}:${widget.device.port}',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
           actions: [
-            // Disconnect button in the app bar.
             IconButton(
-              icon: const Icon(Icons.cast_connected),
+              icon: const Icon(Icons.swap_horiz),
+              tooltip: 'Switch device',
+              onPressed: _showSwitchDeviceSheet,
+            ),
+            IconButton(
+              icon: const Icon(Icons.power_settings_new),
               tooltip: 'Disconnect',
               onPressed: _disconnect,
             ),
           ],
         ),
-        body: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 500),
-            child: Column(
-              children: [
-                // -- Session state indicator --
-                _buildStateBar(),
-                Expanded(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        // -- Device info --
-                        _buildDeviceInfo(),
-                        const SizedBox(height: 24),
-                        // -- Media selector --
-                        _buildMediaSelector(),
-                        const SizedBox(height: 24),
-                        // -- Now playing info --
-                        if (_currentMedia != null) ...[
-                          _buildNowPlaying(),
-                          const SizedBox(height: 24),
-                          // -- Seek slider --
-                          _buildSeekSlider(),
-                          const SizedBox(height: 16),
-                          // -- Playback controls --
-                          _buildPlaybackControls(),
-                          const SizedBox(height: 24),
-                          // -- Volume slider --
-                          _buildVolumeSlider(),
-                          const SizedBox(height: 24),
-                          // -- Subtitle selector --
-                          if (_currentMedia!.subtitles.isNotEmpty)
-                            _buildSubtitleSelector(),
-                        ],
-                      ],
-                    ),
-                  ),
+        body: Column(
+          children: [
+            _buildStateBar(),
+            Expanded(
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 500),
+                  child: _buildMediaLibrary(),
                 ),
-              ],
+              ),
             ),
-          ),
+          ],
         ),
+        // The player panel stays pinned at the bottom, out of the media
+        // list's scroll, so the controls never bury under the library.
+        bottomNavigationBar: _currentMedia != null ? _buildPlayerPanel() : null,
       ),
     );
   }
@@ -227,8 +256,9 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
       final target = pos - const Duration(seconds: 10);
       final clamped = target.isNegative ? Duration.zero : target;
       _seek(clamped);
-      _seekState
-          .lock(clamped.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble()));
+      _seekState.lock(
+        clamped.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble()),
+      );
       return KeyEventResult.handled;
     }
 
@@ -240,8 +270,9 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
       final target = pos + const Duration(seconds: 30);
       final clamped = target > dur ? dur : target;
       _seek(clamped);
-      _seekState
-          .lock(clamped.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble()));
+      _seekState.lock(
+        clamped.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble()),
+      );
       return KeyEventResult.handled;
     }
 
@@ -265,16 +296,7 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
 
     // M: mute toggle
     if (key == LogicalKeyboardKey.keyM) {
-      final vol = _volumeState.displayValue(_volume.clamp(0.0, 1.0));
-      if (vol > 0) {
-        _lastVolumeBeforeMute = vol;
-        _setVolume(0);
-        _volumeState.lock(0);
-      } else {
-        final restored = _lastVolumeBeforeMute > 0 ? _lastVolumeBeforeMute : 0.5;
-        _setVolume(restored);
-        _volumeState.lock(restored);
-      }
+      _toggleMute();
       return KeyEventResult.handled;
     }
 
@@ -334,37 +356,31 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     }
   }
 
-  /// Shows device name, protocol, and IP address.
-  Widget _buildDeviceInfo() {
-    return Card(
-      child: ListTile(
-        leading: Icon(_protocolIcon(widget.device.protocol), size: 32),
-        title: Text(widget.device.name),
-        subtitle: Text(
-          '${widget.device.protocol.name.toUpperCase()} '
-          '- ${widget.device.address.address}:${widget.device.port}',
-        ),
-      ),
-    );
-  }
-
-  /// Lets the user pick a sample media item to cast.
-  Widget _buildMediaSelector() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+  /// Scrollable media library. Tapping an item casts it; the item that is
+  /// currently on the device is marked and tapping it again is a no-op.
+  Widget _buildMediaLibrary() {
+    final allMedia = [...CastMediaDemo.allMedia, ...widget.customMedia];
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
       children: [
+        Text('Library', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 4),
         Text(
-          'Select Media',
-          style: Theme.of(context).textTheme.titleMedium,
+          _currentMedia == null
+              ? 'Pick something to cast to ${widget.device.name}.'
+              : 'Tap another item to switch what is playing.',
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
         ),
         const SizedBox(height: 8),
-        // List of sample media items + any custom media from the home page.
-        ...[...CastMediaDemo.allMedia, ...widget.customMedia].map((media) {
-          final isSelected = _currentMedia?.url == media.url;
+        ...allMedia.map((media) {
+          final isCurrent = _isCurrentMedia(media);
           return Card(
-            color: isSelected
-                ? Theme.of(context).colorScheme.primaryContainer
-                : null,
+            color:
+                isCurrent
+                    ? Theme.of(context).colorScheme.primaryContainer
+                    : null,
             child: ListTile(
               leading: _mediaTypeIcon(media.type),
               title: Text(media.title ?? 'Untitled'),
@@ -372,10 +388,14 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
                 '${media.type.name.toUpperCase()}'
                 '${media.subtitles.isNotEmpty ? ' - ${media.subtitles.length} subtitle(s)' : ''}',
               ),
-              trailing: isSelected
-                  ? const Icon(Icons.check_circle)
-                  : const Icon(Icons.play_circle_outline),
-              onTap: () => _loadMedia(media),
+              trailing:
+                  isCurrent
+                      ? Icon(
+                        Icons.play_circle,
+                        color: Theme.of(context).colorScheme.primary,
+                      )
+                      : const Icon(Icons.play_circle_outline),
+              onTap: isCurrent ? null : () => _loadMedia(media),
             ),
           );
         }),
@@ -383,49 +403,114 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     );
   }
 
-  /// Displays the currently loaded media title and thumbnail.
-  Widget _buildNowPlaying() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Row(
-          children: [
-            // Thumbnail image if available.
-            if (_currentMedia!.imageUrl != null)
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: Image.network(
-                  _currentMedia!.imageUrl!,
-                  width: 80,
-                  height: 60,
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, _, _) => Container(
-                    width: 80,
-                    height: 60,
-                    color: Colors.grey.shade300,
-                    child: const Icon(Icons.broken_image),
-                  ),
-                ),
-              ),
-            const SizedBox(width: 16),
-            Expanded(
+  /// Whether [media] is the item currently on the device.
+  ///
+  /// Compared by URL, type, and title rather than URL alone: the demo list
+  /// reuses one URL under two container types, and a device-switch handoff
+  /// carries a [CastMedia.copyWith] copy rather than the identical instance.
+  bool _isCurrentMedia(CastMedia media) {
+    final current = _currentMedia;
+    return current != null &&
+        current.url == media.url &&
+        current.type == media.type &&
+        current.title == media.title;
+  }
+
+  /// Pinned bottom panel with now-playing info, seek, transport, volume, and
+  /// subtitle controls.
+  Widget _buildPlayerPanel() {
+    final media = _currentMedia!;
+    return Material(
+      elevation: 8,
+      color: Theme.of(context).colorScheme.surfaceContainerLow,
+      child: SafeArea(
+        top: false,
+        // heightFactor shrink-wraps the panel: a plain Center would expand
+        // to every pixel the Scaffold offers the bottom bar and squeeze the
+        // library to zero height.
+        child: Center(
+          heightFactor: 1,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 500),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Text(
-                    _currentMedia!.title ?? 'Now Playing',
-                    style: Theme.of(context).textTheme.titleSmall,
+                  // Now playing row
+                  Row(
+                    children: [
+                      _mediaTypeIcon(media.type),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          media.title ?? 'Now Playing',
+                          style: Theme.of(context).textTheme.titleSmall,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (media.subtitles.isNotEmpty) _buildSubtitleButton(),
+                    ],
                   ),
-                  Text(
-                    _currentMedia!.type.name.toUpperCase(),
-                    style: Theme.of(context).textTheme.bodySmall,
+                  // Seek slider
+                  _buildSeekSlider(),
+                  // Transport + volume
+                  Row(
+                    children: [
+                      // Volume cluster
+                      _buildMuteButton(),
+                      Expanded(child: _buildVolumeSlider()),
+                      SizedBox(width: 40, child: _buildVolumeLabel()),
+                      const SizedBox(width: 8),
+                      // Transport cluster
+                      IconButton(
+                        iconSize: 28,
+                        onPressed: _stop,
+                        icon: const Icon(Icons.stop),
+                        tooltip: 'Stop',
+                      ),
+                      _buildPlayPauseButton(),
+                    ],
                   ),
                 ],
               ),
             ),
-          ],
+          ),
         ),
       ),
+    );
+  }
+
+  /// Play/pause toggle that reflects the live session state.
+  Widget _buildPlayPauseButton() {
+    return StreamBuilder<SessionState>(
+      stream: widget.session.stateStream,
+      initialData: widget.session.state,
+      builder: (context, snapshot) {
+        final state = snapshot.data ?? SessionState.idle;
+        final isPlaying = state == SessionState.playing;
+        final isBuffering =
+            state == SessionState.buffering || state == SessionState.loading;
+
+        return IconButton.filled(
+          iconSize: 36,
+          onPressed: isBuffering ? null : (isPlaying ? _pause : _play),
+          icon:
+              isBuffering
+                  ? const SizedBox(
+                    width: 36,
+                    height: 36,
+                    child: Padding(
+                      padding: EdgeInsets.all(6),
+                      child: CircularProgressIndicator(strokeWidth: 3),
+                    ),
+                  )
+                  : Icon(isPlaying ? Icons.pause : Icons.play_arrow),
+          tooltip: isPlaying ? 'Pause' : 'Play',
+        );
+      },
     );
   }
 
@@ -442,38 +527,40 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
             final position = posSnapshot.data ?? Duration.zero;
             final duration = durSnapshot.data ?? Duration.zero;
             final maxSeconds = duration.inSeconds.toDouble();
-            final polledSeconds = maxSeconds > 0
-                ? position.inSeconds.toDouble().clamp(0.0, maxSeconds)
-                : 0.0;
+            final polledSeconds =
+                maxSeconds > 0
+                    ? position.inSeconds.toDouble().clamp(0.0, maxSeconds)
+                    : 0.0;
             final displaySeconds = _seekState.displayValue(polledSeconds);
 
-            return Column(
+            return Row(
               children: [
-                Slider(
-                  value: maxSeconds > 0
-                      ? displaySeconds.clamp(0.0, maxSeconds)
-                      : 0,
-                  max: maxSeconds > 0 ? maxSeconds : 1,
-                  onChanged: maxSeconds > 0
-                      ? (value) => _seekState.onDragUpdate(value)
-                      : null,
-                  onChangeEnd: maxSeconds > 0
-                      ? (value) => _seekState.onDragEnd(value, () {
-                            _seek(Duration(seconds: value.toInt()));
-                          })
-                      : null,
+                Text(
+                  _formatDuration(Duration(seconds: displaySeconds.toInt())),
+                  style: Theme.of(context).textTheme.bodySmall,
                 ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(_formatDuration(
-                        Duration(seconds: displaySeconds.toInt()),
-                      )),
-                      Text(_formatDuration(duration)),
-                    ],
+                Expanded(
+                  child: Slider(
+                    value:
+                        maxSeconds > 0
+                            ? displaySeconds.clamp(0.0, maxSeconds)
+                            : 0,
+                    max: maxSeconds > 0 ? maxSeconds : 1,
+                    onChanged:
+                        maxSeconds > 0
+                            ? (value) => _seekState.onDragUpdate(value)
+                            : null,
+                    onChangeEnd:
+                        maxSeconds > 0
+                            ? (value) => _seekState.onDragEnd(value, () {
+                              _seek(Duration(seconds: value.toInt()));
+                            })
+                            : null,
                   ),
+                ),
+                Text(
+                  _formatDuration(duration),
+                  style: Theme.of(context).textTheme.bodySmall,
                 ),
               ],
             );
@@ -483,158 +570,111 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     );
   }
 
-  /// Play/pause and disconnect controls.
-  Widget _buildPlaybackControls() {
-    return StreamBuilder<SessionState>(
-      stream: widget.session.stateStream,
-      initialData: widget.session.state,
+  /// Mute toggle icon reflecting the current volume.
+  Widget _buildMuteButton() {
+    return StreamBuilder<double>(
+      stream: widget.session.volumeStream,
+      initialData: widget.session.volume ?? _volume,
       builder: (context, snapshot) {
-        final state = snapshot.data ?? SessionState.idle;
-        final isPlaying = state == SessionState.playing;
-        final isBuffering =
-            state == SessionState.buffering || state == SessionState.loading;
-
-        return Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            // Play/Pause toggle
-            IconButton.filled(
-              iconSize: 48,
-              onPressed: isBuffering ? null : (isPlaying ? _pause : _play),
-              icon: isBuffering
-                  ? const SizedBox(
-                      width: 48,
-                      height: 48,
-                      child: Padding(
-                        padding: EdgeInsets.all(8),
-                        child: CircularProgressIndicator(strokeWidth: 3),
-                      ),
-                    )
-                  : Icon(isPlaying ? Icons.pause : Icons.play_arrow),
-              tooltip: isPlaying ? 'Pause' : 'Play',
-            ),
-            const SizedBox(width: 16),
-            // Disconnect button
-            IconButton.filled(
-              iconSize: 32,
-              onPressed: _disconnect,
-              style: IconButton.styleFrom(
-                backgroundColor: Theme.of(context).colorScheme.error,
-                foregroundColor: Theme.of(context).colorScheme.onError,
-              ),
-              icon: const Icon(Icons.power_settings_new),
-              tooltip: 'Disconnect',
-            ),
-          ],
+        final polledVol = (snapshot.data ?? _volume).clamp(0.0, 1.0);
+        final displayVol = _volumeState.displayValue(polledVol);
+        return IconButton(
+          icon: Icon(
+            displayVol <= 0
+                ? Icons.volume_off
+                : displayVol < 0.5
+                ? Icons.volume_down
+                : Icons.volume_up,
+          ),
+          onPressed: _toggleMute,
+          tooltip: displayVol > 0 ? 'Mute' : 'Unmute',
         );
       },
     );
   }
 
-  /// Volume slider with [OptimisticSliderState] and mute toggle icon.
+  /// Volume slider with [OptimisticSliderState], seeded from the device.
   Widget _buildVolumeSlider() {
     return StreamBuilder<double>(
       stream: widget.session.volumeStream,
-      initialData: _volume,
+      initialData: widget.session.volume ?? _volume,
       builder: (context, snapshot) {
-        final polledVol = (snapshot.data ?? 0.25).clamp(0.0, 1.0);
+        final polledVol = (snapshot.data ?? _volume).clamp(0.0, 1.0);
         final displayVol = _volumeState.displayValue(polledVol);
 
-        return Row(
-          children: [
-            // Mute toggle icon
-            IconButton(
-              iconSize: 20,
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-              icon: Icon(
-                displayVol <= 0
-                    ? Icons.volume_off
-                    : displayVol < 0.5
-                        ? Icons.volume_down
-                        : Icons.volume_up,
-              ),
-              onPressed: () {
-                if (displayVol > 0) {
-                  _lastVolumeBeforeMute = displayVol;
-                  _setVolume(0);
-                  _volumeState.lock(0);
-                } else {
-                  final restored =
-                      _lastVolumeBeforeMute > 0 ? _lastVolumeBeforeMute : 0.5;
-                  _setVolume(restored);
-                  _volumeState.lock(restored);
-                }
-              },
-              tooltip: displayVol > 0 ? 'Mute' : 'Unmute',
-            ),
-            Expanded(
-              child: Slider(
-                value: displayVol.clamp(0.0, 1.0),
-                onChanged: (value) => _volumeState.onDragUpdate(value),
-                onChangeEnd: (value) => _volumeState.onDragEnd(value, () {
-                  _setVolume(value);
-                }),
-              ),
-            ),
-            SizedBox(
-              width: 40,
-              child: Text(
-                '${(displayVol * 100).round()}%',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ),
-          ],
+        return Slider(
+          value: displayVol.clamp(0.0, 1.0),
+          onChanged: (value) => _volumeState.onDragUpdate(value),
+          onChangeEnd:
+              (value) => _volumeState.onDragEnd(value, () {
+                _setVolume(value);
+              }),
         );
       },
     );
   }
 
-  /// Subtitle selector using filter chips.
-  Widget _buildSubtitleSelector() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'Subtitles',
-          style: Theme.of(context).textTheme.titleMedium,
-        ),
-        const SizedBox(height: 8),
-        Wrap(
-          spacing: 8,
-          children: [
-            // "Off" chip to disable subtitles.
-            FilterChip(
-              label: const Text('Off'),
-              selected: _selectedSubtitle == null,
-              onSelected: (_) => _setSubtitle(null),
+  Widget _buildVolumeLabel() {
+    return StreamBuilder<double>(
+      stream: widget.session.volumeStream,
+      initialData: widget.session.volume ?? _volume,
+      builder: (context, snapshot) {
+        final polledVol = (snapshot.data ?? _volume).clamp(0.0, 1.0);
+        final displayVol = _volumeState.displayValue(polledVol);
+        return Text(
+          '${(displayVol * 100).round()}%',
+          style: Theme.of(context).textTheme.bodySmall,
+        );
+      },
+    );
+  }
+
+  /// Subtitle picker as a popup menu in the player panel.
+  Widget _buildSubtitleButton() {
+    final subtitles = _currentMedia!.subtitles;
+    return PopupMenuButton<CastSubtitle?>(
+      icon: Icon(
+        _selectedSubtitle != null ? Icons.subtitles : Icons.subtitles_outlined,
+        color:
+            _selectedSubtitle != null
+                ? Theme.of(context).colorScheme.primary
+                : null,
+      ),
+      tooltip: 'Subtitles',
+      onSelected: (_) {},
+      itemBuilder:
+          (context) => [
+            CheckedPopupMenuItem<CastSubtitle?>(
+              value: null,
+              checked: _selectedSubtitle == null,
+              onTap: () => _setSubtitle(null),
+              child: const Text('Off'),
             ),
-            // One chip per available subtitle track.
-            ..._currentMedia!.subtitles.map((sub) {
-              return FilterChip(
-                label: Text(sub.label),
-                selected: _selectedSubtitle?.language == sub.language,
-                onSelected: (_) => _setSubtitle(sub),
-              );
-            }),
+            ...subtitles.map(
+              (sub) => CheckedPopupMenuItem<CastSubtitle?>(
+                value: sub,
+                checked: _selectedSubtitle?.language == sub.language,
+                onTap: () => _setSubtitle(sub),
+                child: Text(sub.label),
+              ),
+            ),
           ],
-        ),
-      ],
     );
   }
 
   // -- Actions --
 
   /// Loads media onto the cast device using [CastSession.loadMedia].
+  ///
+  /// Deliberately does NOT touch the device volume: whatever level the TV
+  /// is already at is what the user expects to keep hearing.
   Future<void> _loadMedia(CastMedia media) async {
     setState(() {
       _currentMedia = media;
-      _selectedSubtitle = null;
+      _selectedSubtitle = media.defaultSubtitle;
     });
     try {
       await widget.session.loadMedia(media);
-      // Apply default volume to the device after loading.
-      await widget.session.setVolume(0.25);
     } catch (e) {
       _showError('Failed to load media: $e');
     }
@@ -656,6 +696,15 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     }
   }
 
+  Future<void> _stop() async {
+    try {
+      await widget.session.stop();
+      setState(() => _currentMedia = null);
+    } catch (e) {
+      _showError('Stop failed: $e');
+    }
+  }
+
   Future<void> _seek(Duration position) async {
     try {
       await widget.session.seek(position);
@@ -672,6 +721,19 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     }
   }
 
+  void _toggleMute() {
+    final vol = _volumeState.displayValue(_volume.clamp(0.0, 1.0));
+    if (vol > 0) {
+      _lastVolumeBeforeMute = vol;
+      _setVolume(0);
+      _volumeState.lock(0);
+    } else {
+      final restored = _lastVolumeBeforeMute > 0 ? _lastVolumeBeforeMute : 0.5;
+      _setVolume(restored);
+      _volumeState.lock(restored);
+    }
+  }
+
   Future<void> _setSubtitle(CastSubtitle? subtitle) async {
     setState(() => _selectedSubtitle = subtitle);
     try {
@@ -679,6 +741,100 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     } catch (e) {
       _showError('Subtitle change failed: $e');
     }
+  }
+
+  // -- Device switching --
+
+  /// Discovers devices and shows them in a sheet. Picking one transfers the
+  /// session: the current media resumes on the new device from the current
+  /// position.
+  void _showSwitchDeviceSheet() {
+    _switchDiscovering.value = true;
+    _switchDevices.value = [];
+
+    _switchDiscoverySub?.cancel();
+    _switchDiscoverySub = widget.castService
+        .startDiscovery(timeout: const Duration(seconds: 15))
+        .listen(
+          (devices) => _switchDevices.value = devices,
+          onDone: () => _switchDiscovering.value = false,
+          onError: (Object error) {
+            _switchDiscovering.value = false;
+            _showError('Discovery error: $error');
+          },
+        );
+
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return ValueListenableBuilder<List<CastDevice>>(
+          valueListenable: _switchDevices,
+          builder: (context, devices, _) {
+            return ValueListenableBuilder<bool>(
+              valueListenable: _switchDiscovering,
+              builder: (context, isDiscovering, _) {
+                return DeviceListSheet(
+                  devices: devices,
+                  isDiscovering: isDiscovering,
+                  connectedDeviceId: widget.device.id,
+                  onDeviceTap: (device) {
+                    Navigator.of(sheetContext).pop();
+                    _switchToDevice(device);
+                  },
+                  onStop: _stopSwitchDiscovery,
+                );
+              },
+            );
+          },
+        );
+      },
+    ).then((_) => _stopSwitchDiscovery());
+  }
+
+  void _stopSwitchDiscovery() {
+    _switchDiscoverySub?.cancel();
+    widget.castService.stopDiscovery();
+    _switchDiscovering.value = false;
+  }
+
+  Future<void> _switchToDevice(CastDevice device) async {
+    // Capture playback context before tearing the old session down.
+    final media = _currentMedia;
+    final position = widget.session.position;
+
+    _switching = true;
+    try {
+      await widget.session.disconnect();
+    } catch (_) {
+      // Old session is going away regardless.
+    }
+
+    if (!mounted) return;
+    final session = await connectWithUi(context, widget.castService, device);
+    if (session == null) {
+      // Connection to the new device failed and the old one is gone —
+      // fall back to the discovery page.
+      _switching = false;
+      if (mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+      return;
+    }
+
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute<void>(
+        builder:
+            (_) => RemoteControlPage(
+              session: session,
+              device: device,
+              castService: widget.castService,
+              customMedia: widget.customMedia,
+              initialMedia: media?.copyWith(startPosition: position),
+            ),
+      ),
+    );
   }
 
   /// Disconnects from the device and pops back to the discovery page.
@@ -693,9 +849,9 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
 
   void _showError(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   // -- Helpers --
@@ -707,17 +863,6 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
     if (hours > 0) return '$hours:$minutes:$seconds';
     return '$minutes:$seconds';
-  }
-
-  IconData _protocolIcon(CastProtocol protocol) {
-    switch (protocol) {
-      case CastProtocol.chromecast:
-        return Icons.cast;
-      case CastProtocol.airplay:
-        return Icons.airplay;
-      case CastProtocol.dlna:
-        return Icons.devices_other;
-    }
   }
 
   Widget _mediaTypeIcon(CastMediaType type) {

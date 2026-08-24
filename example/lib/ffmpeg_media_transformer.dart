@@ -78,19 +78,26 @@ class FfmpegRemuxer {
     final hasSubs = subtitlePath != null && File(subtitlePath).existsSync();
 
     onProgress?.call(
-        'Remuxing ${p.basename(inputPath)} → .mp4${hasSubs ? ' (with subs)' : ''}');
+      'Remuxing ${p.basename(inputPath)} → .mp4${hasSubs ? ' (with subs)' : ''}',
+    );
 
     try {
       final result = await Process.run('ffmpeg', [
-        '-fflags', '+genpts',
-        '-i', inputPath,
+        '-fflags',
+        '+genpts',
+        '-i',
+        inputPath,
         if (hasSubs) ...['-i', subtitlePath],
-        '-map', '0',
+        '-map',
+        '0',
         if (hasSubs) ...['-map', '1'],
-        '-map', '-0:d',
-        '-c', 'copy',
+        '-map',
+        '-0:d',
+        '-c',
+        'copy',
         if (hasSubs) ...['-c:s', 'mov_text'],
-        '-movflags', '+faststart',
+        '-movflags',
+        '+faststart',
         '-y',
         mp4Path,
       ]);
@@ -98,8 +105,9 @@ class FfmpegRemuxer {
       stopwatch.stop();
 
       if (result.exitCode == 0) {
-        final elapsed =
-            (stopwatch.elapsedMilliseconds / 1000).toStringAsFixed(1);
+        final elapsed = (stopwatch.elapsedMilliseconds / 1000).toStringAsFixed(
+          1,
+        );
         onProgress?.call('Remux complete (${elapsed}s)');
         return mp4Path;
       }
@@ -135,7 +143,8 @@ class FfmpegRemuxer {
     final stopwatch = Stopwatch()..start();
 
     onProgress?.call(
-        'Remuxing ${p.basename(inputPath)} → .mkv (with embedded SRT)');
+      'Remuxing ${p.basename(inputPath)} → .mkv (with embedded SRT)',
+    );
 
     try {
       final result = await Process.run('ffmpeg', [
@@ -153,8 +162,9 @@ class FfmpegRemuxer {
       stopwatch.stop();
 
       if (result.exitCode == 0) {
-        final elapsed =
-            (stopwatch.elapsedMilliseconds / 1000).toStringAsFixed(1);
+        final elapsed = (stopwatch.elapsedMilliseconds / 1000).toStringAsFixed(
+          1,
+        );
         onProgress?.call('MKV remux complete (${elapsed}s)');
         return mkvPath;
       }
@@ -218,10 +228,7 @@ class FfmpegMediaTransformer extends DefaultMediaTransformer {
   });
 
   @override
-  Future<TransformedMedia> transform(
-    CastMedia media,
-    MediaProxy proxy,
-  ) async {
+  Future<TransformedMedia> transform(CastMedia media, MediaProxy proxy) async {
     if (!media.isLocalFile || media.type != CastMediaType.mpegTs) {
       return super.transform(media, proxy);
     }
@@ -234,9 +241,10 @@ class FfmpegMediaTransformer extends DefaultMediaTransformer {
     if (embedSubtitles && media.subtitles.isNotEmpty) {
       final subUrl = media.subtitles.first.url;
       // Handle file:// URLs
-      subtitlePath = subUrl.startsWith('file://')
-          ? subUrl.replaceFirst('file://', '')
-          : subUrl;
+      subtitlePath =
+          subUrl.startsWith('file://')
+              ? subUrl.replaceFirst('file://', '')
+              : subUrl;
       if (!File(subtitlePath).existsSync()) {
         subtitlePath = null;
       }
@@ -272,7 +280,9 @@ class FfmpegMediaTransformer extends DefaultMediaTransformer {
       if (result != null) {
         final url = proxy.registerFile(result);
         return TransformedMedia(
-            proxyUrl: url, effectiveType: CastMediaType.mkv);
+          proxyUrl: url,
+          effectiveType: CastMediaType.mkv,
+        );
       }
       // MKV embedding failed — fall through to normal MP4 remux
       onProgress?.call('MKV subtitle embedding failed, casting without subs');
