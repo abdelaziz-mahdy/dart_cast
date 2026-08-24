@@ -1,12 +1,11 @@
 import 'dart:async';
 
 import 'package:dart_cast/dart_cast.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:path/path.dart' as p;
 
 import 'cast_connector.dart';
 import 'device_list_sheet.dart';
+import 'media_sources.dart';
 import 'remote_control_page.dart';
 
 /// Main page that handles device discovery and connection.
@@ -89,21 +88,6 @@ class _DeviceDiscoveryPageState extends State<DeviceDiscoveryPage> {
     super.dispose();
   }
 
-  /// Auto-detects media type from a URL.
-  CastMediaType _detectMediaType(String url) {
-    final lower = url.toLowerCase();
-    if (lower.contains('.m3u8') || lower.contains('hls')) {
-      return CastMediaType.hls;
-    }
-    if (lower.contains('.ts')) {
-      return CastMediaType.mpegTs;
-    }
-    if (lower.contains('.mkv')) {
-      return CastMediaType.mkv;
-    }
-    return CastMediaType.mp4;
-  }
-
   /// Adds a custom media item from the URL text fields.
   void _addCustomMedia() {
     final url = _customUrlController.text.trim();
@@ -114,20 +98,7 @@ class _DeviceDiscoveryPageState extends State<DeviceDiscoveryPage> {
       return;
     }
 
-    final type = _detectMediaType(url);
-
-    final subtitles = <CastSubtitle>[];
-    final subUrl = _customSubUrlController.text.trim();
-    if (subUrl.isNotEmpty) {
-      subtitles.add(
-        CastSubtitle(
-          url: subUrl,
-          label: 'Custom',
-          language: 'und',
-          format: subUrl.endsWith('.srt') ? 'srt' : 'vtt',
-        ),
-      );
-    }
+    final type = detectMediaType(url);
 
     setState(() {
       _customMedia.add(
@@ -135,7 +106,7 @@ class _DeviceDiscoveryPageState extends State<DeviceDiscoveryPage> {
           url: url,
           type: type,
           title: 'Custom Video (${type.name.toUpperCase()})',
-          subtitles: subtitles,
+          subtitles: subtitlesFromUrl(_customSubUrlController.text.trim()),
         ),
       );
     });
@@ -154,46 +125,15 @@ class _DeviceDiscoveryPageState extends State<DeviceDiscoveryPage> {
   /// [CastMedia.file] can be cast to any discovered device just like a remote
   /// URL — no extra setup is needed here.
   Future<void> _pickLocalVideo() async {
-    // The example disables the macOS app sandbox, so let file_picker skip its
-    // entitlements check there. This is a no-op on every other platform.
-    await FilePicker.skipEntitlementsChecks();
-    final result = await FilePicker.pickFiles(type: FileType.video);
-    // User cancelled the picker, or no path is available (e.g. on web).
-    if (result == null) return;
-    final path = result.files.single.path;
-    if (path == null) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not read the selected file path')),
-      );
-      return;
-    }
-
-    final type = _detectMediaType(path);
+    final picked = await pickLocalVideoMedia();
+    if (picked == null || !mounted) return;
 
     // Reuse the subtitle URL field if the user filled it in before picking.
-    final subtitles = <CastSubtitle>[];
-    final subUrl = _customSubUrlController.text.trim();
-    if (subUrl.isNotEmpty) {
-      subtitles.add(
-        CastSubtitle(
-          url: subUrl,
-          label: 'Custom',
-          language: 'und',
-          format: subUrl.endsWith('.srt') ? 'srt' : 'vtt',
-        ),
-      );
-    }
+    final subtitles = subtitlesFromUrl(_customSubUrlController.text.trim());
 
-    if (!mounted) return;
     setState(() {
       _customMedia.add(
-        CastMedia.file(
-          filePath: path,
-          type: type,
-          title: p.basename(path),
-          subtitles: subtitles,
-        ),
+        subtitles.isEmpty ? picked : picked.copyWith(subtitles: subtitles),
       );
     });
 

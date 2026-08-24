@@ -69,10 +69,15 @@ void main() {
     castService.dispose();
   });
 
-  RemoteControlPage page({CastMedia? initialMedia}) => RemoteControlPage(
+  RemoteControlPage page({
+    CastMedia? initialMedia,
+    List<CastMedia>? customMedia,
+  }) =>
+      RemoteControlPage(
         session: session,
         device: session.device,
         castService: castService,
+        customMedia: customMedia ?? [],
         initialMedia: initialMedia,
       );
 
@@ -192,6 +197,77 @@ void main() {
       await tester.pump();
       expect(session.loadedMedia, hasLength(2));
       expect(session.loadedMedia.last.title, 'Elephants Dream (MP4)');
+    });
+  });
+
+  group('adding sources while connected', () {
+    testWidgets('Add URL dialog appends to the shared custom media list',
+        (tester) async {
+      // Tall surface: the custom item lands at the end of the library.
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      final shared = <CastMedia>[];
+      await tester.pumpWidget(_wrap(page(customMedia: shared)));
+
+      await tester.tap(find.text('Add URL'));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Video URL'),
+        'https://example.com/movie.mkv',
+      );
+      await tester.tap(find.text('Add'));
+      await tester.pumpAndSettle();
+
+      // Appended to the caller's list (so it survives navigation) and
+      // rendered in the library with a remove action.
+      expect(shared, hasLength(1));
+      expect(shared.single.type, CastMediaType.mkv);
+      expect(find.text('Custom Video (MKV)'), findsOneWidget);
+      expect(find.byTooltip('Remove from library'), findsOneWidget);
+
+      // Tapping the new item casts it.
+      await tester.tap(find.text('Custom Video (MKV)'));
+      await tester.pump();
+      expect(session.loadedMedia.single.url, 'https://example.com/movie.mkv');
+    });
+
+    testWidgets('empty URL is not accepted', (tester) async {
+      final shared = <CastMedia>[];
+      await tester.pumpWidget(_wrap(page(customMedia: shared)));
+
+      await tester.tap(find.text('Add URL'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Add'));
+      await tester.pumpAndSettle();
+
+      // Dialog stays open, nothing added.
+      expect(find.text('Video URL'), findsOneWidget);
+      expect(shared, isEmpty);
+    });
+
+    testWidgets('remove action deletes a custom item', (tester) async {
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      final shared = <CastMedia>[
+        const CastMedia(
+          url: 'https://example.com/a.mp4',
+          type: CastMediaType.mp4,
+          title: 'My Custom Video',
+        ),
+      ];
+      await tester.pumpWidget(_wrap(page(customMedia: shared)));
+
+      expect(find.text('My Custom Video'), findsOneWidget);
+      await tester.tap(find.byTooltip('Remove from library'));
+      await tester.pump();
+
+      expect(shared, isEmpty);
+      expect(find.text('My Custom Video'), findsNothing);
     });
   });
 

@@ -131,6 +131,15 @@ void main() {
         session: session,
         device: session.device,
         castService: CastService(discoveryProviders: []),
+        // A user-added source, to show the custom-item row with its
+        // remove action alongside the demo entries.
+        customMedia: [
+          const CastMedia.file(
+            filePath: '/Users/demo/Movies/holiday-recap.mkv',
+            type: CastMediaType.mkv,
+            title: 'holiday-recap.mkv',
+          ),
+        ],
         initialMedia: initialMedia,
       ),
     );

@@ -102,6 +102,7 @@ Widget _remote({CastMedia? initialMedia, Brightness brightness = Brightness.ligh
       session: session,
       device: session.device,
       castService: CastService(discoveryProviders: []),
+      customMedia: [],
       initialMedia: initialMedia,
     ),
   );

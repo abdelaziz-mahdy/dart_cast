@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'cast_connector.dart';
 import 'cast_media_demo.dart';
 import 'device_list_sheet.dart';
+import 'media_sources.dart';
 
 /// Prevents slider jitter by ignoring polled values during and after user
 /// interaction.
@@ -81,6 +82,12 @@ class RemoteControlPage extends StatefulWidget {
   final CastSession session;
   final CastDevice device;
   final CastService castService;
+
+  /// User-added media (URLs and local files), shared with the caller.
+  ///
+  /// Must be a growable list: the page appends to it when the user adds a
+  /// source while connected, so additions survive device switches and are
+  /// still there after navigating back to the discovery page.
   final List<CastMedia> customMedia;
 
   /// Media to load as soon as the page opens. Used when switching devices to
@@ -92,7 +99,7 @@ class RemoteControlPage extends StatefulWidget {
     required this.session,
     required this.device,
     required this.castService,
-    this.customMedia = const [],
+    required this.customMedia,
     this.initialMedia,
   });
 
@@ -358,12 +365,32 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
 
   /// Scrollable media library. Tapping an item casts it; the item that is
   /// currently on the device is marked and tapping it again is a no-op.
+  /// The header offers adding a URL or a local file without leaving the
+  /// connected screen.
   Widget _buildMediaLibrary() {
-    final allMedia = [...CastMediaDemo.allMedia, ...widget.customMedia];
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
       children: [
-        Text('Library', style: Theme.of(context).textTheme.titleMedium),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Library',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
+            TextButton.icon(
+              onPressed: _addUrlSource,
+              icon: const Icon(Icons.add_link),
+              label: const Text('Add URL'),
+            ),
+            TextButton.icon(
+              onPressed: _addFileSource,
+              icon: const Icon(Icons.folder_open),
+              label: const Text('Add file'),
+            ),
+          ],
+        ),
         const SizedBox(height: 4),
         Text(
           _currentMedia == null
@@ -374,32 +401,67 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
           ),
         ),
         const SizedBox(height: 8),
-        ...allMedia.map((media) {
-          final isCurrent = _isCurrentMedia(media);
-          return Card(
-            color:
-                isCurrent
-                    ? Theme.of(context).colorScheme.primaryContainer
-                    : null,
-            child: ListTile(
-              leading: _mediaTypeIcon(media.type),
-              title: Text(media.title ?? 'Untitled'),
-              subtitle: Text(
-                '${media.type.name.toUpperCase()}'
-                '${media.subtitles.isNotEmpty ? ' - ${media.subtitles.length} subtitle(s)' : ''}',
-              ),
-              trailing:
-                  isCurrent
-                      ? Icon(
-                        Icons.play_circle,
-                        color: Theme.of(context).colorScheme.primary,
-                      )
-                      : const Icon(Icons.play_circle_outline),
-              onTap: isCurrent ? null : () => _loadMedia(media),
-            ),
-          );
-        }),
+        ...CastMediaDemo.allMedia.map((media) => _buildMediaTile(media)),
+        ...widget.customMedia.map(
+          (media) => _buildMediaTile(media, isCustom: true),
+        ),
       ],
+    );
+  }
+
+  Widget _buildMediaTile(CastMedia media, {bool isCustom = false}) {
+    final isCurrent = _isCurrentMedia(media);
+    final playIcon = isCurrent
+        ? Icon(Icons.play_circle, color: Theme.of(context).colorScheme.primary)
+        : const Icon(Icons.play_circle_outline);
+    return Card(
+      color: isCurrent ? Theme.of(context).colorScheme.primaryContainer : null,
+      child: ListTile(
+        leading: _mediaTypeIcon(media.type),
+        title: Text(media.title ?? 'Untitled'),
+        subtitle: Text(
+          '${media.type.name.toUpperCase()}'
+          '${media.subtitles.isNotEmpty ? ' - ${media.subtitles.length} subtitle(s)' : ''}',
+        ),
+        trailing: isCustom
+            ? Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline),
+                    tooltip: 'Remove from library',
+                    onPressed: () {
+                      setState(() => widget.customMedia.remove(media));
+                    },
+                  ),
+                  playIcon,
+                ],
+              )
+            : playIcon,
+        onTap: isCurrent ? null : () => _loadMedia(media),
+      ),
+    );
+  }
+
+  /// Prompts for a video URL (plus optional subtitle URL) and adds it to
+  /// the shared custom media list.
+  Future<void> _addUrlSource() async {
+    final media = await promptForUrlMedia(context);
+    if (media == null || !mounted) return;
+    setState(() => widget.customMedia.add(media));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Added to library — tap it to cast')),
+    );
+  }
+
+  /// Picks a local video file and adds it to the shared custom media list.
+  /// The package serves it over HTTP via its built-in proxy.
+  Future<void> _addFileSource() async {
+    final media = await pickLocalVideoMedia();
+    if (media == null || !mounted) return;
+    setState(() => widget.customMedia.add(media));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Added to library — tap it to cast')),
     );
   }
 
