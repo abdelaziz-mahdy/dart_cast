@@ -76,13 +76,19 @@ void main() {
   const shotDir = String.fromEnvironment('SHOT_DIR', defaultValue: 'after');
   final boundaryKey = GlobalKey();
 
-  const size = Size(420, 860);
-  setUp(() {
+  const phone = Size(420, 860);
+  const desktop = Size(1280, 800);
+  var size = phone;
+
+  void setSize(Size s) {
+    size = s;
     final view =
         TestWidgetsFlutterBinding.instance.platformDispatcher.views.first;
-    view.physicalSize = size * 2;
+    view.physicalSize = s * 2;
     view.devicePixelRatio = 2;
-  });
+  }
+
+  setUp(() => setSize(phone));
   tearDown(() {
     final view =
         TestWidgetsFlutterBinding.instance.platformDispatcher.views.first;
@@ -179,5 +185,35 @@ void main() {
     ));
     await t.pump(const Duration(milliseconds: 400));
     await shoot('04-device-sheet');
+  });
+
+  testWidgets('remote idle desktop', (t) async {
+    setSize(desktop);
+    final session = FakeCastSession(device('tv-1', 'Living room TV',
+        CastProtocol.chromecast, '192.168.2.17', 8009));
+    await t.pumpWidget(remote(session));
+    await t.pump(const Duration(milliseconds: 400));
+    await shoot('05-remote-idle-desktop');
+  });
+
+  testWidgets('remote playing desktop', (t) async {
+    setSize(desktop);
+    final session = FakeCastSession(device('tv-1', 'Living room TV',
+        CastProtocol.chromecast, '192.168.2.17', 8009));
+    await t.pumpWidget(
+        remote(session, initialMedia: CastMediaDemo.mp4TearsOfSteel));
+    await t.pump(const Duration(milliseconds: 400));
+    await shoot('06-remote-playing-desktop');
+  });
+
+  testWidgets('remote playing desktop dark', (t) async {
+    setSize(desktop);
+    final session = FakeCastSession(device('tv-1', 'Living room TV',
+        CastProtocol.chromecast, '192.168.2.17', 8009));
+    await t.pumpWidget(remote(session,
+        initialMedia: CastMediaDemo.mp4TearsOfSteel,
+        brightness: Brightness.dark));
+    await t.pump(const Duration(milliseconds: 400));
+    await shoot('07-remote-playing-desktop-dark');
   });
 }

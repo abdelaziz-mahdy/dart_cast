@@ -119,6 +119,13 @@ Widget remotePlayingDark() => _remote(
       brightness: Brightness.dark,
     );
 
+@Preview(name: 'Remote — desktop, playing', size: Size(1280, 800))
+Widget remotePlayingDesktop() =>
+    _remote(initialMedia: CastMediaDemo.mp4TearsOfSteel);
+
+@Preview(name: 'Remote — desktop, library only', size: Size(1280, 800))
+Widget remoteIdleDesktop() => _remote();
+
 @Preview(name: 'Discovery page', size: Size(420, 860))
 Widget discovery() => _theme(const DeviceDiscoveryPage());
 
