@@ -128,6 +128,18 @@ void main() {
       await sub.cancel();
     });
 
+    test('volume defaults to null until the device reports it', () {
+      expect(session.volume, isNull);
+    });
+
+    test('updateVolume caches the value for late readers', () {
+      session.updateVolume(0.18);
+      expect(session.volume, 0.18);
+
+      session.updateVolume(0.5);
+      expect(session.volume, 0.5);
+    });
+
     test('positionStream, durationStream, volumeStream exist', () {
       expect(session.positionStream, isA<Stream<Duration>>());
       expect(session.durationStream, isA<Stream<Duration>>());

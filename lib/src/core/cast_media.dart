@@ -150,4 +150,48 @@ class CastMedia {
   }) : url = '',
        isLocalFile = false,
        httpHeaders = const {};
+
+  const CastMedia._raw({
+    required this.url,
+    required this.type,
+    required this.isLocalFile,
+    required this.fileExtension,
+    required this.source,
+    required this.httpHeaders,
+    required this.title,
+    required this.imageUrl,
+    required this.startPosition,
+    required this.duration,
+    required this.subtitles,
+    required this.defaultSubtitle,
+  });
+
+  /// Returns a copy of this media with the given fields replaced.
+  ///
+  /// The media identity (URL, local-file flag, byte source, headers) is
+  /// always preserved — this exists for playback-context tweaks such as
+  /// resuming on another device from a known position.
+  CastMedia copyWith({
+    String? title,
+    String? imageUrl,
+    Duration? startPosition,
+    Duration? duration,
+    List<CastSubtitle>? subtitles,
+    CastSubtitle? defaultSubtitle,
+  }) {
+    return CastMedia._raw(
+      url: url,
+      type: type,
+      isLocalFile: isLocalFile,
+      fileExtension: fileExtension,
+      source: source,
+      httpHeaders: httpHeaders,
+      title: title ?? this.title,
+      imageUrl: imageUrl ?? this.imageUrl,
+      startPosition: startPosition ?? this.startPosition,
+      duration: duration ?? this.duration,
+      subtitles: subtitles ?? this.subtitles,
+      defaultSubtitle: defaultSubtitle ?? this.defaultSubtitle,
+    );
+  }
 }
