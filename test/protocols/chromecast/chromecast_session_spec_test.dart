@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:dart_cast/src/core/cast_device.dart';
 import 'package:dart_cast/src/core/cast_exceptions.dart';
+import 'package:dart_cast/src/core/cast_media.dart';
 import 'package:dart_cast/src/core/cast_session.dart';
 import 'package:dart_cast/src/core/media_proxy.dart';
 import 'package:dart_cast/src/protocols/chromecast/cast_media_channel.dart';
@@ -11,7 +12,9 @@ import 'package:dart_cast/src/protocols/chromecast/cast_receiver_channel.dart';
 import 'package:dart_cast/src/protocols/chromecast/chromecast_session.dart';
 import 'package:test/test.dart';
 
-import 'chromecast_session_test.dart' show MockCastV2Channel;
+import 'chromecast_session_test.dart' show MockCastV2Channel, MockSentMessage;
+
+typedef MockSentMessageLike = MockSentMessage;
 
 const _receiver = CastReceiverChannel.receiverNamespace;
 const _connection = CastReceiverChannel.connectionNamespace;
@@ -232,6 +235,40 @@ void main() {
       inject(_heartbeat, {'type': 'PONG'});
     }
     expect(session.state, SessionState.connected);
+  });
+
+  test('a PLAYING broadcast from another media session does not count as '
+      'our LOAD succeeding', () async {
+    await connect();
+    final load = session.loadMedia(
+      CastMedia(url: 'http://example.com/v.m3u8', type: CastMediaType.hls),
+    );
+    // Each attempt of the LOAD retry loop: a foreign session's broadcast
+    // arrives first, then the receiver rejects our LOAD.
+    for (var attempt = 0; attempt < 2; attempt++) {
+      MockSentMessageLike? sent;
+      for (var i = 0; i < 100 && sent == null; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        final loads =
+            channel.sentMessages
+                .where((m) => m.payload['type'] == 'LOAD')
+                .toList();
+        if (loads.length > attempt) sent = loads[attempt];
+      }
+      expect(sent, isNotNull, reason: 'LOAD attempt $attempt not sent');
+      inject(CastMediaChannel.mediaNamespace, {
+        'type': 'MEDIA_STATUS',
+        'requestId': 0,
+        'status': [
+          {'mediaSessionId': 99, 'playerState': 'PLAYING', 'currentTime': 5},
+        ],
+      }, from: 'web-4');
+      inject(CastMediaChannel.mediaNamespace, {
+        'type': 'LOAD_FAILED',
+        'requestId': sent!.payload['requestId'],
+      }, from: 'web-4');
+    }
+    await expectLater(load, throwsA(isA<MediaLoadFailedException>()));
   });
 
   group('volume', () {

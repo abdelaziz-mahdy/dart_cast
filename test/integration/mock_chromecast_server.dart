@@ -123,6 +123,7 @@ class MockChromecastServer {
   void _autoRespond(MockSentMessage msg) {
     final type = msg.payload['type'] as String?;
 
+    final requestId = (msg.payload['requestId'] as num?)?.toInt() ?? 0;
     switch (type) {
       case 'LAUNCH':
         // Respond with RECEIVER_STATUS containing the transportId
@@ -139,7 +140,7 @@ class MockChromecastServer {
           injectMessage(
             namespace: 'urn:x-cast:com.google.cast.media',
             sourceId: transportId,
-            payload: _buildMediaStatus(),
+            payload: _buildMediaStatus(requestId: requestId),
           );
         });
       case 'PLAY':
@@ -148,7 +149,7 @@ class MockChromecastServer {
           injectMessage(
             namespace: 'urn:x-cast:com.google.cast.media',
             sourceId: transportId,
-            payload: _buildMediaStatus(),
+            payload: _buildMediaStatus(requestId: requestId),
           );
         });
       case 'PAUSE':
@@ -157,7 +158,7 @@ class MockChromecastServer {
           injectMessage(
             namespace: 'urn:x-cast:com.google.cast.media',
             sourceId: transportId,
-            payload: _buildMediaStatus(),
+            payload: _buildMediaStatus(requestId: requestId),
           );
         });
       case 'STOP':
@@ -168,7 +169,10 @@ class MockChromecastServer {
             injectMessage(
               namespace: 'urn:x-cast:com.google.cast.media',
               sourceId: transportId,
-              payload: _buildMediaStatus(idleReason: 'CANCELLED'),
+              payload: _buildMediaStatus(
+                idleReason: 'CANCELLED',
+                requestId: requestId,
+              ),
             );
           });
         }
@@ -181,7 +185,7 @@ class MockChromecastServer {
           injectMessage(
             namespace: 'urn:x-cast:com.google.cast.media',
             sourceId: transportId,
-            payload: _buildMediaStatus(),
+            payload: _buildMediaStatus(requestId: requestId),
           );
         });
       case 'SET_VOLUME':
@@ -223,7 +227,12 @@ class MockChromecastServer {
     },
   };
 
-  Map<String, dynamic> _buildMediaStatus({String? idleReason}) {
+  /// A spec receiver answers a media command with a MEDIA_STATUS carrying
+  /// that command's requestId; 0 is reserved for unsolicited broadcasts.
+  Map<String, dynamic> _buildMediaStatus({
+    String? idleReason,
+    int requestId = 0,
+  }) {
     final statusEntry = <String, dynamic>{
       'mediaSessionId': mediaSessionId,
       'playerState': playerState,
@@ -241,7 +250,7 @@ class MockChromecastServer {
 
     return {
       'type': 'MEDIA_STATUS',
-      'requestId': 0,
+      'requestId': requestId,
       'status': [statusEntry],
     };
   }

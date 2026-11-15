@@ -254,7 +254,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'web-4',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 1),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
 
         await loadFuture;
@@ -283,7 +286,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'web-4',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 1),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
 
         await loadFuture;
@@ -383,6 +389,7 @@ void main() {
           destinationId: 'sender-0',
           payload: _mediaStatusPayload(
             mediaSessionId: 2,
+            requestId: _lastLoadRequestId(mockChannel),
             playerState: 'BUFFERING',
           ),
         );
@@ -471,6 +478,7 @@ void main() {
             destinationId: 'sender-0',
             payload: _mediaStatusPayload(
               mediaSessionId: 1,
+              requestId: _lastLoadRequestId(mockChannel),
               playerState: 'BUFFERING',
             ),
           );
@@ -511,7 +519,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'web-4',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 1),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
         await loadFuture;
       });
@@ -539,7 +550,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'web-4',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 1),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
         await loadFuture;
       });
@@ -564,7 +578,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'web-4',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 1),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
         await loadFuture;
         mockChannel.clearMessages();
@@ -627,7 +644,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'web-4',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 42),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 42,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
         await loadFuture;
 
@@ -717,7 +737,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'web-4',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 1),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
         await loadFuture;
       });
@@ -933,7 +956,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'transport-abc',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 1),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
 
         await firstLoad;
@@ -965,7 +991,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'transport-abc',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 1),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 1,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
         await firstLoad;
 
@@ -976,7 +1005,10 @@ void main() {
           namespace: CastMediaChannel.mediaNamespace,
           sourceId: 'transport-abc',
           destinationId: 'sender-0',
-          payload: _mediaStatusPayload(mediaSessionId: 2),
+          payload: _mediaStatusPayload(
+            mediaSessionId: 2,
+            requestId: _lastLoadRequestId(mockChannel),
+          ),
         );
         await secondLoad;
 
@@ -1095,6 +1127,15 @@ Future<MockSentMessage> _awaitSentLoad(
     'LOAD message (skip=$skip) never reached the wire within $timeout',
   );
 }
+
+/// The requestId of the most recent LOAD the session sent. A spec receiver
+/// answers LOAD with a MEDIA_STATUS carrying that requestId; requestId 0
+/// marks an unsolicited broadcast that need not concern our LOAD.
+int _lastLoadRequestId(MockCastV2Channel channel) =>
+    channel.sentMessages
+            .lastWhere((m) => m.payload['type'] == 'LOAD')
+            .payload['requestId']
+        as int;
 
 Map<String, dynamic> _mediaStatusPayload({
   required int mediaSessionId,
