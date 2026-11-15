@@ -516,6 +516,10 @@ class DlnaSession extends CastSession {
     }
 
     await _guardedReload(() async {
+      // Stop first, as the piped reload does: given a new URI while it
+      // plays, the TCL renderer sometimes opens a second player that it
+      // then cannot pause, seek or stop.
+      await _sendAvTransport('Stop', DlnaSoapBuilder.buildStop());
       await _sendAvTransport('SetAVTransportURI', _buildSetUri(url));
       await _sendAvTransport('Play', DlnaSoapBuilder.buildPlay());
     });

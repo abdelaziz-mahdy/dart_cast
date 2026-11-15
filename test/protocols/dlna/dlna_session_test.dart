@@ -1092,6 +1092,17 @@ void main() {
       );
       final setUri = bodiesOf('SetAVTransportURI').single;
       expect(setUri, contains('duration=&quot;00:02:00&quot;'));
+      // Stop first: a TCL renderer given a new URI while playing sometimes
+      // opens a second player it then cannot control.
+      expect(
+        mockServer.capturedActions
+            .map((a) => a.action)
+            .where(
+              (a) => a == 'Stop' || a == 'SetAVTransportURI' || a == 'Play',
+            )
+            .take(3),
+        ['Stop', 'SetAVTransportURI', 'Play'],
+      );
 
       // The renderer restarts the item at 0; we put it back at 40 s once it
       // reports PLAYING again.
