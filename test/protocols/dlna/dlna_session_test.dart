@@ -212,6 +212,9 @@ class _CapturedSoapAction {
 }
 
 void main() {
+  // The reload settle delay exists for a real renderer's UI; not here.
+  setUpAll(() => DlnaSession.reloadSettle = Duration.zero);
+
   late MockDlnaServer mockServer;
   late CastDevice device;
   late DlnaDeviceDescription description;
@@ -1102,6 +1105,15 @@ void main() {
             )
             .take(3),
         ['Stop', 'SetAVTransportURI', 'Play'],
+      );
+      // ...and the new URI goes out only once the renderer says STOPPED.
+      final actions = mockServer.capturedActions.map((a) => a.action).toList();
+      expect(
+        actions.sublist(
+          actions.indexOf('Stop'),
+          actions.indexOf('SetAVTransportURI'),
+        ),
+        contains('GetTransportInfo'),
       );
 
       // The renderer restarts the item at 0; we put it back at 40 s once it

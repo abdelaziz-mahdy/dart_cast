@@ -406,13 +406,47 @@ class DlnaSession extends CastSession {
     CastLogger.info('DLNA: restarting piped stream at ${position.inSeconds}s');
 
     await _guardedReload(() async {
-      await _sendAvTransport('Stop', DlnaSoapBuilder.buildStop());
+      await _stopForReload();
       await _sendAvTransport('SetAVTransportURI', _buildSetUri(seekUrl));
       await _sendAvTransport('Play', DlnaSoapBuilder.buildPlay());
       // Inside the guard, so no poll pairs the new stream's position with
       // the old offset.
       _pipedStartOffset = position;
     });
+  }
+
+  /// How long to let the renderer settle after it reports STOPPED, before a
+  /// reload sends the new URI. Tests set it to zero.
+  static Duration reloadSettle = const Duration(milliseconds: 1200);
+
+  /// Stops the current item and waits until the renderer has finished
+  /// stopping, so the SetAVTransportURI that follows starts clean.
+  ///
+  /// The TCL renderer closes its player screen on Stop; a new URI arriving
+  /// while that screen is still closing gets a player the renderer cannot
+  /// control (no position, and pause, seek and stop are ignored). Its
+  /// AVTransport says STOPPED before the screen is gone, hence the settle
+  /// delay on top.
+  Future<void> _stopForReload() async {
+    await _sendAvTransport('Stop', DlnaSoapBuilder.buildStop());
+    final deadline = DateTime.now().add(const Duration(seconds: 3));
+    while (DateTime.now().isBefore(deadline)) {
+      try {
+        final state = DlnaSoapParser.parseTransportInfo(
+          await _sendAvTransport(
+            'GetTransportInfo',
+            DlnaSoapBuilder.buildGetTransportInfo(),
+          ),
+        );
+        if (state == 'STOPPED' || state == 'NO_MEDIA_PRESENT') break;
+      } catch (_) {
+        break;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+    if (reloadSettle > Duration.zero) {
+      await Future<void>.delayed(reloadSettle);
+    }
   }
 
   /// Runs [body] — a re-send of SetAVTransportURI for the current item —
@@ -516,10 +550,9 @@ class DlnaSession extends CastSession {
     }
 
     await _guardedReload(() async {
-      // Stop first, as the piped reload does: given a new URI while it
-      // plays, the TCL renderer sometimes opens a second player that it
-      // then cannot pause, seek or stop.
-      await _sendAvTransport('Stop', DlnaSoapBuilder.buildStop());
+      // Given a new URI while it plays, the TCL renderer sometimes opens a
+      // second player that it then cannot pause, seek or stop.
+      await _stopForReload();
       await _sendAvTransport('SetAVTransportURI', _buildSetUri(url));
       await _sendAvTransport('Play', DlnaSoapBuilder.buildPlay());
     });
