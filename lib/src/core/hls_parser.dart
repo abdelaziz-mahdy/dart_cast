@@ -210,6 +210,9 @@ class HlsParser {
     // kind of the next URI is remembered across other tags and comments.
     var nextUriIsSegment = false;
     var segmentIndex = 0;
+    // fMP4/CMAF playlists declare an initialization section first; their
+    // obfuscated segment URLs get an fMP4 hint instead of `.ts`.
+    var isFragmentedMp4 = false;
 
     for (final line in lines) {
       final trimmed = line.trim();
@@ -221,6 +224,8 @@ class HlsParser {
       if (trimmed.startsWith('#')) {
         if (trimmed.startsWith('#EXTINF:')) {
           nextUriIsSegment = true;
+        } else if (trimmed.startsWith('#EXT-X-MAP:')) {
+          isFragmentedMp4 = true;
         } else if (trimmed.startsWith('#EXT-X-STREAM-INF:')) {
           nextUriIsSegment = false;
         }
@@ -236,7 +241,13 @@ class HlsParser {
       if (nextUriIsSegment) {
         segmentIndex++;
         result.add(
-          _buildSegmentProxyUrl(proxyBaseUrl, token, resolved, segmentIndex),
+          _buildSegmentProxyUrl(
+            proxyBaseUrl,
+            token,
+            resolved,
+            segmentIndex,
+            _segmentExtension(resolved, isFragmentedMp4: isFragmentedMp4),
+          ),
         );
       } else {
         result.add(_buildProxyUrl(proxyBaseUrl, token, resolved));
@@ -491,16 +502,40 @@ class HlsParser {
     return '$proxyBaseUrl/stream/$token?url=${Uri.encodeComponent(originalUrl)}';
   }
 
-  /// Constructs a segment proxy URL whose *path* ends in `.ts`, satisfying
-  /// the Chromecast / Shaka URL-extension capability probe even when the
-  /// upstream URL ends in `.jpg`, `.bin`, or another non-media extension.
+  /// Segment extensions whose media type a player can infer correctly, so
+  /// they are kept in the proxy path as-is.
+  static const _mediaSegmentExtensions = {
+    'ts', 'm4s', 'mp4', 'm4v', 'm4a', 'aac', 'ac3', 'ec3', 'mp3', //
+    'vtt', 'webvtt', 'cmfv', 'cmfa', 'cmft',
+  };
+
+  /// The extension for a segment's proxy path: its own when it names a
+  /// media type, otherwise `.m4s` for fMP4 playlists and `.ts` for the rest
+  /// (the obfuscated `.jpg`/`.bin`/no-extension case the hint exists for).
+  static String _segmentExtension(String url, {required bool isFragmentedMp4}) {
+    final path = Uri.tryParse(url)?.path ?? url;
+    final slash = path.lastIndexOf('/');
+    final name = path.substring(slash + 1);
+    final dot = name.lastIndexOf('.');
+    if (dot > 0) {
+      final ext = name.substring(dot + 1).toLowerCase();
+      if (_mediaSegmentExtensions.contains(ext)) return ext;
+    }
+    return isFragmentedMp4 ? 'm4s' : 'ts';
+  }
+
+  /// Constructs a segment proxy URL whose *path* ends in a media extension,
+  /// satisfying the Chromecast / Shaka URL-extension capability probe even
+  /// when the upstream URL ends in `.jpg`, `.bin`, or another non-media
+  /// extension, without mislabelling fMP4, audio or WebVTT segments as TS.
   static String _buildSegmentProxyUrl(
     String proxyBaseUrl,
     String token,
     String originalUrl,
     int segmentIndex,
+    String extension,
   ) {
-    return '$proxyBaseUrl/stream/$token/seg$segmentIndex.ts'
+    return '$proxyBaseUrl/stream/$token/seg$segmentIndex.$extension'
         '?url=${Uri.encodeComponent(originalUrl)}';
   }
 }
