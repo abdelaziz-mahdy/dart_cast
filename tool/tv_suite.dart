@@ -292,7 +292,15 @@ List<_Case> _cases() => [
       );
       x.note('second sender sent STOP for app session $appSession');
       final samples = await x.watch(s, 15);
-      await other.close();
+      // Close politely; the TV may never close its end of a sender
+      // connection, so do not wait on it.
+      other.sendMessage(
+        namespace: 'urn:x-cast:com.google.cast.tp.connection',
+        sourceId: 'sender-tv-suite-other',
+        destinationId: 'receiver-0',
+        payload: CastReceiverChannel.buildClose(),
+      );
+      await other.close().timeout(const Duration(seconds: 3), onTimeout: () {});
       await x.screenshot('after_stop');
       final ended = samples.any((p) => p.state == SessionState.disconnected);
       x.note('states after STOP: ${samples.map((p) => p.state.name).toSet()}');
