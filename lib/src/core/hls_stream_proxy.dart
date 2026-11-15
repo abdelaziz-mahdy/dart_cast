@@ -91,6 +91,16 @@ class HlsStreamHandler {
   }) async {
     try {
       if (requestHeaders != null) {
+        final refusal = DlnaContentFeatures.notAcceptableReason(
+          requestHeaders,
+          timeSeek: true,
+        );
+        if (refusal != null) {
+          CastLogger.debug('HlsStreamHandler: 406 — $refusal');
+          response.statusCode = HttpStatus.notAcceptable;
+          await response.close();
+          return;
+        }
         DlnaContentFeatures.responseHeaders(
           requestHeaders,
           contentFeatures ?? DlnaContentFeatures.pipedTransportStream,

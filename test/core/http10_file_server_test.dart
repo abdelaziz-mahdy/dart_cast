@@ -213,9 +213,9 @@ void main() {
     test('echoes the requested transfer mode, not a fixed one', () async {
       final r = await harness.request(
         method: 'HEAD',
-        headers: {'transferMode.dlna.org': 'Interactive'},
+        headers: {'transferMode.dlna.org': 'background'},
       );
-      expect(r.headers['transfermode.dlna.org'], 'Interactive');
+      expect(r.headers['transfermode.dlna.org'], 'Background');
     });
 
     test('adds neither header when the client did not ask', () async {
@@ -230,6 +230,26 @@ void main() {
       );
       expect(r.headers.containsKey('transfermode.dlna.org'), isFalse);
       expect(r.headers.containsKey('x-injected'), isFalse);
+    });
+
+    test('refuses with 406 what it cannot serve (DLNA 7.4.1.3.11, '
+        '7.4.1.3.18)', () async {
+      final interactive = await harness.request(
+        headers: {'transferMode.dlna.org': 'Interactive'},
+      );
+      expect(interactive.status, 406);
+      final timeSeek = await harness.request(
+        headers: {'TimeSeekRange.dlna.org': 'npt=10.0-'},
+      );
+      expect(timeSeek.status, 406);
+      final streaming = await harness.request(
+        headers: {'transferMode.dlna.org': 'Streaming'},
+      );
+      expect(streaming.status, 200);
+      final background = await harness.request(
+        headers: {'transferMode.dlna.org': 'Background'},
+      );
+      expect(background.status, 200);
     });
   });
 

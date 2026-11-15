@@ -949,6 +949,25 @@ void main() {
     });
 
     test(
+      'an Interactive transfer of the piped stream is refused with 406',
+      () async {
+        playlist(
+          '/vod.m3u8',
+          '#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg.ts\n'
+              '#EXT-X-ENDLIST\n',
+        );
+        routes['/seg.ts'] = (request) async => request.response.add([0x47]);
+        final r = await get(
+          '/vod.m3u8',
+          headers: {'transferMode.dlna.org': 'Interactive'},
+        );
+        await r.drain<void>();
+        expect(r.statusCode, HttpStatus.notAcceptable);
+        expect(requested, isEmpty);
+      },
+    );
+
+    test(
       'alt-audio sources honour startAt and advertise the seek window',
       () async {
         String media(String prefix) {

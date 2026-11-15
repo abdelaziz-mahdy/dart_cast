@@ -80,6 +80,22 @@ class Http10FileServer {
       contentFeatures ?? DlnaContentFeatures.forByteSeekableMime(mime),
     );
 
+    final refusal = DlnaContentFeatures.notAcceptableReason(
+      request.headers,
+      timeSeek: false,
+    );
+    if (refusal != null) {
+      CastLogger.debug('Http10FileServer: 406 — $refusal');
+      final errorHeaders =
+          StringBuffer()
+            ..write('HTTP/1.0 406 Not Acceptable\r\n')
+            ..write('Date: ${HttpDate.format(DateTime.now())}\r\n')
+            ..write('Content-Length: 0\r\n')
+            ..write('\r\n');
+      socket.add(utf8.encode(errorHeaders.toString()));
+      return;
+    }
+
     if (range is _Unsatisfiable) {
       final errorHeaders = StringBuffer();
       errorHeaders.write('HTTP/1.0 416 Range Not Satisfiable\r\n');
@@ -251,6 +267,26 @@ class DlnaContentFeatures {
   }
 
   static const _transferModes = ['Streaming', 'Interactive', 'Background'];
+
+  /// Why a request must be answered `406 Not Acceptable` (DLNA guidelines
+  /// 7.4.1.3.11 and 7.4.1.3.18), or null when it can be served.
+  ///
+  /// Refused: a `transferMode.dlna.org` other than Streaming or Background
+  /// (the only modes [flags] declares), and a `TimeSeekRange.dlna.org` on a
+  /// resource that does not support time seek ([timeSeek] false).
+  static String? notAcceptableReason(
+    HttpHeaders request, {
+    required bool timeSeek,
+  }) {
+    final mode = request.value('transferMode.dlna.org')?.trim().toLowerCase();
+    if (mode != null && mode != 'streaming' && mode != 'background') {
+      return 'transferMode.dlna.org "$mode" is not offered';
+    }
+    if (!timeSeek && request.value('TimeSeekRange.dlna.org') != null) {
+      return 'TimeSeekRange.dlna.org on a byte-seek-only resource';
+    }
+    return null;
+  }
 
   /// The DLNA headers to add to a response, given the [request] headers.
   ///
