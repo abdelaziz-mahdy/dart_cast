@@ -10,6 +10,8 @@ experimental commits move to the fixes branch.
 - PASS and FAIL come from what the **device** reports: playback state,
   position still advancing several seconds later, device volume. A value
   the tool computed never counts (see `CLAUDE.md`).
+- Test volume never goes above 0.10 of the TV's range (the suite uses
+  0.08 and restores the original level).
 - Anything only a picture can show is **LOOK**. Subtitles and the AirPlay
   PIN are LOOK cases, and the screenshots are the evidence.
 - `adb screencap` cannot capture the video plane on Google TV, so a black
@@ -68,8 +70,8 @@ at 1 Hz), `logcat.txt` and the screenshots.
 | `cc_hls_byterange` | Single-file byte-range HLS | CO-2, CO-6 | Device position and state |
 | `cc_hls_alt_audio` | Separate audio rendition (4 s vs 6 s segments) | CO-1, CO-7 (exp.), CO-8 (exp.) | Device position; audio is LOOK/listen |
 | `cc_subtitles_srt` | Sidecar SRT with "42", "1984", `&`, `<`, loose timestamps | CO-9 | Playback, plus LOOK at cue screenshots |
-| `cc_volume` | Set 0.3, set −0.2 (expect 0), restore | CC-10 | Device-reported volume |
-| `cc_app_closed_on_tv` | Press BACK on the TV during playback | CC-2 | Session reaches `disconnected` |
+| `cc_volume` | Set 0.08, set −0.2 (expect 0), restore | CC-10 | Device-reported volume |
+| `cc_app_closed_on_tv` | A second sender stops our app during playback (BACK on Google TV only backgrounds the receiver, which never reports closing) | CC-2 | Session reaches `disconnected` |
 | `dl_mp4` | Local MP4: play, pause, resume, seek; records TV headers | DL-1, DL-6, DL-9, DL-14 | Device position and state |
 | `dl_srt_sidecar` | Sidecar SRT | DL-3, CO-9 | Playback, plus LOOK; logs which subtitle URL the TV fetched |
 | `dl_vtt_sidecar` | Sidecar WebVTT | DL-3 | As above |
@@ -79,7 +81,7 @@ at 1 Hz), `logcat.txt` and the screenshots.
 | `dl_hls_piped_seek` | HLS piped as TS, behind a 302, seek | DL-5, DL-15, CO-1, CO-3 | Device position and state |
 | `dl_hls_byterange` | Byte-range HLS piped as TS | CO-2 | Device position and state |
 | `dl_hls_alt_audio` | Alt-audio HLS muxed and piped, seek | DL-5, CO-7/CO-8 (exp.) | Device position and state |
-| `dl_volume` | Set 0.2, read back, restore | DL-8 | Device-reported volume |
+| `dl_volume` | Set 0.08, read back, restore | DL-8 | Device-reported volume |
 | `ap_transient_connect` | Connect with no stored credentials | AP-4, AP-7, AP-9 | Connect succeeds |
 | `ap_pin_start` | Show the PIN | AP-6 setup | LOOK (screenshot of the PIN) |
 | `ap_pair` | PIN pair-setup | AP-4, AP-6 (exp.) | Credentials returned |

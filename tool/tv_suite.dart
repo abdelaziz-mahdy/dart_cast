@@ -37,6 +37,8 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:dart_cast/dart_cast.dart';
+import 'package:dart_cast/src/protocols/chromecast/cast_receiver_channel.dart';
+import 'package:dart_cast/src/protocols/chromecast/castv2_channel.dart';
 
 Future<void> main(List<String> args) async {
   final opts = _Options(args);
@@ -120,6 +122,10 @@ Future<void> main(List<String> args) async {
 // ---------------------------------------------------------------------------
 // Cases
 // ---------------------------------------------------------------------------
+
+/// Volume the suite sets on the TV. Never above 0.10 of the device range:
+/// the TV is in a living room.
+const _testVolume = 0.08;
 
 List<_Case> _cases() => [
   // -- Chromecast ----------------------------------------------------------
@@ -226,27 +232,27 @@ List<_Case> _cases() => [
   ),
   _Case(
     'cc_volume',
-    'Device volume: set 0.3, set -0.2 (clamped to 0), restore',
+    'Device volume: set 0.08, set -0.2 (clamped to 0), restore',
     ['CC-10 SET_VOLUME clamp'],
     (x) async {
       final s = await x.chromecast();
       await s.loadMedia(x.file('local.mp4', CastMediaType.mp4));
       await x.watch(s, 3);
       final original = x.probe.volume;
-      await s.setVolume(0.3);
+      await s.setVolume(_testVolume);
       await x.watch(s, 3);
-      final atThird = x.probe.volume;
+      final atTest = x.probe.volume;
       await s.setVolume(-0.2);
       await x.watch(s, 3);
       final atZero = x.probe.volume;
       if (original != null) await s.setVolume(original);
       x.note(
-        'device volume: start=$original  after 0.3=$atThird  '
+        'device volume: start=$original  after $_testVolume=$atTest  '
         'after -0.2=$atZero',
       );
       final ok =
-          atThird != null &&
-          (atThird - 0.3).abs() < 0.05 &&
+          atTest != null &&
+          (atTest - _testVolume).abs() < 0.03 &&
           atZero != null &&
           atZero < 0.05;
       return ok ? _Verdict.pass : _Verdict.fail;
@@ -254,20 +260,42 @@ List<_Case> _cases() => [
   ),
   _Case(
     'cc_app_closed_on_tv',
-    'Leave the cast app with the TV remote: session must end',
+    'Another sender stops our cast app: session must end',
     ['CC-2 receiver CLOSE / app gone'],
     (x) async {
-      if (x.env.adb == null) return x.skip('needs adb to press BACK');
       final s = await x.chromecast();
       await s.loadMedia(x.file('local.mp4', CastMediaType.mp4));
       await x.watch(s, 8);
-      await x.env.adb!.key('KEYCODE_BACK');
-      await Future<void>.delayed(const Duration(seconds: 2));
-      await x.env.adb!.key('KEYCODE_BACK');
-      final samples = await x.watch(s, 20);
-      await x.screenshot('after_back');
+      final appSession = s.sessionId;
+      if (appSession == null) {
+        x.note('no receiver sessionId to stop');
+        return _Verdict.fail;
+      }
+      // A second sender connection stopping the app is what happens when
+      // someone else casts or presses "stop casting" on their phone. (The
+      // TV remote's BACK only backgrounds the receiver on Google TV: it
+      // keeps reporting BUFFERING and never says the app closed.)
+      final other = CastV2Channel();
+      await other.connect(x.env.tv);
+      const receiverNs = 'urn:x-cast:com.google.cast.receiver';
+      other.sendMessage(
+        namespace: 'urn:x-cast:com.google.cast.tp.connection',
+        sourceId: 'sender-tv-suite-other',
+        destinationId: 'receiver-0',
+        payload: CastReceiverChannel.buildConnect(),
+      );
+      other.sendMessage(
+        namespace: receiverNs,
+        sourceId: 'sender-tv-suite-other',
+        destinationId: 'receiver-0',
+        payload: CastReceiverChannel.buildStop(appSession),
+      );
+      x.note('second sender sent STOP for app session $appSession');
+      final samples = await x.watch(s, 15);
+      await other.close();
+      await x.screenshot('after_stop');
       final ended = samples.any((p) => p.state == SessionState.disconnected);
-      x.note('states after BACK: ${samples.map((p) => p.state.name).toSet()}');
+      x.note('states after STOP: ${samples.map((p) => p.state.name).toSet()}');
       return ended ? _Verdict.pass : _Verdict.fail;
     },
   ),
@@ -394,19 +422,19 @@ List<_Case> _cases() => [
   ),
   _Case(
     'dl_volume',
-    'Renderer volume: set 0.2, read back, restore',
+    'Renderer volume: set 0.08, read back, restore',
     ['DL-8 volume range from SCPD'],
     (x) async {
       final s = await x.dlna();
       await s.loadMedia(x.file('local.mp4', CastMediaType.mp4));
       await x.watch(s, 4);
       final original = x.probe.volume;
-      await s.setVolume(0.2);
+      await s.setVolume(_testVolume);
       await x.watch(s, 4);
       final after = x.probe.volume;
       if (original != null) await s.setVolume(original);
-      x.note('device volume: start=$original after 0.2=$after');
-      final ok = after != null && (after - 0.2).abs() < 0.06;
+      x.note('device volume: start=$original after $_testVolume=$after');
+      final ok = after != null && (after - _testVolume).abs() < 0.03;
       return ok ? _Verdict.pass : _Verdict.fail;
     },
   ),
