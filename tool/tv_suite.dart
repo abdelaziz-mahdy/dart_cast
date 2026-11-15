@@ -691,6 +691,8 @@ class _Ctx {
 
     await s.pause();
     final paused = await watch(s, 4);
+    // The player's transport UI (title, scrub bar) is drawn while paused.
+    await screenshot('paused');
     final pausedOk =
         paused.last.state == SessionState.paused &&
         !_advanced(paused.sublist(1), 3, minRatio: 0.5);
