@@ -670,8 +670,19 @@ class _Ctx {
     return out;
   }
 
+  /// Waits (up to [timeout] seconds) until the device reports a position
+  /// above zero: a DLNA renderer says PLAYING at 0 s while it still buffers.
+  Future<void> waitForProgress(CastSession s, {int timeout = 15}) async {
+    for (var i = 0; i < timeout; i++) {
+      final p = probe.position;
+      if (p != null && p > Duration.zero) return;
+      await watch(s, 1);
+    }
+  }
+
   /// Play / pause / resume / seek, all judged on device-reported values.
   Future<_Verdict> playbackChecks(CastSession s, {required int seekTo}) async {
+    await waitForProgress(s);
     final play = await watch(s, 12);
     await screenshot('playing');
     final played = _advanced(play, 12);
@@ -826,11 +837,17 @@ class _Ctx {
   ].join('\n');
 }
 
+/// Whether the device-reported position moved by at least [minRatio] of
+/// [seconds] across [samples]. Samples taken before the device reported any
+/// position (a DLNA renderer's first poll) are skipped rather than failing
+/// the check; the span is then measured over the samples that remain.
 bool _advanced(List<_Sample> samples, int seconds, {double minRatio = 0.6}) {
-  final first = samples.first.position;
-  final last = samples.last.position;
-  if (first == null || last == null) return false;
-  return (last - first).inMilliseconds >= seconds * 1000 * minRatio * 0.9;
+  final known = samples.where((s) => s.position != null).toList();
+  if (known.length < 2) return false;
+  final first = known.first.position!;
+  final last = known.last.position!;
+  final span = known.length == samples.length ? seconds : known.length - 1;
+  return (last - first).inMilliseconds >= span * 1000 * minRatio * 0.9;
 }
 
 String _span(List<_Sample> s) =>
