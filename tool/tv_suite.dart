@@ -37,6 +37,8 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:dart_cast/dart_cast.dart';
+import 'package:dart_cast/src/protocols/chromecast/cast_receiver_channel.dart';
+import 'package:dart_cast/src/protocols/chromecast/castv2_channel.dart';
 
 Future<void> main(List<String> args) async {
   final opts = _Options(args);
@@ -120,6 +122,10 @@ Future<void> main(List<String> args) async {
 // ---------------------------------------------------------------------------
 // Cases
 // ---------------------------------------------------------------------------
+
+/// Volume the suite sets on the TV. Never above 0.10 of the device range:
+/// the TV is in a living room.
+const _testVolume = 0.08;
 
 List<_Case> _cases() => [
   // -- Chromecast ----------------------------------------------------------
@@ -226,27 +232,27 @@ List<_Case> _cases() => [
   ),
   _Case(
     'cc_volume',
-    'Device volume: set 0.3, set -0.2 (clamped to 0), restore',
+    'Device volume: set 0.08, set -0.2 (clamped to 0), restore',
     ['CC-10 SET_VOLUME clamp'],
     (x) async {
       final s = await x.chromecast();
       await s.loadMedia(x.file('local.mp4', CastMediaType.mp4));
       await x.watch(s, 3);
       final original = x.probe.volume;
-      await s.setVolume(0.3);
+      await s.setVolume(_testVolume);
       await x.watch(s, 3);
-      final atThird = x.probe.volume;
+      final atTest = x.probe.volume;
       await s.setVolume(-0.2);
       await x.watch(s, 3);
       final atZero = x.probe.volume;
       if (original != null) await s.setVolume(original);
       x.note(
-        'device volume: start=$original  after 0.3=$atThird  '
+        'device volume: start=$original  after $_testVolume=$atTest  '
         'after -0.2=$atZero',
       );
       final ok =
-          atThird != null &&
-          (atThird - 0.3).abs() < 0.05 &&
+          atTest != null &&
+          (atTest - _testVolume).abs() < 0.03 &&
           atZero != null &&
           atZero < 0.05;
       return ok ? _Verdict.pass : _Verdict.fail;
@@ -254,20 +260,50 @@ List<_Case> _cases() => [
   ),
   _Case(
     'cc_app_closed_on_tv',
-    'Leave the cast app with the TV remote: session must end',
+    'Another sender stops our cast app: session must end',
     ['CC-2 receiver CLOSE / app gone'],
     (x) async {
-      if (x.env.adb == null) return x.skip('needs adb to press BACK');
       final s = await x.chromecast();
       await s.loadMedia(x.file('local.mp4', CastMediaType.mp4));
       await x.watch(s, 8);
-      await x.env.adb!.key('KEYCODE_BACK');
-      await Future<void>.delayed(const Duration(seconds: 2));
-      await x.env.adb!.key('KEYCODE_BACK');
-      final samples = await x.watch(s, 20);
-      await x.screenshot('after_back');
+      final appSession = s.sessionId;
+      if (appSession == null) {
+        x.note('no receiver sessionId to stop');
+        return _Verdict.fail;
+      }
+      // A second sender connection stopping the app is what happens when
+      // someone else casts or presses "stop casting" on their phone. (The
+      // TV remote's BACK only backgrounds the receiver on Google TV: it
+      // keeps reporting BUFFERING and never says the app closed.)
+      final other = CastV2Channel();
+      await other.connect(x.env.tv);
+      const receiverNs = 'urn:x-cast:com.google.cast.receiver';
+      other.sendMessage(
+        namespace: 'urn:x-cast:com.google.cast.tp.connection',
+        sourceId: 'sender-tv-suite-other',
+        destinationId: 'receiver-0',
+        payload: CastReceiverChannel.buildConnect(),
+      );
+      other.sendMessage(
+        namespace: receiverNs,
+        sourceId: 'sender-tv-suite-other',
+        destinationId: 'receiver-0',
+        payload: CastReceiverChannel.buildStop(appSession),
+      );
+      x.note('second sender sent STOP for app session $appSession');
+      final samples = await x.watch(s, 15);
+      // Close politely; the TV may never close its end of a sender
+      // connection, so do not wait on it.
+      other.sendMessage(
+        namespace: 'urn:x-cast:com.google.cast.tp.connection',
+        sourceId: 'sender-tv-suite-other',
+        destinationId: 'receiver-0',
+        payload: CastReceiverChannel.buildClose(),
+      );
+      await other.close().timeout(const Duration(seconds: 3), onTimeout: () {});
+      await x.screenshot('after_stop');
       final ended = samples.any((p) => p.state == SessionState.disconnected);
-      x.note('states after BACK: ${samples.map((p) => p.state.name).toSet()}');
+      x.note('states after STOP: ${samples.map((p) => p.state.name).toSet()}');
       return ended ? _Verdict.pass : _Verdict.fail;
     },
   ),
@@ -394,19 +430,19 @@ List<_Case> _cases() => [
   ),
   _Case(
     'dl_volume',
-    'Renderer volume: set 0.2, read back, restore',
+    'Renderer volume: set 0.08, read back, restore',
     ['DL-8 volume range from SCPD'],
     (x) async {
       final s = await x.dlna();
       await s.loadMedia(x.file('local.mp4', CastMediaType.mp4));
       await x.watch(s, 4);
       final original = x.probe.volume;
-      await s.setVolume(0.2);
+      await s.setVolume(_testVolume);
       await x.watch(s, 4);
       final after = x.probe.volume;
       if (original != null) await s.setVolume(original);
-      x.note('device volume: start=$original after 0.2=$after');
-      final ok = after != null && (after - 0.2).abs() < 0.06;
+      x.note('device volume: start=$original after $_testVolume=$after');
+      final ok = after != null && (after - _testVolume).abs() < 0.03;
       return ok ? _Verdict.pass : _Verdict.fail;
     },
   ),
@@ -634,8 +670,19 @@ class _Ctx {
     return out;
   }
 
+  /// Waits (up to [timeout] seconds) until the device reports a position
+  /// above zero: a DLNA renderer says PLAYING at 0 s while it still buffers.
+  Future<void> waitForProgress(CastSession s, {int timeout = 15}) async {
+    for (var i = 0; i < timeout; i++) {
+      final p = probe.position;
+      if (p != null && p > Duration.zero) return;
+      await watch(s, 1);
+    }
+  }
+
   /// Play / pause / resume / seek, all judged on device-reported values.
   Future<_Verdict> playbackChecks(CastSession s, {required int seekTo}) async {
+    await waitForProgress(s);
     final play = await watch(s, 12);
     await screenshot('playing');
     final played = _advanced(play, 12);
@@ -644,6 +691,8 @@ class _Ctx {
 
     await s.pause();
     final paused = await watch(s, 4);
+    // The player's transport UI (title, scrub bar) is drawn while paused.
+    await screenshot('paused');
     final pausedOk =
         paused.last.state == SessionState.paused &&
         !_advanced(paused.sublist(1), 3, minRatio: 0.5);
@@ -790,11 +839,17 @@ class _Ctx {
   ].join('\n');
 }
 
+/// Whether the device-reported position moved by at least [minRatio] of
+/// [seconds] across [samples]. Samples taken before the device reported any
+/// position (a DLNA renderer's first poll) are skipped rather than failing
+/// the check; the span is then measured over the samples that remain.
 bool _advanced(List<_Sample> samples, int seconds, {double minRatio = 0.6}) {
-  final first = samples.first.position;
-  final last = samples.last.position;
-  if (first == null || last == null) return false;
-  return (last - first).inMilliseconds >= seconds * 1000 * minRatio * 0.9;
+  final known = samples.where((s) => s.position != null).toList();
+  if (known.length < 2) return false;
+  final first = known.first.position!;
+  final last = known.last.position!;
+  final span = known.length == samples.length ? seconds : known.length - 1;
+  return (last - first).inMilliseconds >= span * 1000 * minRatio * 0.9;
 }
 
 String _span(List<_Sample> s) =>

@@ -348,4 +348,58 @@ void main() {
       expect(out.length, 188);
     });
   });
+
+  group('MediaProxy.withDisplayName', () {
+    late MediaProxy proxy;
+    late Directory dir;
+
+    setUp(() async {
+      proxy = MediaProxy();
+      await proxy.start();
+      dir = await Directory.systemTemp.createTemp('dart_cast_name');
+    });
+
+    tearDown(() async {
+      await proxy.stop();
+      await dir.delete(recursive: true);
+    });
+
+    test('a file URL ends in the title and is still served', () async {
+      final file = File('${dir.path}/clip.mp4')..writeAsBytesSync([1, 2, 3]);
+      final url = proxy.withDisplayName(
+        proxy.registerFile(file.path),
+        'Episode 1: The Pilot.mp4',
+      );
+      expect(Uri.parse(url).pathSegments.last, 'Episode_1_The_Pilot.mp4');
+      // Nothing the renderer would have to percent-decode.
+      expect(url, isNot(contains('%')));
+      final r = await _get(url);
+      expect(r.status, HttpStatus.ok);
+      expect(r.body, [1, 2, 3]);
+    });
+
+    test('a piped TS URL ends in the title with .ts', () {
+      final url = proxy.withDisplayName(
+        proxy.registerHlsAsStream('http://example.com/a.m3u8'),
+        "Ma série (L'été)",
+      );
+      expect(Uri.parse(url).pathSegments.last, "Ma_serie_(L'ete).ts");
+      expect(url, isNot(contains('%')));
+      expect(Uri.parse(url).pathSegments, hasLength(3));
+    });
+
+    test('a remote stream URL keeps its extension hint', () {
+      final url = proxy.withDisplayName(
+        proxy.registerMedia('http://example.com/v.mp4', pathExtension: 'mp4'),
+        'Trailer',
+      );
+      expect(Uri.parse(url).pathSegments.last, 'Trailer.mp4');
+    });
+
+    test('no title, or nothing usable in it, leaves the URL alone', () {
+      final url = proxy.registerHlsAsStream('http://example.com/a.m3u8');
+      expect(proxy.withDisplayName(url, null), url);
+      expect(proxy.withDisplayName(url, ' ::: '), url);
+    });
+  });
 }

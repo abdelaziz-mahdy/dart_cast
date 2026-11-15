@@ -66,6 +66,19 @@ class DlnaSession extends CastSession {
   /// flight when one happened discards what it read.
   int _reloadEpoch = 0;
 
+  /// Whether the last GetPositionInfo showed the item loaded: a position or
+  /// a duration above zero. Some renderers (TCL) answer PLAYING at 0 s with
+  /// duration 0 while their player is still opening the item, and drop a
+  /// Seek sent then.
+  bool _lastPollLoaded = true;
+
+  /// PLAYING polls seen while a deferred seek waits for [_lastPollLoaded].
+  int _playingPollsWhileSeekPending = 0;
+
+  /// After this many PLAYING polls the deferred seek is sent anyway: a piped
+  /// stream may never report a position or duration.
+  static const _maxPollsBeforeDeferredSeek = 6;
+
   /// The renderer's RenderingControl `Volume` range, read once from its SCPD.
   Future<({int min, int max})>? _volumeRange;
 
@@ -240,6 +253,8 @@ class DlnaSession extends CastSession {
     }
     final protocolInfo = 'http-get:*:$mimeType:$contentFeatures';
 
+    // Some renderers show the URL's file name instead of dc:title.
+    proxyUrl = _proxy.withDisplayName(proxyUrl, media.title);
     _currentProxyUrl = proxyUrl;
     _currentProtocolInfo = protocolInfo;
 
@@ -320,6 +335,7 @@ class DlnaSession extends CastSession {
     // Seeking immediately after Play fails because the TV hasn't loaded yet.
     if (media.startPosition != null && media.startPosition! > Duration.zero) {
       _pendingSeekPosition = media.startPosition;
+      _playingPollsWhileSeekPending = 0;
       CastLogger.info(
         'DLNA: deferred seek to ${media.startPosition!.inSeconds}s (waiting for TV to load)',
       );
@@ -507,6 +523,7 @@ class DlnaSession extends CastSession {
       // Seeking straight after Play fails while the renderer is still
       // loading, so seek once it reports PLAYING — as loadMedia does.
       _pendingSeekPosition = resumeAt;
+      _playingPollsWhileSeekPending = 0;
     }
   }
 
@@ -626,6 +643,8 @@ class DlnaSession extends CastSession {
       CastLogger.debug(
         'DLNA: poll position=${posInfo.position.inSeconds}s, duration=${posInfo.duration.inSeconds}s',
       );
+      _lastPollLoaded =
+          posInfo.position > Duration.zero || posInfo.duration > Duration.zero;
       updatePosition(posInfo.position + _pipedStartOffset);
       // Only trust the device's duration when we have nothing better.
       // A renderer fed a length-less piped TS reports a placeholder — this TV
@@ -700,10 +719,16 @@ class DlnaSession extends CastSession {
             stateMachine.canTransitionTo(SessionState.playing)) {
           stateMachine.transitionTo(SessionState.playing);
         }
-        // Execute deferred seek now that the TV has loaded and is playing.
+        // Execute deferred seek once the TV has loaded the item and plays.
         if (_pendingSeekPosition != null) {
+          _playingPollsWhileSeekPending++;
+          if (!_lastPollLoaded &&
+              _playingPollsWhileSeekPending < _maxPollsBeforeDeferredSeek) {
+            break;
+          }
           final pos = _pendingSeekPosition!;
           _pendingSeekPosition = null;
+          _playingPollsWhileSeekPending = 0;
           CastLogger.info('DLNA: executing deferred seek to ${pos.inSeconds}s');
           unawaited(_deferredSeek(pos));
         }

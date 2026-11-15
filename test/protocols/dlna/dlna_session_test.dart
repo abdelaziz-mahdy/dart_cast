@@ -1101,6 +1101,66 @@ void main() {
       expect(bodiesOf('Seek').single, contains('<Target>00:00:40</Target>'));
     });
 
+    test('the seek back after setSubtitle waits until the renderer has '
+        'loaded the item, not just until it says PLAYING', () async {
+      // TCL's renderer answers PLAYING with position and duration 0 while
+      // its player is still loading; a Seek sent then is accepted and lost.
+      await session.connect();
+      mockServer.transportState = 'PLAYING';
+      mockServer.relTime = '00:00:40';
+      mockServer.trackDuration = '00:02:00';
+      await session.loadMedia(
+        const CastMedia(
+          url: 'http://example.com/video.mp4',
+          type: CastMediaType.mp4,
+        ),
+      );
+      await session.positionStream
+          .firstWhere((p) => p == const Duration(seconds: 40))
+          .timeout(const Duration(seconds: 3));
+
+      mockServer.relTime = '00:00:00';
+      mockServer.trackDuration = '00:00:00';
+      mockServer.capturedActions.clear();
+      await session.setSubtitle(
+        const CastSubtitle(
+          url: 'http://example.com/subs.srt',
+          label: 'English',
+          language: 'en',
+          format: 'srt',
+        ),
+      );
+
+      // Two polls of PLAYING at 0 s / 0 s: still loading, no seek yet.
+      await Future<void>.delayed(const Duration(milliseconds: 2300));
+      expect(bodiesOf('Seek'), isEmpty);
+
+      // Loaded: the renderer now knows the duration.
+      mockServer.trackDuration = '00:02:00';
+      for (var i = 0; i < 30 && bodiesOf('Seek').isEmpty; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      expect(bodiesOf('Seek').single, contains('<Target>00:00:40</Target>'));
+    });
+
+    test('the media URL ends in the title, which some renderers show '
+        'instead of dc:title', () async {
+      await session.connect();
+      mockServer.transportState = 'PLAYING';
+      await session.loadMedia(
+        CastMedia(
+          url: mockServer.playlistUrl,
+          type: CastMediaType.hls,
+          title: 'Big Buck Bunny',
+        ),
+      );
+      final uri =
+          RegExp(
+            r'<CurrentURI>([^<]*)</CurrentURI>',
+          ).firstMatch(bodiesOf('SetAVTransportURI').single)!.group(1)!;
+      expect(uri, endsWith('/Big_Buck_Bunny.ts'));
+    });
+
     test('the DIDL protocolInfo 4th field is what the servers answer '
         'getcontentFeatures with', () async {
       await session.connect();

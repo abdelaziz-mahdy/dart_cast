@@ -565,6 +565,170 @@ class MediaProxy {
     return variants;
   }
 
+  /// Returns [proxyUrl] with a readable last path segment built from
+  /// [name], e.g. `/file/<token>.mp4/My_Movie.mp4`.
+  ///
+  /// Some DLNA renderers (TCL's) show the URL's last path segment as the
+  /// title instead of the DIDL-Lite `dc:title`, which made the random token
+  /// appear on screen. Routing ignores the extra segment. URLs that are not
+  /// `/file/`, `/stream/` or `/ts-stream/` routes, and an empty [name], are
+  /// returned unchanged.
+  String withDisplayName(String proxyUrl, String? name) {
+    final slug = _displaySlug(name);
+    if (slug == null) return proxyUrl;
+    final uri = Uri.parse(proxyUrl);
+    final segments = uri.pathSegments;
+    if (segments.length < 2) return proxyUrl;
+    final String token;
+    final String ext;
+    switch (segments.first) {
+      case 'file':
+        if (segments.length != 2) return proxyUrl;
+        token = segments[1];
+        ext = _extensionOf(token);
+      case 'ts-stream':
+        if (segments.length != 2) return proxyUrl;
+        token = segments[1];
+        ext = '.ts';
+      case 'stream':
+        if (segments.length > 3) return proxyUrl;
+        token = segments[1];
+        ext = segments.length == 3 ? _extensionOf(segments[2]) : '';
+      default:
+        return proxyUrl;
+    }
+    return uri
+        .replace(pathSegments: [segments.first, token, '$slug$ext'])
+        .toString();
+  }
+
+  static final _videoExtension = RegExp(
+    r'\.(mp4|m4v|mkv|ts|m2ts|mov|webm|avi|m3u8)$',
+    caseSensitive: false,
+  );
+  // Only characters that need no percent-encoding in a path: the TCL
+  // renderer shows the segment verbatim, so `%20` would appear on screen.
+  // Spaces become `_`; anything else outside this set is dropped.
+  static final _unsafeNameChars = RegExp(r"[^A-Za-z0-9\-_.()' ]+");
+
+  static String? _displaySlug(String? name) {
+    if (name == null) return null;
+    var slug = name.trim().replaceFirst(_videoExtension, '');
+    slug = String.fromCharCodes(
+      slug.runes.expand(
+        (r) => (_asciiFold[r] ?? String.fromCharCode(r)).codeUnits,
+      ),
+    );
+    slug = slug.replaceAll(_unsafeNameChars, ' ');
+    slug = slug.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (slug.length > 80) slug = slug.substring(0, 80).trim();
+    // A leading dot would hide the name; dots alone are no name.
+    slug = slug.replaceFirst(RegExp(r'^\.+'), '').replaceAll(' ', '_');
+    return slug.isEmpty ? null : slug;
+  }
+
+  /// Latin letters with diacritics folded to ASCII for [_displaySlug].
+  static const _asciiFold = <int, String>{
+    0x00E0: 'a',
+    0x00E1: 'a',
+    0x00E2: 'a',
+    0x00E3: 'a',
+    0x00E4: 'a',
+    0x00E5: 'a',
+    0x0101: 'a',
+    0x00C0: 'A',
+    0x00C1: 'A',
+    0x00C2: 'A',
+    0x00C3: 'A',
+    0x00C4: 'A',
+    0x00C5: 'A',
+    0x0100: 'A',
+    0x00E7: 'c',
+    0x0107: 'c',
+    0x010D: 'c',
+    0x00C7: 'C',
+    0x0106: 'C',
+    0x010C: 'C',
+    0x00E8: 'e',
+    0x00E9: 'e',
+    0x00EA: 'e',
+    0x00EB: 'e',
+    0x0113: 'e',
+    0x0117: 'e',
+    0x00C8: 'E',
+    0x00C9: 'E',
+    0x00CA: 'E',
+    0x00CB: 'E',
+    0x0112: 'E',
+    0x0116: 'E',
+    0x00EC: 'i',
+    0x00ED: 'i',
+    0x00EE: 'i',
+    0x00EF: 'i',
+    0x012B: 'i',
+    0x00CC: 'I',
+    0x00CD: 'I',
+    0x00CE: 'I',
+    0x00CF: 'I',
+    0x012A: 'I',
+    0x00F1: 'n',
+    0x0144: 'n',
+    0x00D1: 'N',
+    0x0143: 'N',
+    0x00F2: 'o',
+    0x00F3: 'o',
+    0x00F4: 'o',
+    0x00F5: 'o',
+    0x00F6: 'o',
+    0x00F8: 'o',
+    0x014D: 'o',
+    0x00D2: 'O',
+    0x00D3: 'O',
+    0x00D4: 'O',
+    0x00D5: 'O',
+    0x00D6: 'O',
+    0x00D8: 'O',
+    0x014C: 'O',
+    0x00F9: 'u',
+    0x00FA: 'u',
+    0x00FB: 'u',
+    0x00FC: 'u',
+    0x016B: 'u',
+    0x00D9: 'U',
+    0x00DA: 'U',
+    0x00DB: 'U',
+    0x00DC: 'U',
+    0x016A: 'U',
+    0x00FD: 'y',
+    0x00FF: 'y',
+    0x00DD: 'Y',
+    0x015B: 's',
+    0x0161: 's',
+    0x015A: 'S',
+    0x0160: 'S',
+    0x017A: 'z',
+    0x017C: 'z',
+    0x017E: 'z',
+    0x0179: 'Z',
+    0x017B: 'Z',
+    0x017D: 'Z',
+    0x0142: 'l',
+    0x0141: 'L',
+    0x011F: 'g',
+    0x011E: 'G',
+    0x00DF: 'ss',
+    0x00E6: 'ae',
+    0x00C6: 'AE',
+    0x0153: 'oe',
+    0x0152: 'OE',
+    0x2019: "'",
+  };
+
+  static String _extensionOf(String segment) {
+    final dot = segment.lastIndexOf('.');
+    return dot <= 0 ? '' : segment.substring(dot);
+  }
+
   /// Registers an HLS stream to be served as continuous MPEG-TS.
   ///
   /// When a client (e.g. a DLNA TV) GETs the returned URL, the proxy fetches
@@ -873,8 +1037,10 @@ class MediaProxy {
       }
 
       // Route: /ts-stream/<token> — HLS-to-MPEG-TS streaming
+      // A trailing `/<name>.ts` segment is a display name, see
+      // [withDisplayName]; routing uses the token alone.
       if (path.startsWith('/ts-stream/')) {
-        final token = path.substring('/ts-stream/'.length);
+        final token = _firstSegment(path.substring('/ts-stream/'.length));
         await _handleHlsStreamRequest(request, token);
         return;
       }
@@ -907,7 +1073,7 @@ class MediaProxy {
 
       // Route: /file/<token> — local file serving
       if (path.startsWith('/file/')) {
-        final token = path.substring('/file/'.length);
+        final token = _firstSegment(path.substring('/file/'.length));
         await _handleFileRequest(request, token);
         return;
       }
@@ -923,6 +1089,11 @@ class MediaProxy {
         // Response may already be closed
       }
     }
+  }
+
+  static String _firstSegment(String rest) {
+    final slash = rest.indexOf('/');
+    return slash < 0 ? rest : rest.substring(0, slash);
   }
 
   Future<void> _handleSyntheticRequest(
