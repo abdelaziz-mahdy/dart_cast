@@ -253,6 +253,8 @@ class DlnaSession extends CastSession {
     }
     final protocolInfo = 'http-get:*:$mimeType:$contentFeatures';
 
+    // Some renderers show the URL's file name instead of dc:title.
+    proxyUrl = _proxy.withDisplayName(proxyUrl, media.title);
     _currentProxyUrl = proxyUrl;
     _currentProtocolInfo = protocolInfo;
 

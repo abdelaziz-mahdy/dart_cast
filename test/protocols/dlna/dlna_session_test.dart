@@ -1143,6 +1143,24 @@ void main() {
       expect(bodiesOf('Seek').single, contains('<Target>00:00:40</Target>'));
     });
 
+    test('the media URL ends in the title, which some renderers show '
+        'instead of dc:title', () async {
+      await session.connect();
+      mockServer.transportState = 'PLAYING';
+      await session.loadMedia(
+        CastMedia(
+          url: mockServer.playlistUrl,
+          type: CastMediaType.hls,
+          title: 'Big Buck Bunny',
+        ),
+      );
+      final uri =
+          RegExp(
+            r'<CurrentURI>([^<]*)</CurrentURI>',
+          ).firstMatch(bodiesOf('SetAVTransportURI').single)!.group(1)!;
+      expect(uri, endsWith('/Big_Buck_Bunny.ts'));
+    });
+
     test('the DIDL protocolInfo 4th field is what the servers answer '
         'getcontentFeatures with', () async {
       await session.connect();
