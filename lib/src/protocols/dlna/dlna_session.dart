@@ -4,6 +4,7 @@ import 'dart:io';
 import '../../core/cast_device.dart';
 import '../../core/cast_media.dart';
 import '../../core/cast_session.dart';
+import '../../core/http10_file_server.dart' show DlnaContentFeatures;
 import '../../core/media_proxy.dart';
 import '../../core/media_transformer.dart';
 import '../../utils/logger.dart';
@@ -46,6 +47,27 @@ class DlnaSession extends CastSession {
   String? _currentProxyUrl;
   String? _currentProtocolInfo;
   Duration? _pendingSeekPosition;
+
+  /// DIDL-Lite `<res>` details of the current item, reused whenever
+  /// SetAVTransportURI is re-sent (piped seek, subtitle change) so the
+  /// renderer keeps the duration, size and subtitles it was first given.
+  List<({String url, String format})>? _currentSubtitleVariants;
+  String? _currentDurationStr;
+  int? _currentFileSize;
+
+  /// How many re-sends of SetAVTransportURI for the current item are in
+  /// progress (a counter, as seeks can overlap).
+  ///
+  /// The renderer legitimately reports STOPPED between the Stop / new URI and
+  /// the Play; a poll that sees that must not end the session.
+  int _activeReloads = 0;
+
+  /// Bumped when a reload starts and ends, so a poll that was already in
+  /// flight when one happened discards what it read.
+  int _reloadEpoch = 0;
+
+  /// The renderer's RenderingControl `Volume` range, read once from its SCPD.
+  Future<({int min, int max})>? _volumeRange;
 
   /// Creates a [DlnaSession] for the given [device] and [description].
   ///
@@ -105,6 +127,7 @@ class DlnaSession extends CastSession {
       avTransportControlUrl: avTransportUrl,
       renderingControlUrl: renderingControlUrl,
       connectionManagerControlUrl: connectionManagerControlUrl,
+      renderingControlScpdUrl: device.metadata['renderingControlScpdUrl'],
       locationUrl: 'http://${device.address.address}:${device.port}',
     );
 
@@ -161,21 +184,21 @@ class DlnaSession extends CastSession {
     // Use transformer for media preparation (register, wrap TS in HLS, etc.)
     final transformed = await _mediaTransformer.transform(media, _proxy);
     String proxyUrl = transformed.proxyUrl;
-    final String protocolInfo;
+    final String mimeType;
+    final String contentFeatures;
 
-    // DLNA flags must match between DIDL-Lite protocolInfo and HTTP headers.
-    // Use 01700000 (STREAMING + BACKGROUND + CONNECTION_STALL + V1.5) —
-    // same as VLC and MiniDLNA. Include DLNA.ORG_PN profile name so the
-    // renderer knows the codec without probing the stream.
-    const dlnaFlags = '01700000000000000000000000000000';
-
+    // DLNA flags must match between DIDL-Lite protocolInfo and HTTP headers,
+    // so the 4th field comes from DlnaContentFeatures, which the proxy's
+    // servers also use to answer `getcontentFeatures.dlna.org`. Flags are
+    // 01700000 (STREAMING + BACKGROUND + CONNECTION_STALL + V1.5) — same as
+    // VLC and MiniDLNA — with a DLNA.ORG_PN profile name so the renderer
+    // knows the codec without probing the stream.
+    //
     // Piped-TS routes are generated on the fly: there is no Content-Length and
     // byte ranges cannot be served. DLNA.ORG_OP is "<time-seek><byte-seek>",
     // so those routes must advertise 10 (time seek only) rather than 01.
     // Claiming byte-range seek on a stream that answers `Accept-Ranges: none`
     // is what made this TV stop playback the moment a seek was issued.
-    const opByteSeek = 'DLNA.ORG_OP=01';
-    const opTimeSeek = 'DLNA.ORG_OP=10';
     var isPipedStream = false;
     Duration? probedDuration;
 
@@ -196,25 +219,26 @@ class DlnaSession extends CastSession {
         media.url,
         headers: media.httpHeaders,
       );
-      protocolInfo =
-          'http-get:*:video/mp2t:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;$opTimeSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+      mimeType = 'video/mp2t';
+      contentFeatures = DlnaContentFeatures.pipedTransportStream;
     } else if (transformed.effectiveType == CastMediaType.hls) {
       // Transformer wrapped media in HLS → pipe as TS stream for DLNA
       isPipedStream = true;
       probedDuration = await _proxy.probeHlsDuration(proxyUrl);
       proxyUrl = _proxy.registerHlsAsStream(proxyUrl);
-      protocolInfo =
-          'http-get:*:video/mp2t:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;$opTimeSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+      mimeType = 'video/mp2t';
+      contentFeatures = DlnaContentFeatures.pipedTransportStream;
     } else if (transformed.effectiveType == CastMediaType.mpegTs) {
-      protocolInfo =
-          'http-get:*:video/mp2t:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;$opByteSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+      mimeType = 'video/mp2t';
+      contentFeatures = DlnaContentFeatures.forByteSeekableMime(mimeType)!;
     } else if (transformed.effectiveType == CastMediaType.mkv) {
-      protocolInfo =
-          'http-get:*:video/x-matroska:$opByteSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+      mimeType = 'video/x-matroska';
+      contentFeatures = DlnaContentFeatures.forByteSeekableMime(mimeType)!;
     } else {
-      protocolInfo =
-          'http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_HP_HD_AAC;$opByteSeek;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags';
+      mimeType = 'video/mp4';
+      contentFeatures = DlnaContentFeatures.forByteSeekableMime(mimeType)!;
     }
+    final protocolInfo = 'http-get:*:$mimeType:$contentFeatures';
 
     _currentProxyUrl = proxyUrl;
     _currentProtocolInfo = protocolInfo;
@@ -270,6 +294,12 @@ class DlnaSession extends CastSession {
         size: fileSize,
       ),
     );
+
+    _currentSubtitleVariants = subtitleVariants;
+    _currentDurationStr = durationStr;
+    // A piped route has no size; for a local HLS file this would be the
+    // playlist's, so it is never repeated on a reload.
+    _currentFileSize = isPipedStream ? null : fileSize;
 
     // Set known duration immediately if available (the TV may report 0
     // for piped streams since it doesn't know the total size upfront)
@@ -338,7 +368,6 @@ class DlnaSession extends CastSession {
       // encoded instead: the proxy restarts the stream at that segment, which
       // is a seek from the viewer's point of view.
       await _reloadPipedStreamAt(position);
-      _pipedStartOffset = position;
       updatePosition(position);
       return;
     }
@@ -352,8 +381,7 @@ class DlnaSession extends CastSession {
   /// Restarts a piped-TS route at [position] by re-issuing SetAVTransportURI.
   Future<void> _reloadPipedStreamAt(Duration position) async {
     final baseUrl = _currentProxyUrl;
-    final protocolInfo = _currentProtocolInfo;
-    if (baseUrl == null || protocolInfo == null) return;
+    if (baseUrl == null || _currentProtocolInfo == null) return;
 
     final seconds = position.inMilliseconds / 1000.0;
     final separator = baseUrl.contains('?') ? '&' : '?';
@@ -361,28 +389,49 @@ class DlnaSession extends CastSession {
 
     CastLogger.info('DLNA: restarting piped stream at ${position.inSeconds}s');
 
-    await _sendAvTransport('Stop', DlnaSoapBuilder.buildStop());
-    await _sendAvTransport(
-      'SetAVTransportURI',
-      DlnaSoapBuilder.buildSetAVTransportURI(
-        seekUrl,
-        title: _currentTitle,
-        protocolInfo: protocolInfo,
-        duration:
-            _knownDuration != null
-                ? NetworkUtils.formatDuration(_knownDuration!)
-                : null,
-      ),
+    await _guardedReload(() async {
+      await _sendAvTransport('Stop', DlnaSoapBuilder.buildStop());
+      await _sendAvTransport('SetAVTransportURI', _buildSetUri(seekUrl));
+      await _sendAvTransport('Play', DlnaSoapBuilder.buildPlay());
+      // Inside the guard, so no poll pairs the new stream's position with
+      // the old offset.
+      _pipedStartOffset = position;
+    });
+  }
+
+  /// Runs [body] — a re-send of SetAVTransportURI for the current item —
+  /// with polling told to ignore what it sees meanwhile.
+  Future<void> _guardedReload(Future<void> Function() body) async {
+    _activeReloads++;
+    _reloadEpoch++;
+    try {
+      await body();
+    } finally {
+      _activeReloads--;
+      _reloadEpoch++;
+    }
+  }
+
+  /// SetAVTransportURI for [url] carrying the current item's metadata.
+  String _buildSetUri(String url) {
+    return DlnaSoapBuilder.buildSetAVTransportURI(
+      url,
+      title: _currentTitle,
+      subtitleVariants: _currentSubtitleVariants,
+      protocolInfo: _currentProtocolInfo ?? 'http-get:*:video/mp4:*',
+      duration: _currentDurationStr,
+      size: _currentFileSize,
     );
-    await _sendAvTransport('Play', DlnaSoapBuilder.buildPlay());
   }
 
   @override
   Future<void> setVolume(double volume) async {
     CastLogger.info('DLNA: SetVolume ${volume.toStringAsFixed(2)}');
-    final intVolume = (volume.clamp(0.0, 1.0) * 100).round();
     final controlUrl = description.renderingControlUrl;
     if (controlUrl == null) return;
+    final range = await _getVolumeRange();
+    final intVolume =
+        (range.min + volume.clamp(0.0, 1.0) * (range.max - range.min)).round();
 
     await _httpClient.sendAction(
       controlUrl,
@@ -393,33 +442,72 @@ class DlnaSession extends CastSession {
     updateVolume(volume);
   }
 
+  /// The renderer's `Volume` range. RenderingControl:1 declares Volume as a
+  /// `ui2` with a vendor-defined maximum, so 0..100 is only a fallback for
+  /// when the SCPD is missing, unreadable or slow.
+  Future<({int min, int max})> _getVolumeRange() =>
+      _volumeRange ??= _fetchVolumeRange();
+
+  Future<({int min, int max})> _fetchVolumeRange() async {
+    const fallback = (min: 0, max: 100);
+    final url = description.renderingControlScpdUrl;
+    if (url == null) return fallback;
+    try {
+      final xml = await _httpClient.fetchText(
+        url,
+        timeout: const Duration(seconds: 2),
+      );
+      final range = DlnaScpdParser.volumeRange(xml);
+      if (range == null) {
+        CastLogger.debug('DLNA: SCPD declares no Volume range — using 0..100');
+        return fallback;
+      }
+      CastLogger.info('DLNA: renderer volume range ${range.min}..${range.max}');
+      return range;
+    } catch (e) {
+      CastLogger.debug('DLNA: could not read SCPD ($e) — using 0..100');
+      return fallback;
+    }
+  }
+
   @override
   Future<void> setSubtitle(CastSubtitle? subtitle) async {
     _currentSubtitle = subtitle;
     final media = _currentMedia;
-    if (media == null || _currentProxyUrl == null) return;
+    final url = _currentProxyUrl;
+    if (media == null || url == null) return;
 
-    String? subtitleProxyUrl;
-    if (subtitle != null) {
-      subtitleProxyUrl = _proxy.registerSubtitle(
-        subtitle.url,
-        headers: media.httpHeaders,
-      );
+    // Same registration as loadMedia, so the renderer gets the same subtitle
+    // entries it would have had if the track was chosen up front.
+    _currentSubtitleVariants =
+        subtitle == null
+            ? null
+            : _proxy.registerSubtitleVariants(
+              subtitle.url,
+              headers: media.httpHeaders,
+            );
+
+    // Re-sending SetAVTransportURI restarts the item, so put the viewer
+    // back where they were.
+    final resumeAt = position;
+
+    if (_isPipedStream) {
+      // A piped route restarts at zero unless the offset is in the URL —
+      // the same reload a seek does.
+      await _reloadPipedStreamAt(resumeAt);
+      updatePosition(resumeAt);
+      return;
     }
 
-    // Re-send SetAVTransportURI with proxy URL and proxied subtitle
-    await _sendAvTransport(
-      'SetAVTransportURI',
-      DlnaSoapBuilder.buildSetAVTransportURI(
-        _currentProxyUrl!,
-        title: media.title,
-        subtitleUrl: subtitleProxyUrl,
-        protocolInfo: _currentProtocolInfo ?? 'http-get:*:video/mp4:*',
-      ),
-    );
-
-    // Resume playback
-    await _sendAvTransport('Play', DlnaSoapBuilder.buildPlay());
+    await _guardedReload(() async {
+      await _sendAvTransport('SetAVTransportURI', _buildSetUri(url));
+      await _sendAvTransport('Play', DlnaSoapBuilder.buildPlay());
+    });
+    if (resumeAt > Duration.zero) {
+      // Seeking straight after Play fails while the renderer is still
+      // loading, so seek once it reports PLAYING — as loadMedia does.
+      _pendingSeekPosition = resumeAt;
+    }
   }
 
   @override
@@ -522,14 +610,18 @@ class DlnaSession extends CastSession {
   }
 
   Future<void> _poll() async {
-    if (_isPolling) return;
+    if (_isPolling || _activeReloads > 0) return;
     _isPolling = true;
+    final epoch = _reloadEpoch;
     try {
       // Get position info
       final positionResponse = await _sendAvTransport(
         'GetPositionInfo',
         DlnaSoapBuilder.buildGetPositionInfo(),
       );
+      // A reload started or finished while this was in flight: the answer
+      // describes the old item or the gap between the two.
+      if (epoch != _reloadEpoch) return;
       final posInfo = DlnaSoapParser.parsePositionInfo(positionResponse);
       CastLogger.debug(
         'DLNA: poll position=${posInfo.position.inSeconds}s, duration=${posInfo.duration.inSeconds}s',
@@ -556,6 +648,7 @@ class DlnaSession extends CastSession {
       final transportState = DlnaSoapParser.parseTransportInfo(
         transportResponse,
       );
+      if (epoch != _reloadEpoch) return;
 
       _handleTransportState(transportState);
 
@@ -570,7 +663,10 @@ class DlnaSession extends CastSession {
             DlnaSoapBuilder.buildGetVolume(),
           );
           final intVolume = DlnaSoapParser.parseVolume(volumeResponse);
-          updateVolume(intVolume / 100.0);
+          final range = await _getVolumeRange();
+          updateVolume(
+            ((intVolume - range.min) / (range.max - range.min)).clamp(0.0, 1.0),
+          );
         } catch (e) {
           CastLogger.debug('DLNA: volume polling failed: $e');
         }
@@ -579,6 +675,18 @@ class DlnaSession extends CastSession {
       CastLogger.debug('DLNA: polling failed: $e');
     } finally {
       _isPolling = false;
+    }
+  }
+
+  /// Runs a seek nobody awaits, so a failure is logged rather than lost as
+  /// an unhandled async error.
+  Future<void> _deferredSeek(Duration position) async {
+    try {
+      await seek(position);
+    } catch (e) {
+      CastLogger.warning(
+        'DLNA: deferred seek to ${position.inSeconds}s failed: $e',
+      );
     }
   }
 
@@ -597,7 +705,7 @@ class DlnaSession extends CastSession {
           final pos = _pendingSeekPosition!;
           _pendingSeekPosition = null;
           CastLogger.info('DLNA: executing deferred seek to ${pos.inSeconds}s');
-          seek(pos);
+          unawaited(_deferredSeek(pos));
         }
         break;
       case 'PAUSED_PLAYBACK':

@@ -1,6 +1,8 @@
 import 'dart:io';
 
 import 'package:dart_cast/src/core/hls_parser.dart';
+import 'package:dart_cast/src/core/hls_stream_proxy.dart';
+import 'package:dart_cast/src/core/http10_file_server.dart';
 import 'package:dart_cast/src/core/media_proxy.dart';
 import 'package:test/test.dart';
 
@@ -648,5 +650,336 @@ void main() {
         client.close();
       }
     });
+  });
+
+  group('HlsStreamHandler.streamAsTransportStream', () {
+    late HttpServer upstream;
+    late String upstreamUrl;
+    late HttpServer front;
+    late HlsStreamHandler handler;
+    late List<String> requested;
+    late List<String?> requestedRanges;
+
+    /// Route table for the upstream: path → handler.
+    late Map<String, Future<void> Function(HttpRequest)> routes;
+
+    /// Options the front server passes to the handler.
+    Duration startAt = Duration.zero;
+
+    setUp(() async {
+      requested = [];
+      requestedRanges = [];
+      routes = {};
+      startAt = Duration.zero;
+      upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      upstreamUrl = 'http://127.0.0.1:${upstream.port}';
+      upstream.listen((request) async {
+        requested.add(request.uri.path);
+        requestedRanges.add(request.headers.value('Range'));
+        final route = routes[request.uri.path];
+        if (route == null) {
+          request.response.statusCode = HttpStatus.notFound;
+        } else {
+          await route(request);
+        }
+        await request.response.close();
+      });
+
+      handler = HlsStreamHandler();
+      front = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      front.listen((request) async {
+        await handler.streamAsTransportStream(
+          '$upstreamUrl${request.uri.path}',
+          const {},
+          request.response,
+          startAt: startAt,
+          requestHeaders: request.headers,
+        );
+      });
+    });
+
+    tearDown(() async {
+      handler.close();
+      await front.close(force: true);
+      await upstream.close(force: true);
+    });
+
+    void playlist(String path, String content) {
+      routes[path] = (request) async {
+        request.response.headers.contentType = ContentType(
+          'application',
+          'vnd.apple.mpegurl',
+        );
+        request.response.write(content);
+      };
+    }
+
+    Future<HttpClientResponse> get(
+      String path, {
+      Map<String, String> headers = const {},
+    }) async {
+      final client = HttpClient();
+      addTearDown(() => client.close(force: true));
+      final request = await client.getUrl(
+        Uri.parse('http://127.0.0.1:${front.port}$path'),
+      );
+      headers.forEach(request.headers.set);
+      return request.close();
+    }
+
+    Future<List<int>> bodyOf(HttpClientResponse response) =>
+        response.fold<List<int>>(<int>[], (a, c) => a..addAll(c));
+
+    // Three distinct 188-byte TS packets in one 564-byte file.
+    final tsFile = <int>[
+      for (var p = 0; p < 3; p++) ...[
+        0x47,
+        p,
+        0x00,
+        0x10,
+        ...List.filled(184, p),
+      ],
+    ];
+
+    const byteRangePlaylist =
+        '#EXTM3U\n'
+        '#EXT-X-VERSION:4\n'
+        '#EXT-X-TARGETDURATION:2\n'
+        '#EXTINF:2.0,\n'
+        '#EXT-X-BYTERANGE:188@0\n'
+        'all.ts\n'
+        '#EXTINF:2.0,\n'
+        '#EXT-X-BYTERANGE:188@188\n'
+        'all.ts\n'
+        '#EXTINF:2.0,\n'
+        '#EXT-X-BYTERANGE:188@376\n'
+        'all.ts\n'
+        '#EXT-X-ENDLIST\n';
+
+    test('EXT-X-BYTERANGE segments are fetched with Range, not whole '
+        '(RFC 8216 §4.3.2.2)', () async {
+      playlist('/single.m3u8', byteRangePlaylist);
+      routes['/all.ts'] = (request) async {
+        // Honours Range like a real CDN; without one the whole file comes
+        // back, which is what made the old code pipe it three times over.
+        final range = request.headers.value('Range');
+        final m = RegExp(r'bytes=(\d+)-(\d+)').firstMatch(range ?? '');
+        if (m == null) {
+          request.response.add(tsFile);
+          return;
+        }
+        final s = int.parse(m.group(1)!);
+        final e = int.parse(m.group(2)!);
+        request.response.statusCode = HttpStatus.partialContent;
+        request.response.headers.set(
+          'Content-Range',
+          'bytes $s-$e/${tsFile.length}',
+        );
+        request.response.add(tsFile.sublist(s, e + 1));
+      };
+
+      final response = await get('/single.m3u8');
+      final body = await bodyOf(response);
+      expect(response.statusCode, HttpStatus.ok);
+      expect(body.length, 564);
+      expect(body, tsFile);
+      expect(requestedRanges.whereType<String>(), [
+        'bytes=0-187',
+        'bytes=188-375',
+        'bytes=376-563',
+      ]);
+    });
+
+    test(
+      'a server that ignores Range still yields only the sub-range',
+      () async {
+        playlist('/single.m3u8', byteRangePlaylist);
+        routes['/all.ts'] = (request) async => request.response.add(tsFile);
+
+        final body = await bodyOf(await get('/single.m3u8'));
+        expect(body, tsFile);
+      },
+    );
+
+    test(
+      'an encrypted playlist is refused instead of piping ciphertext',
+      () async {
+        playlist(
+          '/enc.m3u8',
+          '#EXTM3U\n'
+              '#EXT-X-TARGETDURATION:2\n'
+              '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+              '#EXTINF:2.0,\n'
+              'seg.ts\n'
+              '#EXT-X-ENDLIST\n',
+        );
+        routes['/seg.ts'] = (request) async => request.response.add(tsFile);
+
+        final response = await get('/enc.m3u8');
+        await response.drain<void>();
+        expect(response.statusCode, HttpStatus.badGateway);
+        expect(requested, isNot(contains('/seg.ts')));
+      },
+    );
+
+    test('an fMP4 (EXT-X-MAP) playlist is refused instead of being '
+        'labelled video/mp2t', () async {
+      playlist(
+        '/cmaf.m3u8',
+        '#EXTM3U\n'
+            '#EXT-X-TARGETDURATION:2\n'
+            '#EXT-X-MAP:URI="init.mp4"\n'
+            '#EXTINF:2.0,\n'
+            'seg.m4s\n'
+            '#EXT-X-ENDLIST\n',
+      );
+      routes['/seg.m4s'] = (request) async => request.response.add([1, 2]);
+
+      final response = await get('/cmaf.m3u8');
+      await response.drain<void>();
+      expect(response.statusCode, HttpStatus.badGateway);
+      expect(requested, isNot(contains('/seg.m4s')));
+    });
+
+    test('relative segment URIs resolve against the URL after redirects '
+        '(RFC 3986 §5.1.3)', () async {
+      routes['/a/index.m3u8'] = (request) async {
+        request.response.statusCode = HttpStatus.found;
+        request.response.headers.set('Location', '/b/index.m3u8');
+      };
+      playlist(
+        '/b/index.m3u8',
+        '#EXTM3U\n'
+            '#EXT-X-TARGETDURATION:2\n'
+            '#EXTINF:2.0,\n'
+            'seg.ts\n'
+            '#EXT-X-ENDLIST\n',
+      );
+      routes['/b/seg.ts'] = (request) async => request.response.add([0x47, 9]);
+
+      final body = await bodyOf(await get('/a/index.m3u8'));
+      expect(requested, contains('/b/seg.ts'));
+      expect(requested, isNot(contains('/a/seg.ts')));
+      expect(body, [0x47, 9]);
+    });
+
+    test('redirected master playlists resolve variants against the final '
+        'URL', () async {
+      routes['/a/master.m3u8'] = (request) async {
+        request.response.statusCode = HttpStatus.found;
+        request.response.headers.set('Location', '/b/master.m3u8');
+      };
+      playlist(
+        '/b/master.m3u8',
+        '#EXTM3U\n'
+            '#EXT-X-STREAM-INF:BANDWIDTH=1000\n'
+            'v/index.m3u8\n',
+      );
+      playlist(
+        '/b/v/index.m3u8',
+        '#EXTM3U\n'
+            '#EXT-X-TARGETDURATION:2\n'
+            '#EXTINF:2.0,\n'
+            'seg.ts\n'
+            '#EXT-X-ENDLIST\n',
+      );
+      routes['/b/v/seg.ts'] =
+          (request) async => request.response.add([0x47, 7]);
+
+      final body = await bodyOf(await get('/a/master.m3u8'));
+      expect(body, [0x47, 7]);
+      expect(
+        await handler.probeDuration('$upstreamUrl/a/master.m3u8', const {}),
+        const Duration(seconds: 2),
+      );
+    });
+
+    test('a live playlist still advertises time seek with an unknown '
+        'total (npt=<start>-/*)', () async {
+      playlist(
+        '/live.m3u8',
+        '#EXTM3U\n'
+            '#EXT-X-TARGETDURATION:2\n'
+            '#EXTINF:2.0,\n'
+            'seg.ts\n',
+      );
+      routes['/seg.ts'] = (request) async => request.response.add([0x47]);
+
+      final response = await get('/live.m3u8');
+      await response.drain<void>();
+      expect(response.headers.value('TimeSeekRange.dlna.org'), 'npt=0.000-/*');
+    });
+
+    test('answers DLNA transfer headers when asked (DLNA 7.4.1.3)', () async {
+      playlist(
+        '/vod.m3u8',
+        '#EXTM3U\n'
+            '#EXT-X-TARGETDURATION:2\n'
+            '#EXTINF:2.0,\n'
+            'seg.ts\n'
+            '#EXT-X-ENDLIST\n',
+      );
+      routes['/seg.ts'] = (request) async => request.response.add([0x47]);
+
+      final asked = await get(
+        '/vod.m3u8',
+        headers: {
+          'getcontentFeatures.dlna.org': '1',
+          'transferMode.dlna.org': 'Streaming',
+        },
+      );
+      await asked.drain<void>();
+      expect(
+        asked.headers.value('contentFeatures.dlna.org'),
+        DlnaContentFeatures.pipedTransportStream,
+      );
+      expect(
+        asked.headers.value('contentFeatures.dlna.org'),
+        contains('DLNA.ORG_OP=10'),
+      );
+      expect(asked.headers.value('transferMode.dlna.org'), 'Streaming');
+      expect(asked.headers.date, isNotNull);
+
+      final notAsked = await get('/vod.m3u8');
+      await notAsked.drain<void>();
+      expect(notAsked.headers.value('contentFeatures.dlna.org'), isNull);
+      expect(notAsked.headers.value('transferMode.dlna.org'), isNull);
+    });
+
+    test(
+      'alt-audio sources honour startAt and advertise the seek window',
+      () async {
+        String media(String prefix) {
+          final b = StringBuffer('#EXTM3U\n#EXT-X-TARGETDURATION:10\n');
+          for (var i = 0; i < 6; i++) {
+            b.write('#EXTINF:10.0,\n$prefix$i.ts\n');
+          }
+          b.write('#EXT-X-ENDLIST\n');
+          return b.toString();
+        }
+
+        playlist('/master.m3u8', _altAudioMaster);
+        playlist('/video-1080p.m3u8', media('v'));
+        playlist('/audio-jpn.m3u8', media('a'));
+        for (var i = 0; i < 6; i++) {
+          routes['/v$i.ts'] = (request) async => request.response.add([0x47]);
+          routes['/a$i.ts'] = (request) async => request.response.add([0x47]);
+        }
+
+        startAt = const Duration(seconds: 20);
+        final response = await get('/master.m3u8');
+        await response.drain<void>();
+
+        expect(
+          response.headers.value('TimeSeekRange.dlna.org'),
+          'npt=20.000-60.000/60.000',
+        );
+        // 20s lands on the start of segment 2: 0 and 1 are never fetched.
+        expect(requested, isNot(contains('/v0.ts')));
+        expect(requested, isNot(contains('/v1.ts')));
+        expect(requested, isNot(contains('/a0.ts')));
+        expect(requested, containsAll(['/v2.ts', '/v5.ts', '/a2.ts']));
+      },
+    );
   });
 }

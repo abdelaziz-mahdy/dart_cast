@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import '../../core/cast_device.dart';
@@ -26,6 +27,7 @@ class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
   RawDatagramSocket? _socket;
   StreamController<List<CastDevice>>? _controller;
   Timer? _searchTimer;
+  Timer? _timeoutTimer;
   final Map<String, CastDevice> _devices = {};
 
   /// Creates a [DlnaDiscoveryProvider].
@@ -56,9 +58,18 @@ class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
   Future<void> _doDiscovery(Duration timeout) async {
     try {
       CastLogger.info('DLNA: binding UDP socket for SSDP discovery');
-      _socket = await _socketFactory(InternetAddress.anyIPv4, 0);
+      final controller = _controller;
+      final socket = await _socketFactory(InternetAddress.anyIPv4, 0);
+      if (!identical(controller, _controller)) {
+        // stopDiscovery() or a newer startDiscovery() ran while binding.
+        socket.close();
+        return;
+      }
+      _socket = socket;
       _socket!.broadcastEnabled = true;
       _socket!.multicastLoopback = false;
+      // UDA 1.1 §1.1.2: the multicast TTL SHOULD default to 2.
+      _socket!.multicastHops = 2;
 
       _socket!.listen((event) {
         if (event == RawSocketEvent.read) {
@@ -88,9 +99,9 @@ class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
       });
 
       // Close after timeout
-      Timer(timeout, () {
+      _timeoutTimer = Timer(timeout, () {
         CastLogger.info('DLNA: discovery timeout reached, closing');
-        _controller?.close();
+        stopDiscovery();
       });
     } catch (e) {
       CastLogger.error('DLNA: discovery failed: $e');
@@ -135,6 +146,8 @@ class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
 
   @override
   void stopDiscovery() {
+    _timeoutTimer?.cancel();
+    _timeoutTimer = null;
     _searchTimer?.cancel();
     _searchTimer = null;
     _socket?.close();
@@ -155,9 +168,13 @@ class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
     try {
       final request = await client.getUrl(Uri.parse(url));
       final response = await request.close();
-      final body =
-          await response.transform(const SystemEncoding().decoder).join();
-      return body;
+      // UPnP descriptions are UTF-8 (UDA 1.1 §2.1). SystemEncoding would
+      // decode them with the ANSI code page on Windows.
+      final bytes = await response.fold<List<int>>(
+        <int>[],
+        (all, chunk) => all..addAll(chunk),
+      );
+      return utf8.decode(bytes, allowMalformed: true);
     } finally {
       client.close();
     }

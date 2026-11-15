@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -347,5 +348,49 @@ void main() {
         expect(results.last, hasLength(1));
       }
     });
+  });
+
+  test('the description is decoded as UTF-8 whatever the system code page '
+      'is, and entities are unescaped', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((request) async {
+      // No charset on the response: the XML declaration says UTF-8, and a
+      // Windows host's ANSI code page must not be used instead.
+      request.response.headers.set('Content-Type', 'text/xml');
+      request.response.add(
+        utf8.encode(
+          _deviceXml.replaceFirst(
+            '<friendlyName>Test TV</friendlyName>',
+            '<friendlyName>リビング &amp; Café</friendlyName>',
+          ),
+        ),
+      );
+      await request.response.close();
+    });
+
+    late FakeRawDatagramSocket fakeSocket;
+    final provider = DlnaDiscoveryProvider(
+      socketFactory: (host, port) async => fakeSocket = FakeRawDatagramSocket(),
+    );
+    addTearDown(provider.dispose);
+    final results = <List<CastDevice>>[];
+    final sub = provider
+        .startDiscovery(timeout: const Duration(seconds: 2))
+        .listen(results.add);
+    addTearDown(sub.cancel);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    fakeSocket.simulateResponse(
+      'HTTP/1.1 200 OK\r\n'
+      'LOCATION: http://127.0.0.1:${server.port}/description.xml\r\n'
+      'USN: uuid:test-123::urn:schemas-upnp-org:device:MediaRenderer:1\r\n'
+      'ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n'
+      '\r\n',
+    );
+    for (var i = 0; i < 40 && results.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
+    expect(results, isNotEmpty);
+    expect(results.last.single.name, 'リビング & Café');
   });
 }
