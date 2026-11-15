@@ -572,6 +572,30 @@ void main() {
         );
       });
 
+      test('segment path hints keep real media extensions', () {
+        String rewrite(String playlist) =>
+            HlsParser.rewritePlaylist(playlist, base, proxyBaseUrl, token);
+        expect(
+          rewrite('#EXTM3U\n#EXTINF:4,\na.m4s\n#EXTINF:4,\nb.aac\n'),
+          allOf(
+            contains('/stream/$token/seg1.m4s?url='),
+            contains('/stream/$token/seg2.aac?url='),
+          ),
+        );
+        // Obfuscated TS keeps the .ts hint the receiver's probe needs.
+        expect(
+          rewrite('#EXTM3U\n#EXTINF:4,\nframe001.jpg\n'),
+          contains('/stream/$token/seg1.ts?url='),
+        );
+        // Obfuscated fMP4 gets an fMP4 hint instead.
+        expect(
+          rewrite(
+            '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4,\nframe001.jpg\n',
+          ),
+          contains('/stream/$token/seg1.m4s?url='),
+        );
+      });
+
       test('attribute lists keep commas inside quoted strings', () {
         expect(
           HlsParser.parseAttributeList(
