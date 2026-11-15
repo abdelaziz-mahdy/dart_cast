@@ -241,10 +241,9 @@ class FfmpegMediaTransformer extends DefaultMediaTransformer {
     if (embedSubtitles && media.subtitles.isNotEmpty) {
       final subUrl = media.subtitles.first.url;
       // Handle file:// URLs
-      subtitlePath =
-          subUrl.startsWith('file://')
-              ? subUrl.replaceFirst('file://', '')
-              : subUrl;
+      subtitlePath = subUrl.startsWith('file://')
+          ? subUrl.replaceFirst('file://', '')
+          : subUrl;
       if (!File(subtitlePath).existsSync()) {
         subtitlePath = null;
       }

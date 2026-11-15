@@ -1,5 +1,5 @@
 import 'package:dart_cast/dart_cast.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// Bottom sheet listing discovered devices, grouped by protocol.
 ///
@@ -116,27 +116,21 @@ class DeviceListSheet extends StatelessWidget {
               ),
             // Device list
             Expanded(
-              child:
-                  devices.isEmpty
-                      ? Center(
-                        child: Text(
-                          isDiscovering
-                              ? 'Searching for devices...'
-                              : 'No devices found.\nMake sure you are on the same network\nas your cast devices.',
-                          textAlign: TextAlign.center,
-                          style: Theme.of(
-                            context,
-                          ).textTheme.bodyMedium?.copyWith(
-                            color:
-                                Theme.of(context).colorScheme.onSurfaceVariant,
-                          ),
+              child: devices.isEmpty
+                  ? Center(
+                      child: Text(
+                        isDiscovering ? 'Searching for devices...' : 'No devices found.\nMake sure you are on the same network\nas your cast devices.',
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
                         ),
-                      )
-                      : ListView.builder(
-                        controller: scrollController,
-                        itemCount: items.length,
-                        itemBuilder: (context, index) => items[index],
                       ),
+                    )
+                  : ListView.builder(
+                      controller: scrollController,
+                      itemCount: items.length,
+                      itemBuilder: (context, index) => items[index],
+                    ),
             ),
           ],
         );
@@ -178,9 +172,8 @@ class DeviceListSheet extends StatelessWidget {
                     vertical: 2,
                   ),
                   decoration: BoxDecoration(
-                    color: Theme.of(
-                      context,
-                    ).colorScheme.primary.withValues(alpha: 0.15),
+                    color: Theme.of(context).colorScheme.primary
+                        .withValues(alpha: 0.15),
                     borderRadius: BorderRadius.circular(4),
                   ),
                   child: Text(
@@ -206,9 +199,8 @@ class DeviceListSheet extends StatelessWidget {
             child: Text(
               note,
               style: TextStyle(
-                color: Theme.of(
-                  context,
-                ).colorScheme.onSurface.withValues(alpha: 0.5),
+                color: Theme.of(context).colorScheme.onSurface
+                    .withValues(alpha: 0.5),
                 fontSize: 11,
               ),
             ),
@@ -228,13 +220,12 @@ class DeviceListSheet extends StatelessWidget {
                   ? 'Connected'
                   : '${device.address.address}:${device.port}',
             ),
-            trailing:
-                isConnected
-                    ? Icon(
-                      Icons.check_circle,
-                      color: Theme.of(context).colorScheme.primary,
-                    )
-                    : const Icon(Icons.chevron_right),
+            trailing: isConnected
+                ? Icon(
+                    Icons.check_circle,
+                    color: Theme.of(context).colorScheme.primary,
+                  )
+                : const Icon(Icons.chevron_right),
             enabled: !isConnected,
             onTap: isConnected ? null : () => onDeviceTap(device),
           ),

@@ -1,6 +1,6 @@
 import 'package:dart_cast/dart_cast.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'device_discovery_page.dart';
 import 'log_viewer_page.dart';

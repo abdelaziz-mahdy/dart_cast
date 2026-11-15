@@ -15,7 +15,7 @@ import 'package:dart_cast/dart_cast.dart';
 import 'package:dart_cast_example/cast_media_demo.dart';
 import 'package:dart_cast_example/device_list_sheet.dart';
 import 'package:dart_cast_example/remote_control_page.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
@@ -60,15 +60,19 @@ class FakeCastSession extends CastSession {
       stateMachine.transitionTo(SessionState.disconnected);
 }
 
-CastDevice device(String id, String name, CastProtocol protocol, String ip,
-        int port) =>
-    CastDevice(
-      id: id,
-      name: name,
-      protocol: protocol,
-      address: InternetAddress(ip),
-      port: port,
-    );
+CastDevice device(
+  String id,
+  String name,
+  CastProtocol protocol,
+  String ip,
+  int port,
+) => CastDevice(
+  id: id,
+  name: name,
+  protocol: protocol,
+  address: InternetAddress(ip),
+  port: port,
+);
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -97,8 +101,8 @@ void main() {
   });
 
   Future<void> shoot(String name) async {
-    final boundary = boundaryKey.currentContext!.findRenderObject()
-        as RenderRepaintBoundary;
+    final boundary =
+        boundaryKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
     final image = await boundary.toImage(pixelRatio: 2);
     final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
     final file = File('screenshots/$shotDir/$name.png');
@@ -123,8 +127,11 @@ void main() {
         ),
       );
 
-  Widget remote(FakeCastSession session, {CastMedia? initialMedia,
-      Brightness brightness = Brightness.light}) {
+  Widget remote(
+    FakeCastSession session, {
+    CastMedia? initialMedia,
+    Brightness brightness = Brightness.light,
+  }) {
     return frame(
       brightness: brightness,
       RemoteControlPage(
@@ -146,60 +153,110 @@ void main() {
   }
 
   testWidgets('remote idle', (t) async {
-    final session = FakeCastSession(device('tv-1', 'Living room TV',
-        CastProtocol.chromecast, '192.168.2.17', 8009));
+    final session = FakeCastSession(
+      device(
+        'tv-1',
+        'Living room TV',
+        CastProtocol.chromecast,
+        '192.168.2.17',
+        8009,
+      ),
+    );
     await t.pumpWidget(remote(session));
     await t.pump(const Duration(milliseconds: 400));
     await shoot('01-remote-idle');
   });
 
   testWidgets('remote playing', (t) async {
-    final session = FakeCastSession(device('tv-1', 'Living room TV',
-        CastProtocol.chromecast, '192.168.2.17', 8009));
+    final session = FakeCastSession(
+      device(
+        'tv-1',
+        'Living room TV',
+        CastProtocol.chromecast,
+        '192.168.2.17',
+        8009,
+      ),
+    );
     await t.pumpWidget(
-        remote(session, initialMedia: CastMediaDemo.mp4TearsOfSteel));
+      remote(session, initialMedia: CastMediaDemo.mp4TearsOfSteel),
+    );
     await t.pump(const Duration(milliseconds: 400));
     await shoot('02-remote-playing');
   });
 
   testWidgets('remote playing dark', (t) async {
-    final session = FakeCastSession(device('tv-1', 'Living room TV',
-        CastProtocol.chromecast, '192.168.2.17', 8009));
-    await t.pumpWidget(remote(session,
+    final session = FakeCastSession(
+      device(
+        'tv-1',
+        'Living room TV',
+        CastProtocol.chromecast,
+        '192.168.2.17',
+        8009,
+      ),
+    );
+    await t.pumpWidget(
+      remote(
+        session,
         initialMedia: CastMediaDemo.mp4TearsOfSteel,
-        brightness: Brightness.dark));
+        brightness: Brightness.dark,
+      ),
+    );
     await t.pump(const Duration(milliseconds: 400));
     await shoot('03-remote-playing-dark');
   });
 
   testWidgets('device sheet while connected', (t) async {
     final devices = [
-      device('tv-1', 'Living room TV', CastProtocol.chromecast,
-          '192.168.2.17', 8009),
-      device('tv-2', 'Bedroom TV', CastProtocol.chromecast, '192.168.2.21',
-          8009),
-      device('tv-3', 'Samsung 7 Series', CastProtocol.dlna, '192.168.2.30',
-          9197),
+      device(
+        'tv-1',
+        'Living room TV',
+        CastProtocol.chromecast,
+        '192.168.2.17',
+        8009,
+      ),
+      device(
+        'tv-2',
+        'Bedroom TV',
+        CastProtocol.chromecast,
+        '192.168.2.21',
+        8009,
+      ),
+      device(
+        'tv-3',
+        'Samsung 7 Series',
+        CastProtocol.dlna,
+        '192.168.2.30',
+        9197,
+      ),
     ];
-    await t.pumpWidget(frame(
-      Scaffold(
-        body: DeviceListSheet(
-          devices: devices,
-          isDiscovering: true,
-          connectedDeviceId: 'tv-1',
-          onDeviceTap: (_) {},
-          onStop: () {},
+    await t.pumpWidget(
+      frame(
+        Scaffold(
+          body: DeviceListSheet(
+            devices: devices,
+            isDiscovering: true,
+            connectedDeviceId: 'tv-1',
+            onDeviceTap: (_) {},
+            onStop: () {},
+          ),
         ),
       ),
-    ));
+    );
     await t.pump(const Duration(milliseconds: 400));
     await shoot('04-device-sheet');
   });
 
   testWidgets('remote idle desktop', (t) async {
     setSize(desktop);
-    final session = FakeCastSession(device('tv-1', 'Living room TV',
-        CastProtocol.chromecast, '192.168.2.17', 8009));
+    final session = FakeCastSession(
+      device(
+        'tv-1',
+        'Living room TV',
+        CastProtocol.chromecast,
+        '192.168.2.17',
+        8009,
+      ),
+    );
     await t.pumpWidget(remote(session));
     await t.pump(const Duration(milliseconds: 400));
     await shoot('05-remote-idle-desktop');
@@ -207,21 +264,40 @@ void main() {
 
   testWidgets('remote playing desktop', (t) async {
     setSize(desktop);
-    final session = FakeCastSession(device('tv-1', 'Living room TV',
-        CastProtocol.chromecast, '192.168.2.17', 8009));
+    final session = FakeCastSession(
+      device(
+        'tv-1',
+        'Living room TV',
+        CastProtocol.chromecast,
+        '192.168.2.17',
+        8009,
+      ),
+    );
     await t.pumpWidget(
-        remote(session, initialMedia: CastMediaDemo.mp4TearsOfSteel));
+      remote(session, initialMedia: CastMediaDemo.mp4TearsOfSteel),
+    );
     await t.pump(const Duration(milliseconds: 400));
     await shoot('06-remote-playing-desktop');
   });
 
   testWidgets('remote playing desktop dark', (t) async {
     setSize(desktop);
-    final session = FakeCastSession(device('tv-1', 'Living room TV',
-        CastProtocol.chromecast, '192.168.2.17', 8009));
-    await t.pumpWidget(remote(session,
+    final session = FakeCastSession(
+      device(
+        'tv-1',
+        'Living room TV',
+        CastProtocol.chromecast,
+        '192.168.2.17',
+        8009,
+      ),
+    );
+    await t.pumpWidget(
+      remote(
+        session,
         initialMedia: CastMediaDemo.mp4TearsOfSteel,
-        brightness: Brightness.dark));
+        brightness: Brightness.dark,
+      ),
+    );
     await t.pump(const Duration(milliseconds: 400));
     await shoot('07-remote-playing-desktop-dark');
   });
