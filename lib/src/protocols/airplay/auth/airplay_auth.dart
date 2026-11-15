@@ -9,6 +9,7 @@ import 'package:http/http.dart' as http;
 import '../../../utils/logger.dart';
 import 'hap_credentials.dart';
 import 'hap_srp.dart';
+import 'socket_http.dart';
 import 'tlv8.dart';
 
 /// Orchestrates the AirPlay HAP pair-setup flow (4 HTTP requests).
@@ -49,11 +50,38 @@ class AirPlayPairSetup {
   ///
   /// [clientId] is the pairing identifier for this client (e.g., a UUID).
   /// Returns [HapCredentials] on success.
+  ///
+  /// M1, M3 and M5 go over one TCP connection opened for this flow. The
+  /// receiver keeps the SRP session per connection (as pyatv's single
+  /// connection relies on), and a pooled HTTP client may move a step onto
+  /// another connection — for instance while a `/pair-pin-start` request
+  /// is still holding the first one.
   Future<HapCredentials> pairSetup({
     required String pin,
     required String clientId,
   }) async {
+    final socket = await Socket.connect(
+      host,
+      port,
+      timeout: const Duration(seconds: 10),
+    );
+    final channel = SocketHttpChannel(socket, host: host, port: port);
+    try {
+      return await _pairSetupOn(channel, pin: pin, clientId: clientId);
+    } finally {
+      await channel.release();
+      socket.destroy();
+    }
+  }
+
+  Future<HapCredentials> _pairSetupOn(
+    SocketHttpChannel channel, {
+    required String pin,
+    required String clientId,
+  }) async {
     final srp = HapSrp();
+    Future<Uint8List> postPairSetup(Uint8List body) =>
+        _postPairSetup(channel, body);
 
     // -- M1: Send PairSetup method + SeqNo 1 --
     CastLogger.info('AirPlay auth: pair-setup M1');
@@ -62,7 +90,7 @@ class AirPlayPairSetup {
       (Tlv8.tagSeqNo, [0x01]),
     ]);
 
-    final m2Response = await _postPairSetup(m1);
+    final m2Response = await postPairSetup(m1);
     final m2 = Tlv8.decode(m2Response);
     _checkError(m2, 'M2');
 
@@ -87,7 +115,7 @@ class AirPlayPairSetup {
       (Tlv8.tagProof, proof),
     ]);
 
-    final m4Response = await _postPairSetup(m3);
+    final m4Response = await postPairSetup(m3);
     final m4 = Tlv8.decode(m4Response);
     _checkError(m4, 'M4');
     await verifyAccessoryProof(srp, m4[Tlv8.tagProof], 'pair-setup');
@@ -102,7 +130,7 @@ class AirPlayPairSetup {
       (Tlv8.tagEncryptedData, encryptedCredentials),
     ]);
 
-    final m6Response = await _postPairSetup(m5);
+    final m6Response = await postPairSetup(m5);
     final m6 = Tlv8.decode(m6Response);
     _checkError(m6, 'M6');
 
@@ -123,18 +151,29 @@ class AirPlayPairSetup {
     return credentials;
   }
 
-  Future<Uint8List> _postPairSetup(Uint8List body) async {
-    final response = await _httpClient.post(
-      _uri('/pair-setup'),
-      headers: {..._defaultHeaders, 'Content-Type': 'application/octet-stream'},
-      body: body,
-    );
+  Future<Uint8List> _postPairSetup(
+    SocketHttpChannel channel,
+    Uint8List body,
+  ) async {
+    final SocketHttpResponse response;
+    try {
+      response = await channel.post(
+        '/pair-setup',
+        headers: {
+          ..._defaultHeaders,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: body,
+      );
+    } on SocketHttpException catch (e) {
+      throw AirPlayAuthException('pair-setup failed: ${e.message}');
+    }
     if (response.statusCode != 200) {
       throw AirPlayAuthException(
         'pair-setup failed with HTTP ${response.statusCode}',
       );
     }
-    return Uint8List.fromList(response.bodyBytes);
+    return Uint8List.fromList(response.body);
   }
 
   void _checkError(Map<int, List<int>> tlv, String step) {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -204,6 +205,87 @@ void main() {
         expect(ctx.seqNos, equals([1, 3, 5]));
       },
     );
+
+    test('pairSetup keeps M1, M3 and M5 on one connection while '
+        'pair-pin-start is still pending', () async {
+      // Like a real receiver, SRP state lives with the TCP connection: an M3
+      // on a connection that did not carry M1 is an authentication error.
+      final accessories = <int, SrpAccessory>{};
+      final ports = <int>[];
+      final m1Seen = Completer<void>();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      server.listen((request) async {
+        final port = request.connectionInfo!.remotePort;
+        final body = await request.fold<List<int>>(
+          [],
+          (prev, chunk) => [...prev, ...chunk],
+        );
+        if (request.uri.path == '/pair-pin-start') {
+          // Hold this connection until pair-setup has started elsewhere.
+          await m1Seen.future;
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+          request.response.statusCode = 200;
+          await request.response.close();
+          return;
+        }
+        final tlv = Tlv8.decode(body);
+        final seqNo = tlv[Tlv8.tagSeqNo]?.first ?? 0;
+        ports.add(port);
+        Uint8List reply;
+        if (seqNo == 1) {
+          final accessory = await SrpAccessory.create(pin: '1234');
+          accessories[port] = accessory;
+          if (!m1Seen.isCompleted) m1Seen.complete();
+          reply = Tlv8.encode([
+            (Tlv8.tagSeqNo, [0x02]),
+            (Tlv8.tagSalt, accessory.salt),
+            (Tlv8.tagPublicKey, accessory.publicKey),
+          ]);
+          // Let the pin-start connection go idle before M3 is sent.
+          await Future<void>.delayed(const Duration(milliseconds: 150));
+        } else if (seqNo == 3) {
+          final accessory = accessories[port];
+          final proof =
+              accessory == null
+                  ? null
+                  : await accessory.verifyM1(
+                    tlv[Tlv8.tagPublicKey] ?? const [],
+                    tlv[Tlv8.tagProof] ?? const [],
+                  );
+          reply = Tlv8.encode([
+            (Tlv8.tagSeqNo, [0x04]),
+            if (proof == null) (Tlv8.tagError, [0x02]),
+            if (proof != null) (Tlv8.tagProof, proof),
+          ]);
+        } else {
+          request.response.statusCode = 500;
+          await request.response.close();
+          return;
+        }
+        request.response
+          ..statusCode = 200
+          ..contentLength = reply.length
+          ..add(reply);
+        await request.response.close();
+      });
+
+      final pairSetup = AirPlayPairSetup(host: '127.0.0.1', port: server.port);
+      addTearDown(pairSetup.close);
+      pairSetup.startPinDisplay();
+      await expectLater(
+        pairSetup.pairSetup(pin: '1234', clientId: 'test-client'),
+        throwsA(
+          isA<AirPlayAuthException>().having(
+            (e) => e.message,
+            'message',
+            contains('HTTP 500'), // reached M5, i.e. M3 was accepted
+          ),
+        ),
+      );
+      expect(ports, hasLength(3));
+      expect(ports.toSet(), hasLength(1));
+    });
 
     test('pairSetup throws on HTTP 500 error', () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);

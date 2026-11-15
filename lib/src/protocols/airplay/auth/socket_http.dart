@@ -184,6 +184,23 @@ class SocketHttpChannel {
       }
     }
 
+    // RFC 9112 §6.3: chunked transfer coding takes precedence over any
+    // Content-Length.
+    if ((headers['transfer-encoding'] ?? '').toLowerCase().contains(
+      'chunked',
+    )) {
+      final chunked = _readChunked(data, bodyStart);
+      if (chunked == null) return null;
+      return (
+        response: SocketHttpResponse(
+          statusCode: statusCode,
+          headers: headers,
+          body: chunked.body,
+        ),
+        consumed: chunked.end,
+      );
+    }
+
     final contentLength = int.tryParse(headers['content-length'] ?? '');
     if (contentLength == null) {
       // No Content-Length: treat the headers as the whole response.
@@ -209,6 +226,49 @@ class SocketHttpChannel {
       ),
       consumed: bodyStart + contentLength,
     );
+  }
+
+  /// Decodes a chunked body (RFC 9112 §7.1) starting at [start]. Returns
+  /// null until the terminating zero-size chunk and trailer section have
+  /// arrived.
+  static ({Uint8List body, int end})? _readChunked(Uint8List data, int start) {
+    final body = BytesBuilder(copy: false);
+    var pos = start;
+    while (true) {
+      final lineEnd = _indexOfCrlf(data, pos);
+      if (lineEnd < 0) return null;
+      final sizeText =
+          ascii
+              .decode(data.sublist(pos, lineEnd), allowInvalid: true)
+              .split(';')
+              .first
+              .trim();
+      final size = int.tryParse(sizeText, radix: 16);
+      if (size == null) {
+        throw SocketHttpException('Malformed chunk size: $sizeText');
+      }
+      pos = lineEnd + 2;
+      if (size == 0) {
+        // Trailer fields, then an empty line.
+        while (true) {
+          final end = _indexOfCrlf(data, pos);
+          if (end < 0) return null;
+          final isEmpty = end == pos;
+          pos = end + 2;
+          if (isEmpty) return (body: body.toBytes(), end: pos);
+        }
+      }
+      if (data.length < pos + size + 2) return null;
+      body.add(data.sublist(pos, pos + size));
+      pos += size + 2; // chunk data + CRLF
+    }
+  }
+
+  static int _indexOfCrlf(Uint8List data, int from) {
+    for (var i = from; i + 1 < data.length; i++) {
+      if (data[i] == 0x0D && data[i + 1] == 0x0A) return i;
+    }
+    return -1;
   }
 
   static int _findHeaderEnd(Uint8List data) {
