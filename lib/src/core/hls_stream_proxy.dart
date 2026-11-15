@@ -397,9 +397,16 @@ class HlsStreamHandler {
     );
 
     final muxer = HlsAltAudioSegmentMuxer(planner: planner);
+    // One response is one transport stream: continuity counters must run on
+    // across segments rather than restart at 0 in each (§2.4.3.3).
+    final continuity = TsMuxContinuity();
     for (var i = skip.count; i < plan.segments.length; i++) {
       try {
-        final muxed = await muxer.muxSegment(plan: plan, segmentIndex: i);
+        final muxed = await muxer.muxSegment(
+          plan: plan,
+          segmentIndex: i,
+          continuity: continuity,
+        );
         response.add(muxed.bytes);
       } catch (e) {
         CastLogger.warning(

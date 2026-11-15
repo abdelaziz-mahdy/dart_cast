@@ -6,6 +6,8 @@ import 'package:dart_cast/src/core/http10_file_server.dart';
 import 'package:dart_cast/src/core/media_proxy.dart';
 import 'package:test/test.dart';
 
+import 'ts_fixtures.dart';
+
 /// Sample master playlist that mirrors the real-world krussdomi.com layout
 /// (alternate audio renditions in their own playlists, video-only variants).
 /// Used by the alt-audio tests below.
@@ -979,6 +981,63 @@ void main() {
         expect(requested, isNot(contains('/v1.ts')));
         expect(requested, isNot(contains('/a0.ts')));
         expect(requested, containsAll(['/v2.ts', '/v5.ts', '/a2.ts']));
+      },
+    );
+
+    test(
+      'muxed alt-audio segments form one stream: continuity counters '
+      'run on across segment boundaries (ISO/IEC 13818-1 §2.4.3.3)',
+      () async {
+        String media(String prefix) {
+          final b = StringBuffer('#EXTM3U\n#EXT-X-TARGETDURATION:1\n');
+          for (var i = 0; i < 3; i++) {
+            b.write('#EXTINF:0.160,\n$prefix$i.ts\n');
+          }
+          b.write('#EXT-X-ENDLIST\n');
+          return b.toString();
+        }
+
+        playlist('/master.m3u8', _altAudioMaster);
+        playlist('/video-1080p.m3u8', media('v'));
+        playlist('/audio-jpn.m3u8', media('a'));
+        for (var i = 0; i < 3; i++) {
+          routes['/v$i.ts'] =
+              (request) async =>
+                  request.response.add(tsVideoSegment(90000 + i * 14400));
+          routes['/a$i.ts'] =
+              (request) async =>
+                  request.response.add(tsAudioSegment(90000 + i * 14400));
+        }
+
+        final response = await get('/master.m3u8');
+        final body = <int>[];
+        await for (final chunk in response) {
+          body.addAll(chunk);
+        }
+        expect(body.length % 188, 0);
+        final packets = body.length ~/ 188;
+        expect(packets, greaterThan(30));
+
+        final last = <int, int>{};
+        final broken = <String>[];
+        for (var i = 0; i < packets; i++) {
+          final pid = tsPid(body, i);
+          if (pid == 0x1FFF) continue;
+          final hasPayload = (body[i * 188 + 3] >> 4) & 0x1 == 1;
+          final cc = tsCc(body, i);
+          final previous = last[pid];
+          if (previous != null) {
+            final expected = hasPayload ? (previous + 1) & 0x0F : previous;
+            if (cc != expected) {
+              broken.add(
+                'packet $i PID 0x${pid.toRadixString(16)}: '
+                'cc $cc after $previous',
+              );
+            }
+          }
+          last[pid] = cc;
+        }
+        expect(broken, isEmpty);
       },
     );
   });
