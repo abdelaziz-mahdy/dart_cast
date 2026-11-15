@@ -43,8 +43,15 @@ class MdnsServiceInfo {
 
   /// Unique device identifier.
   ///
-  /// Uses Chromecast `id` or AirPlay `deviceid` TXT field.
-  String get deviceId => txtRecords['id'] ?? txtRecords['deviceid'] ?? '';
+  /// Uses Chromecast `id` or AirPlay `deviceid` TXT field. When neither is
+  /// present (TXT records are advisory and the lookup may time out, RFC
+  /// 6763 §6), falls back to the service instance [name], which is unique
+  /// on the link, so two such devices are not merged into one.
+  String get deviceId {
+    final id = txtRecords['id'] ?? txtRecords['deviceid'];
+    if (id != null && id.isNotEmpty) return id;
+    return name;
+  }
 
   /// Device model string.
   ///
@@ -101,6 +108,31 @@ class MdnsDiscovery {
 
   /// mDNS service type for Chromecast devices.
   static const String chromecastServiceType = '_googlecast._tcp.local';
+
+  /// Parses the TXT strings of a service, as the multicast_dns package
+  /// hands them over (one string per line), into [into].
+  ///
+  /// RFC 6763 §6.4: keys are case-insensitive (stored lower-case), only
+  /// the first occurrence of a key counts, a string with no `=` is a
+  /// boolean attribute (stored with an empty value), and a string that
+  /// starts with `=` is ignored. Values are kept exactly as sent.
+  static Map<String, String> parseTxtRecords(
+    String text, {
+    Map<String, String>? into,
+  }) {
+    final records = into ?? <String, String>{};
+    for (var line in text.split('\n')) {
+      if (line.endsWith('\r')) line = line.substring(0, line.length - 1);
+      if (line.isEmpty) continue;
+      final eqIndex = line.indexOf('=');
+      if (eqIndex == 0) continue;
+      final key =
+          (eqIndex < 0 ? line : line.substring(0, eqIndex)).toLowerCase();
+      final value = eqIndex < 0 ? '' : line.substring(eqIndex + 1);
+      records.putIfAbsent(key, () => value);
+    }
+    return records;
+  }
 
   /// mDNS service type for AirPlay devices.
   static const String airplayServiceType = '_airplay._tcp.local';
@@ -171,17 +203,7 @@ class MdnsDiscovery {
                           nestedTimeout,
                           onTimeout: (sink) => sink.close(),
                         )) {
-                      // The multicast_dns package joins TXT strings with writeln(),
-                      // producing newline-separated key=value pairs.
-                      for (final line in txt.text.split('\n')) {
-                        final trimmed = line.trim();
-                        if (trimmed.isEmpty) continue;
-                        final eqIndex = trimmed.indexOf('=');
-                        if (eqIndex > 0) {
-                          txtRecords[trimmed.substring(0, eqIndex)] = trimmed
-                              .substring(eqIndex + 1);
-                        }
-                      }
+                      MdnsDiscovery.parseTxtRecords(txt.text, into: txtRecords);
                     }
                   } catch (_) {
                     // TXT lookup timed out — proceed with empty TXT records

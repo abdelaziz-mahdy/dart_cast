@@ -442,5 +442,149 @@ void main() {
         expect(result, contains('$proxyBaseUrl/stream/$token/seg1.ts?url='));
       });
     });
+
+    group('RFC 8216 compliance', () {
+      const proxyBaseUrl = 'http://192.168.1.5:8234';
+      const token = 'tok';
+      const base = 'http://cdn.example.com/hls/index.m3u8';
+
+      test('a tag between #EXTINF and its URI does not orphan the segment', () {
+        const playlist =
+            '#EXTM3U\n#EXT-X-TARGETDURATION:6\n'
+            '#EXTINF:6,\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z\n'
+            'seg1.ts\n'
+            '#EXT-X-DISCONTINUITY\n#EXTINF:6,\n# a comment\nseg2.ts\n'
+            '#EXT-X-ENDLIST\n';
+        final rewritten = HlsParser.rewritePlaylist(
+          playlist,
+          base,
+          proxyBaseUrl,
+          token,
+        );
+        expect(
+          rewritten,
+          contains(
+            '$proxyBaseUrl/stream/$token/seg1.ts?url='
+            '${Uri.encodeComponent('http://cdn.example.com/hls/seg1.ts')}',
+          ),
+        );
+        expect(rewritten, contains('$proxyBaseUrl/stream/$token/seg2.ts?url='));
+        expect(rewritten.split('\n'), isNot(contains('seg1.ts')));
+        expect(HlsParser.extractSegmentUrls(playlist, base), [
+          'http://cdn.example.com/hls/seg1.ts',
+          'http://cdn.example.com/hls/seg2.ts',
+        ]);
+      });
+
+      test('data: and skd:// key URIs pass through untouched', () {
+        const playlist =
+            '#EXTM3U\n'
+            '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:text/plain;base64,AAAA",'
+            'KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"\n'
+            '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://key42"\n'
+            '#EXTINF:6,\nseg1.ts\n';
+        final rewritten = HlsParser.rewritePlaylist(
+          playlist,
+          base,
+          proxyBaseUrl,
+          token,
+        );
+        expect(rewritten, contains('URI="data:text/plain;base64,AAAA"'));
+        expect(rewritten, contains('URI="skd://key42"'));
+      });
+
+      test('Low-Latency HLS part, preload hint and report URIs are proxied', () {
+        const playlist =
+            '#EXTM3U\n'
+            '#EXT-X-PART:DURATION=1.0,URI="part1.mp4"\n'
+            '#EXT-X-PRELOAD-HINT:TYPE=PART,URI="part2.mp4"\n'
+            '#EXT-X-RENDITION-REPORT:URI="../alt/index.m3u8",LAST-MSN=3\n';
+        final rewritten = HlsParser.rewritePlaylist(
+          playlist,
+          base,
+          proxyBaseUrl,
+          token,
+        );
+        for (final upstream in [
+          'http://cdn.example.com/hls/part1.mp4',
+          'http://cdn.example.com/hls/part2.mp4',
+          'http://cdn.example.com/alt/index.m3u8',
+        ]) {
+          expect(
+            rewritten,
+            contains(
+              '$proxyBaseUrl/stream/$token?url=${Uri.encodeComponent(upstream)}',
+            ),
+          );
+        }
+      });
+
+      test('absolute-path URIs keep IPv6 brackets and userinfo', () {
+        expect(
+          HlsParser.resolveUrl('/a.ts', 'http://[::1]:8080/x/index.m3u8'),
+          'http://[::1]:8080/a.ts',
+        );
+        expect(
+          HlsParser.resolveUrl('/a.ts', 'http://user@host/x/index.m3u8'),
+          'http://user@host/a.ts',
+        );
+      });
+
+      test('BANDWIDTH is not read from AVERAGE-BANDWIDTH', () {
+        const master =
+            '#EXTM3U\n'
+            '#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=100,BANDWIDTH=900,'
+            'CODECS="avc1.640028,mp4a.40.2",RESOLUTION=1920x1080\n'
+            'hi.m3u8\n'
+            '#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=800,BANDWIDTH=200\n'
+            'lo.m3u8\n';
+        final variants = HlsParser.extractVariantStreams(master, base);
+        expect(variants.first.url, 'http://cdn.example.com/hls/hi.m3u8');
+        expect(variants.first.bandwidth, 900);
+        expect(variants.first.codecs, 'avc1.640028,mp4a.40.2');
+        expect(variants.first.resolution, '1920x1080');
+      });
+
+      test('EXT-X-BYTERANGE sub-ranges are reported with implicit offsets', () {
+        const playlist =
+            '#EXTM3U\n#EXT-X-VERSION:4\n'
+            '#EXTINF:2,\n#EXT-X-BYTERANGE:188@0\nall.ts\n'
+            '#EXTINF:2,\n#EXT-X-BYTERANGE:376\nall.ts\n'
+            '#EXTINF:2,\n#EXT-X-BYTERANGE:188@1000\nall.ts\n'
+            '#EXT-X-ENDLIST\n';
+        final segments = HlsParser.extractMediaSegments(playlist, base);
+        expect(segments.map((s) => s.rangeHeader), [
+          'bytes=0-187',
+          'bytes=188-563',
+          'bytes=1000-1187',
+        ]);
+      });
+
+      test('detects encrypted and fMP4 playlists', () {
+        expect(
+          HlsParser.isEncrypted('#EXT-X-KEY:METHOD=AES-128,URI="k"\n'),
+          isTrue,
+        );
+        expect(HlsParser.isEncrypted('#EXT-X-KEY:METHOD=NONE\n'), isFalse);
+        expect(
+          HlsParser.hasInitializationSection('#EXT-X-MAP:URI="init.mp4"\n'),
+          isTrue,
+        );
+      });
+
+      test('attribute lists keep commas inside quoted strings', () {
+        expect(
+          HlsParser.parseAttributeList(
+            'TYPE=AUDIO,GROUP-ID="a",NAME="English, Commentary",DEFAULT=YES',
+          ),
+          {
+            'TYPE': 'AUDIO',
+            'GROUP-ID': 'a',
+            'NAME': 'English, Commentary',
+            'DEFAULT': 'YES',
+          },
+        );
+      });
+    });
   });
 }
