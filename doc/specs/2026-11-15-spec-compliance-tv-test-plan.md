@@ -52,6 +52,23 @@ cd ../dart_cast-spec-experimental
 dart run tool/tv_suite.dart --tv=192.168.2.17 --skip=ap_pair,ap_verify
 ```
 
+### Next round (short form, about 20 minutes)
+
+One run on the experimental branch covers the fixes branch too, since it
+contains it. `--set=next` leaves out the DLNA sidecar-subtitle cases (the
+TCL renderer drops sidecar subtitles; see the hardware results) and
+`--quick` roughly halves every watch window.
+
+```sh
+cd ../dart_cast-spec-experimental
+dart run tool/tv_suite.dart --tv=192.168.2.17 --fixtures=../dart_cast-spec-audit/build/tv_fixtures --set=next --quick
+# read the PIN from build/tv_results/<run>/ap_pin_start/*.png, then:
+dart run tool/tv_suite.dart --tv=192.168.2.17 --fixtures=../dart_cast-spec-audit/build/tv_fixtures --only=ap_pair,ap_verify --pin=XXXX
+```
+
+A case that fails in quick mode is re-run without `--quick` before it
+counts as a failure.
+
 Each run writes `build/tv_results/<time>_<sha>/`. That folder has
 `summary.md`, `results.json`, and one folder per case holding `log.txt`
 (every request the TV made, with its headers), `samples.tsv` (device values

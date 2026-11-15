@@ -24,6 +24,10 @@
 //   --tv=<ip>            TV address (required)
 //   --adb=<ip:port>      adb target, default <tv>:5555; --no-adb to skip
 //   --only=a,b           run only these case ids (prefix match)
+//   --set=next           run a named case list (see _sets); combines with
+//                        --only/--skip
+//   --quick              shorter watch windows (~half); still judged on
+//                        device-reported progress
 //   --skip=a,b           skip these case ids (prefix match)
 //   --pin=1234           AirPlay PIN read from the ap_pin_start screenshot
 //   --fixtures=<dir>     default build/tv_fixtures
@@ -58,6 +62,14 @@ Future<void> main(List<String> args) async {
     return;
   }
 
+  final setName = opts.value('set');
+  final set = setName == null ? null : _sets[setName];
+  if (setName != null && set == null) {
+    stderr.writeln('Unknown --set=$setName (have: ${_sets.keys.join(', ')})');
+    exitCode = 64;
+    return;
+  }
+
   final fixtures = Directory(opts.value('fixtures') ?? 'build/tv_fixtures');
   if (!File('${fixtures.path}/local.mp4').existsSync()) {
     stderr.writeln(
@@ -88,6 +100,7 @@ Future<void> main(List<String> args) async {
     fixtures: fixtures,
     server: server,
     pin: opts.value('pin'),
+    quick: opts.flag('quick'),
     credentialsFile: File(
       '${opts.value('out') ?? 'build/tv_results'}/airplay_credentials.json',
     ),
@@ -104,6 +117,7 @@ Future<void> main(List<String> args) async {
   final skip = opts.list('skip');
   final results = <_Result>[];
   for (final c in cases) {
+    if (set != null && !set.any(c.id.startsWith)) continue;
     if (only.isNotEmpty && !only.any(c.id.startsWith)) continue;
     if (skip.any(c.id.startsWith)) continue;
     results.add(await _runCase(c, env, Directory('${runDir.path}/${c.id}')));
@@ -123,6 +137,25 @@ Future<void> main(List<String> args) async {
 // Cases
 // ---------------------------------------------------------------------------
 
+/// Named case lists for `--set`.
+///
+/// `next`: the next TV round. Leaves out the DLNA sidecar-subtitle cases,
+/// whose answer on the TCL TV is known (its renderer drops sidecar
+/// subtitles), and the AirPlay steps that need `--pin`; run those after
+/// reading the PIN from the `ap_pin_start` screenshot.
+const _sets = <String, List<String>>{
+  'next': [
+    'cc_',
+    'dl_mp4',
+    'dl_mkv_embedded_subs',
+    'dl_set_subtitle_midplay',
+    'dl_hls_',
+    'dl_volume',
+    'ap_transient_connect',
+    'ap_pin_start',
+  ],
+};
+
 /// Volume the suite sets on the TV. Never above 0.10 of the device range:
 /// the TV is in a living room.
 const _testVolume = 0.08;
@@ -135,7 +168,8 @@ List<_Case> _cases() => [
     ['CC-3 liveness timeout', 'CC-4 PONG to device PING', 'CC-1 app match'],
     (x) async {
       final s = await x.chromecast();
-      final samples = await x.watch(s, 45);
+      // Quick: 25 s still outlasts the 15 s liveness timeout once.
+      final samples = await x.watch(s, x.env.quick ? 25 : 45);
       final stayed = samples.every((p) => p.state == SessionState.connected);
       x.note('states: ${samples.map((p) => p.state.name).toSet()}');
       x.note('session id: ${s.sessionId}');
@@ -384,9 +418,9 @@ List<_Case> _cases() => [
       await s.loadMedia(
         x.file('local.mp4', CastMediaType.mp4, subtitles: [srt, vtt], def: srt),
       );
-      await x.watch(s, 6);
+      await x.watch(s, x.env.quick ? 4 : 6);
       await s.seek(const Duration(seconds: 60));
-      await x.watch(s, 6);
+      await x.watch(s, x.env.quick ? 4 : 6);
       await s.setSubtitle(vtt);
       final after = await x.watch(s, 12);
       await x.screenshot('after_switch');
@@ -682,36 +716,45 @@ class _Ctx {
 
   /// Play / pause / resume / seek, all judged on device-reported values.
   Future<_Verdict> playbackChecks(CastSession s, {required int seekTo}) async {
+    // Watch windows in seconds; --quick roughly halves them. Every check
+    // still needs the device-reported position to move (or hold) by itself.
+    final q = env.quick;
+    final playFor = q ? 6 : 12;
+    final pauseFor = q ? 3 : 4;
+    final resumeFor = q ? 4 : 5;
+    final landAfter = q ? 4 : 5;
+    final seekFor = q ? 9 : 12;
+
     await waitForProgress(s);
-    final play = await watch(s, 12);
+    final play = await watch(s, playFor);
     await screenshot('playing');
-    final played = _advanced(play, 12);
+    final played = _advanced(play, playFor);
     note('play: ${_span(play)}  duration=${play.last.duration}');
     if (!played) return _Verdict.fail;
 
     await s.pause();
-    final paused = await watch(s, 4);
+    final paused = await watch(s, pauseFor);
     // The player's transport UI (title, scrub bar) is drawn while paused.
     await screenshot('paused');
     final pausedOk =
         paused.last.state == SessionState.paused &&
-        !_advanced(paused.sublist(1), 3, minRatio: 0.5);
+        !_advanced(paused.sublist(1), pauseFor - 1, minRatio: 0.5);
     note('pause: ${paused.last.state.name} ${_span(paused)}');
 
     await s.play();
-    final resumed = await watch(s, 5);
-    final resumedOk = _advanced(resumed, 5);
+    final resumed = await watch(s, resumeFor);
+    final resumedOk = _advanced(resumed, resumeFor);
     note('resume: ${resumed.last.state.name} ${_span(resumed)}');
 
     await s.seek(Duration(seconds: seekTo));
-    final seek = await watch(s, 12);
+    final seek = await watch(s, seekFor);
     await screenshot('after_seek');
-    final landed = seek[5].position;
+    final landed = seek[landAfter].position;
     final landedOk = landed != null && (landed.inSeconds - seekTo).abs() <= 20;
-    final progressing = _advanced(seek.sublist(5), 7);
+    final progressing = _advanced(seek.sublist(landAfter), seekFor - landAfter);
     note(
-      'seek to $seekTo: +5s=${landed?.inSeconds}s, '
-      '+12s=${seek.last.position?.inSeconds}s, ${seek.last.state.name}',
+      'seek to $seekTo: +${landAfter}s=${landed?.inSeconds}s, '
+      '+${seekFor}s=${seek.last.position?.inSeconds}s, ${seek.last.state.name}',
     );
 
     final ok =
@@ -738,7 +781,10 @@ class _Ctx {
     };
     final taken = <String>{};
     final out = <_Sample>[];
-    for (var i = 1; i <= 26; i++) {
+    // Quick: stop once the 14.5–18.25 s cue has been on screen; the long
+    // cue only proves the track stays on, which the after-seek shot shows.
+    final watchFor = env.quick ? 20 : 26;
+    for (var i = 1; i <= watchFor; i++) {
       out.addAll(await watch(s, 1));
       final pos = out.last.position?.inMilliseconds;
       if (pos == null) continue;
@@ -752,10 +798,10 @@ class _Ctx {
         }
       }
     }
-    final played = _advanced(out, 26);
+    final played = _advanced(out, watchFor);
     note('play: ${_span(out)}');
     await s.seek(const Duration(seconds: 70));
-    await watch(s, 6);
+    await watch(s, env.quick ? 4 : 6);
     await screenshot('cue_after_seek');
     if (!played) return _Verdict.fail;
     note(
@@ -897,6 +943,9 @@ class _Env {
   final _FixtureServer server;
   final String? pin;
   final File credentialsFile;
+
+  /// `--quick`: roughly halves every watch window.
+  final bool quick;
   CastDevice? _dlna;
   CastDevice? _airplay;
 
@@ -907,6 +956,7 @@ class _Env {
     required this.server,
     required this.pin,
     required this.credentialsFile,
+    this.quick = false,
   });
 
   Future<CastDevice> dlnaDevice() async {
