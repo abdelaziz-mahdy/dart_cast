@@ -133,8 +133,12 @@ class CastMediaChannel {
       'requestId': nextRequestId(),
       'media': media,
       'autoplay': true,
-      'currentTime': startPosition ?? 0,
     };
+
+    // Omitted rather than sent as 0 when no start position was asked for:
+    // for live content the receiver then starts at the live edge, as the
+    // LOAD spec describes, instead of at the start of the DVR window.
+    if (startPosition != null) payload['currentTime'] = startPosition;
 
     if (activeTrackIds != null && activeTrackIds.isNotEmpty) {
       payload['activeTrackIds'] = activeTrackIds;

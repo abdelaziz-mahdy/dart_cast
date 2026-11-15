@@ -133,6 +133,20 @@ class ChromecastSession extends CastSession {
   Timer? _heartbeatTimer;
   StreamSubscription<dynamic>? _messageSubscription;
 
+  /// How often a PING goes to receiver-0.
+  final Duration _heartbeatInterval;
+
+  /// How long the channel may stay silent before the device is treated as
+  /// gone. The receiver answers every PING, so silence this long means the
+  /// TCP connection is half-open (TV powered off, Wi-Fi dropped).
+  final Duration _heartbeatTimeout;
+
+  /// How long [connect] waits for the Default Media Receiver to launch.
+  final Duration _connectTimeout;
+
+  /// Time since the last message of any kind arrived from the device.
+  final Stopwatch _sinceLastInbound = Stopwatch();
+
   /// Whether the heartbeat timer is currently active.
   bool get isHeartbeatActive => _heartbeatTimer?.isActive ?? false;
 
@@ -153,6 +167,9 @@ class ChromecastSession extends CastSession {
     MediaTransformer? mediaTransformer,
     this.enableReceiverDebugNamespaces = false,
   }) : _channel = _RealChannelAdapter(),
+       _heartbeatInterval = const Duration(seconds: 5),
+       _heartbeatTimeout = const Duration(seconds: 15),
+       _connectTimeout = const Duration(seconds: 15),
        _proxy = MediaProxy(),
        _mediaTransformer =
            mediaTransformer ?? const TsHlsMediaTransformer(wrapRemoteTs: true),
@@ -166,13 +183,21 @@ class ChromecastSession extends CastSession {
   /// created if not provided.
   /// [mediaTransformer] is an optional transformer; defaults to
   /// [TsHlsMediaTransformer].
+  /// [heartbeatInterval], [heartbeatTimeout] and [connectTimeout] shorten
+  /// the protocol timers so tests need not wait for the real values.
   ChromecastSession.withMocks({
     required CastDevice device,
     required dynamic channel,
     MediaProxy? proxy,
     MediaTransformer? mediaTransformer,
     this.enableReceiverDebugNamespaces = false,
+    Duration heartbeatInterval = const Duration(seconds: 5),
+    Duration heartbeatTimeout = const Duration(seconds: 15),
+    Duration connectTimeout = const Duration(seconds: 15),
   }) : _channel = _MockChannelAdapter(channel),
+       _heartbeatInterval = heartbeatInterval,
+       _heartbeatTimeout = heartbeatTimeout,
+       _connectTimeout = connectTimeout,
        _proxy = proxy ?? MediaProxy(),
        _mediaTransformer =
            mediaTransformer ?? const TsHlsMediaTransformer(wrapRemoteTs: true),
@@ -233,14 +258,26 @@ class ChromecastSession extends CastSession {
     );
 
     // 6. Wait for RECEIVER_STATUS with transportId
-    await completer.future.timeout(
-      const Duration(seconds: 15),
-      onTimeout: () {
-        CastLogger.error('Chromecast: connect timed out after 15s');
-        stateMachine.transitionTo(SessionState.disconnected);
-        throw TimeoutException('Chromecast connect timed out after 15 seconds');
-      },
-    );
+    try {
+      await completer.future.timeout(
+        _connectTimeout,
+        onTimeout: () {
+          CastLogger.error(
+            'Chromecast: connect timed out after '
+            '${_connectTimeout.inSeconds}s',
+          );
+          throw TimeoutException(
+            'Chromecast connect timed out after '
+            '${_connectTimeout.inSeconds} seconds',
+          );
+        },
+      );
+    } catch (_) {
+      // Without this the heartbeat keeps pinging an orphaned socket, and
+      // a retry on the same session starts a second heartbeat timer.
+      await _abortConnect();
+      rethrow;
+    }
 
     // 7. CONNECT to app transportId
     _channel.sendMessage(
@@ -773,6 +810,36 @@ class ChromecastSession extends CastSession {
     }
   }
 
+  /// Tears down a connect attempt that failed before the app was joined.
+  Future<void> _abortConnect() async {
+    _stopHeartbeat();
+    _transportId = null;
+    _sessionId = null;
+    stateMachine.transitionTo(SessionState.disconnected);
+    final subscription = _messageSubscription;
+    _messageSubscription = null;
+    try {
+      await Future.wait([
+        subscription?.cancel() ?? Future<void>.value(),
+        _channel.close(),
+      ]).timeout(const Duration(seconds: 3), onTimeout: () => []);
+    } catch (e) {
+      CastLogger.warning('Chromecast: cleanup error after failed connect: $e');
+    }
+  }
+
+  /// Called when the receiver closes our virtual connection, or reports
+  /// that the app this sender launched is no longer running (the user
+  /// exited it on the TV, or another sender launched a different app).
+  void _onAppClosed(String reason) {
+    if (stateMachine.state == SessionState.disconnected) return;
+    CastLogger.warning('Chromecast: receiver app closed ($reason)');
+    // The app's transport is gone, so disconnect() must not address it.
+    _transportId = null;
+    _sessionId = null;
+    unawaited(disconnect());
+  }
+
   /// Called when the TLS socket drops unexpectedly (stream error or done).
   /// Cleans up timers and transitions to disconnected so the UI can react.
   void _onSocketLost() {
@@ -801,7 +868,28 @@ class ChromecastSession extends CastSession {
   }
 
   void _startHeartbeat() {
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+    _stopHeartbeat();
+    _sinceLastInbound
+      ..reset()
+      ..start();
+    _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) {
+      if (_sinceLastInbound.elapsed > _heartbeatTimeout) {
+        CastLogger.warning(
+          'Chromecast: no message from the device for '
+          '${_sinceLastInbound.elapsed.inSeconds}s, treating it as gone',
+        );
+        if (stateMachine.state == SessionState.connecting) {
+          // connect() is still waiting; its timeout will clean up.
+          _stopHeartbeat();
+          return;
+        }
+        _onSocketLost();
+        final subscription = _messageSubscription;
+        _messageSubscription = null;
+        unawaited(subscription?.cancel());
+        unawaited(_channel.close().catchError((Object _) {}));
+        return;
+      }
       _channel.sendMessage(
         namespace: CastReceiverChannel.heartbeatNamespace,
         sourceId: _senderId,
@@ -839,7 +927,11 @@ class ChromecastSession extends CastSession {
   }
 
   void _handleMessage(dynamic msg, Completer<void> connectCompleter) {
+    _sinceLastInbound
+      ..reset()
+      ..start();
     final namespace = _getNamespace(msg);
+    final sourceId = _getSourceId(msg);
     final payload = _getPayload(msg);
     if (payload == null) return;
 
@@ -883,19 +975,61 @@ class ChromecastSession extends CastSession {
       }
     }
 
+    // Heartbeat: the device PINGs too and expects a PONG back.
+    if (namespace == CastReceiverChannel.heartbeatNamespace && type == 'PING') {
+      _channel.sendMessage(
+        namespace: CastReceiverChannel.heartbeatNamespace,
+        sourceId: _senderId,
+        destinationId: sourceId ?? _receiverId,
+        payload: CastReceiverChannel.buildPong(),
+      );
+      return;
+    }
+
+    // The receiver closed one of our virtual connections.
+    if (namespace == CastReceiverChannel.connectionNamespace &&
+        type == 'CLOSE') {
+      if (sourceId != null && sourceId == _transportId) {
+        _onAppClosed('CLOSE from $sourceId');
+      } else if (sourceId == _receiverId) {
+        _onAppClosed('CLOSE from $_receiverId');
+      }
+      return;
+    }
+
+    // LAUNCH failed — fail connect now instead of waiting for the timeout.
+    if (namespace == CastReceiverChannel.receiverNamespace &&
+        type == 'LAUNCH_ERROR') {
+      if (!connectCompleter.isCompleted) {
+        connectCompleter.completeError(
+          DeviceUnreachableException(
+            'Chromecast could not launch the Default Media Receiver'
+            '${_formatErrorDetail(payload)}',
+          ),
+        );
+      }
+      return;
+    }
+
     // Handle RECEIVER_STATUS — extract volume and session info
     if (namespace == CastReceiverChannel.receiverNamespace &&
-        payload['type'] == 'RECEIVER_STATUS') {
-      final status = CastReceiverChannel.parseReceiverStatus(payload);
-      if (status != null) {
-        // Always update volume from device state
-        updateVolume(status.volumeLevel);
+        type == 'RECEIVER_STATUS') {
+      final level = CastReceiverChannel.parseVolumeLevel(payload);
+      if (level != null) updateVolume(level);
 
-        // Complete connection if still connecting
-        if (!connectCompleter.isCompleted) {
+      if (!connectCompleter.isCompleted) {
+        // Only the Default Media Receiver we launched completes connect;
+        // a broadcast naming another running app (YouTube, …) does not.
+        final status = CastReceiverChannel.parseReceiverStatus(payload);
+        if (status != null) {
           _transportId = status.transportId;
           _sessionId = status.sessionId;
           connectCompleter.complete();
+        }
+      } else if (_sessionId != null) {
+        final running = CastReceiverChannel.runningSessionIds(payload);
+        if (running != null && !running.contains(_sessionId)) {
+          _onAppClosed('session $_sessionId no longer running');
         }
       }
     }
@@ -1202,6 +1336,16 @@ class ChromecastSession extends CastSession {
     }
     if (parts.isEmpty) return '';
     return ' [${parts.join(', ')}]';
+  }
+
+  String? _getSourceId(dynamic msg) {
+    if (msg is CastMessage) return msg.sourceId;
+    if (msg is Map) return msg['sourceId'] as String?;
+    try {
+      return (msg as dynamic).sourceId as String?;
+    } catch (_) {
+      return null;
+    }
   }
 
   String? _getNamespace(dynamic msg) {

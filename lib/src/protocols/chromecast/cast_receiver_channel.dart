@@ -85,6 +85,11 @@ class CastReceiverChannel {
     return jsonEncode({'type': 'PING'});
   }
 
+  /// Builds a PONG message, the answer to a PING from the device.
+  static String buildPong() {
+    return jsonEncode({'type': 'PONG'});
+  }
+
   // ---------------------------------------------------------------------------
   // Static builders with auto-generated requestId (use a shared counter)
   // ---------------------------------------------------------------------------
@@ -122,7 +127,7 @@ class CastReceiverChannel {
   /// Builds a SET_VOLUME message with a static request ID.
   static String buildSetVolume({double? level, bool? muted}) {
     final volume = <String, dynamic>{};
-    if (level != null) volume['level'] = level;
+    if (level != null) volume['level'] = clampVolumeLevel(level);
     if (muted != null) volume['muted'] = muted;
     return jsonEncode({
       'type': 'SET_VOLUME',
@@ -161,7 +166,7 @@ class CastReceiverChannel {
   /// Builds a SET_VOLUME message with an instance-scoped request ID.
   String buildSetVolumeWithId({double? level, bool? muted}) {
     final volume = <String, dynamic>{};
-    if (level != null) volume['level'] = level;
+    if (level != null) volume['level'] = clampVolumeLevel(level);
     if (muted != null) volume['muted'] = muted;
     return jsonEncode({
       'type': 'SET_VOLUME',
@@ -174,27 +179,73 @@ class CastReceiverChannel {
   // Parsers
   // ---------------------------------------------------------------------------
 
-  /// Parses a RECEIVER_STATUS payload and extracts app info and volume.
+  /// Parses a RECEIVER_STATUS payload and extracts the entry for [appId]
+  /// (the Default Media Receiver unless told otherwise) plus the volume.
   ///
-  /// Returns null if no applications are running.
-  static ReceiverStatusInfo? parseReceiverStatus(Map<String, dynamic> json) {
-    final status = json['status'] as Map<String, dynamic>?;
-    if (status == null) return null;
+  /// Returns null if [appId] is not among the running applications, or if
+  /// its entry lacks a transportId or sessionId. RECEIVER_STATUS is also
+  /// broadcast unprompted (requestId 0), for example on a volume change or
+  /// when another sender launches a different app, so the first entry is
+  /// not necessarily the app this sender launched.
+  static ReceiverStatusInfo? parseReceiverStatus(
+    Map<String, dynamic> json, {
+    String appId = defaultMediaReceiverAppId,
+  }) {
+    final status = json['status'];
+    if (status is! Map) return null;
 
-    final apps = status['applications'] as List?;
-    if (apps == null || apps.isEmpty) return null;
+    final apps = status['applications'];
+    if (apps is! List) return null;
 
-    final app = apps[0] as Map<String, dynamic>;
-    final volume = status['volume'] as Map<String, dynamic>?;
-
-    return ReceiverStatusInfo(
-      transportId: app['transportId'] as String,
-      sessionId: app['sessionId'] as String,
-      appId: app['appId'] as String,
-      volumeLevel: (volume?['level'] as num?)?.toDouble() ?? 1.0,
-      isMuted: (volume?['muted'] as bool?) ?? false,
-    );
+    for (final app in apps) {
+      if (app is! Map || app['appId'] != appId) continue;
+      final transportId = app['transportId'];
+      final sessionId = app['sessionId'];
+      if (transportId is! String || sessionId is! String) continue;
+      final volume = status['volume'];
+      return ReceiverStatusInfo(
+        transportId: transportId,
+        sessionId: sessionId,
+        appId: appId,
+        volumeLevel:
+            (volume is Map ? volume['level'] as num? : null)?.toDouble() ??
+            1.0,
+        isMuted: (volume is Map ? volume['muted'] as bool? : null) ?? false,
+      );
+    }
+    return null;
   }
+
+  /// Returns the device volume level from a RECEIVER_STATUS payload, or
+  /// null when the payload carries no volume.
+  static double? parseVolumeLevel(Map<String, dynamic> json) {
+    final status = json['status'];
+    if (status is! Map) return null;
+    final volume = status['volume'];
+    if (volume is! Map) return null;
+    return (volume['level'] as num?)?.toDouble();
+  }
+
+  /// Returns the session IDs of every application listed in a
+  /// RECEIVER_STATUS payload, or null when the payload carries no status.
+  ///
+  /// A status without an `applications` list means nothing is running.
+  static Set<String>? runningSessionIds(Map<String, dynamic> json) {
+    final status = json['status'];
+    if (status is! Map) return null;
+    final apps = status['applications'];
+    if (apps is! List) return <String>{};
+    return {
+      for (final app in apps)
+        if (app is Map && app['sessionId'] is String)
+          app['sessionId'] as String,
+    };
+  }
+
+  /// Clamps a volume level to the 0.0–1.0 range the receiver accepts.
+  /// NaN becomes 0.0.
+  static double clampVolumeLevel(double level) =>
+      level.isNaN ? 0.0 : level.clamp(0.0, 1.0).toDouble();
 
   /// Returns true if the message is a PONG heartbeat response.
   static bool isPong(Map<String, dynamic> json) {
