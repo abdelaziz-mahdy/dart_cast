@@ -1,5 +1,112 @@
+import 'dart:convert';
+
 /// Converts between subtitle formats (SRT <-> VTT).
 class SubtitleConverter {
+  /// Decodes subtitle file bytes to text.
+  ///
+  /// WebVTT must be UTF-8, but SRT files in the wild are often UTF-16 (with
+  /// a byte-order mark) or a legacy single-byte code page. Tries UTF-8,
+  /// then UTF-16 when a BOM says so, then Latin-1, so a non-UTF-8 file is
+  /// converted instead of failing the request. A leading BOM is dropped.
+  static String decodeText(List<int> bytes) {
+    if (bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
+      return _decodeUtf16(bytes.sublist(2), littleEndian: true);
+    }
+    if (bytes.length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
+      return _decodeUtf16(bytes.sublist(2), littleEndian: false);
+    }
+    var body = bytes;
+    if (body.length >= 3 &&
+        body[0] == 0xEF &&
+        body[1] == 0xBB &&
+        body[2] == 0xBF) {
+      body = body.sublist(3);
+    }
+    try {
+      return utf8.decode(body);
+    } on FormatException {
+      return latin1.decode(body);
+    }
+  }
+
+  static String _decodeUtf16(List<int> bytes, {required bool littleEndian}) {
+    final units = <int>[];
+    for (var i = 0; i + 1 < bytes.length; i += 2) {
+      units.add(
+        littleEndian
+            ? bytes[i] | (bytes[i + 1] << 8)
+            : (bytes[i] << 8) | bytes[i + 1],
+      );
+    }
+    return String.fromCharCodes(units);
+  }
+
+  /// SRT/VTT timestamp: optional hours, then minutes, seconds and a
+  /// fraction with either separator and loose digit counts.
+  static final _timestamp = RegExp(
+    r'(?:(\d+):)?(\d{1,2}):(\d{1,2})[,.](\d{1,3})',
+  );
+
+  /// Formats a timestamp as WebVTT requires: two-digit hours, minutes and
+  /// seconds, and exactly three fraction digits (`00:00:01.500`).
+  static String _vttTimestamp(Match m) {
+    final hours = (m[1] ?? '0').padLeft(2, '0');
+    final minutes = m[2]!.padLeft(2, '0');
+    final seconds = m[3]!.padLeft(2, '0');
+    final fraction = m[4]!.padRight(3, '0');
+    return '$hours:$minutes:$seconds.$fraction';
+  }
+
+  /// Tags WebVTT cue text understands; everything else that looks like a
+  /// tag in an SRT (`<font color=...>`) is dropped.
+  static final _keptTag = RegExp(r'^</?(i|b|u)>$', caseSensitive: false);
+
+  /// Rewrites one line of SRT cue text as valid WebVTT cue text: keeps
+  /// `<i>`, `<b>`, `<u>`, drops other tags and `{\an8}`-style overrides,
+  /// escapes stray `&` and `<`, and breaks up a literal `-->`, which the
+  /// WebVTT parser would read as a timing line.
+  static String _vttCueText(String line) {
+    final out = StringBuffer();
+    var i = 0;
+    while (i < line.length) {
+      final c = line[i];
+      if (c == '<') {
+        final close = line.indexOf('>', i);
+        if (close > i) {
+          final tag = line.substring(i, close + 1);
+          if (_keptTag.hasMatch(tag)) out.write(tag.toLowerCase());
+          if (RegExp(r'^</?[A-Za-z][^<>]*>$').hasMatch(tag)) {
+            i = close + 1;
+            continue;
+          }
+        }
+        out.write('&lt;');
+      } else if (c == '{' && line.startsWith(r'{\', i)) {
+        final close = line.indexOf('}', i);
+        if (close < 0) {
+          out.write(c);
+        } else {
+          i = close + 1;
+          continue;
+        }
+      } else if (c == '&') {
+        final entity = RegExp(r'&(#\d+|#x[0-9a-fA-F]+|[A-Za-z]+);');
+        final m = entity.matchAsPrefix(line, i);
+        out.write(m != null ? m[0] : '&amp;');
+        if (m != null) {
+          i += m[0]!.length;
+          continue;
+        }
+      } else if (c == '>') {
+        out.write('&gt;');
+      } else {
+        out.write(c);
+      }
+      i++;
+    }
+    return out.toString();
+  }
+
   /// Converts SRT content to WebVTT format.
   ///
   /// SRT format:
@@ -16,22 +123,34 @@ class SubtitleConverter {
   /// 00:00:01.000 --> 00:00:04.000
   /// Hello world
   /// ```
+  ///
+  /// Works cue by cue: only a number line directly above a timing line is
+  /// taken as a cue number, so a subtitle line that is just "42" or "1984"
+  /// survives. Timestamps are normalised to the WebVTT form, and cue text
+  /// is escaped so the WebVTT parser reads it as text.
   static String srtToVtt(String srt) {
-    final lines = srt.split('\n');
+    final normalized = srt
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n')
+        .replaceFirst(RegExp('^\uFEFF'), '');
     final vtt = StringBuffer('WEBVTT\n\n');
 
-    for (final line in lines) {
-      // Replace SRT comma timestamps with VTT dot timestamps
-      // SRT: 00:00:01,000 --> 00:00:04,000
-      // VTT: 00:00:01.000 --> 00:00:04.000
-      if (line.contains(' --> ')) {
-        vtt.writeln(line.replaceAll(',', '.'));
-      } else if (RegExp(r'^\d+$').hasMatch(line.trim())) {
-        // Skip sequence numbers (SRT has them, VTT doesn't need them)
-        continue;
-      } else {
-        vtt.writeln(line);
+    for (final block in normalized.split(RegExp(r'\n[ \t]*\n'))) {
+      final lines = block.split('\n');
+      final timingIndex = lines.indexWhere((l) => l.contains('-->'));
+      if (timingIndex < 0) continue; // not a cue
+      final timing = lines[timingIndex];
+      final arrow = timing.indexOf('-->');
+      final start = _timestamp.firstMatch(timing.substring(0, arrow));
+      final end = _timestamp.firstMatch(timing.substring(arrow + 3));
+      if (start == null || end == null) continue;
+
+      vtt.writeln('${_vttTimestamp(start)} --> ${_vttTimestamp(end)}');
+      for (final line in lines.skip(timingIndex + 1)) {
+        if (line.trim().isEmpty) continue;
+        vtt.writeln(_vttCueText(line).replaceAll('-->', '--&gt;'));
       }
+      vtt.writeln();
     }
     return vtt.toString();
   }
@@ -85,11 +204,13 @@ class SubtitleConverter {
     return srt.toString().trimRight();
   }
 
-  /// Detects if content is SRT format (starts with a number, not WEBVTT).
+  /// Detects if content is SRT format (starts with a cue number or a
+  /// timing line, not WEBVTT).
   static bool isSrt(String content) {
-    final trimmed = content.trimLeft();
-    return !trimmed.startsWith('WEBVTT') &&
-        RegExp(r'^\d+\s*\n').hasMatch(trimmed);
+    final trimmed = content.replaceFirst(RegExp('^\uFEFF'), '').trimLeft();
+    if (trimmed.startsWith('WEBVTT')) return false;
+    return RegExp(r'^\d+[ \t]*\r?\n').hasMatch(trimmed) ||
+        RegExp(r'^[\d:]+[,.]\d+[ \t]*-->').hasMatch(trimmed);
   }
 
   /// Strips `X-TIMESTAMP-MAP` from VTT content.

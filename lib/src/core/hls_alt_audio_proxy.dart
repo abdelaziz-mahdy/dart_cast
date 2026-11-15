@@ -101,7 +101,11 @@ class HlsAltAudioPlanner {
     required Map<String, String> headers,
     String? preferredAudioLanguage,
   }) async {
-    final masterContent = await _fetchString(masterUrl, headers);
+    // Relative URIs resolve against the URL the playlist actually came
+    // from, after redirects (RFC 3986 §5.1.3), not the one we asked for.
+    final master = await _fetchPlaylist(masterUrl, headers);
+    final masterContent = master.body;
+    final masterBase = master.finalUrl;
     if (!HlsParser.isMasterPlaylist(masterContent)) {
       CastLogger.debug(
         'HlsAltAudioPlanner: $masterUrl is not a master playlist — '
@@ -110,7 +114,7 @@ class HlsAltAudioPlanner {
       return null;
     }
 
-    final variants = HlsParser.extractVariants(masterContent, masterUrl);
+    final variants = HlsParser.extractVariantStreams(masterContent, masterBase);
     if (variants.isEmpty) {
       CastLogger.debug('HlsAltAudioPlanner: no variants in master — skipped');
       return null;
@@ -127,7 +131,7 @@ class HlsAltAudioPlanner {
 
     final renditions = HlsParser.extractAudioRenditions(
       masterContent,
-      masterUrl,
+      masterBase,
     );
     final usableRenditions =
         renditions
@@ -155,11 +159,17 @@ class HlsAltAudioPlanner {
     final variantUrl = variant.url;
     final audioUrl = pickedRendition.uri!;
     final results = await Future.wait([
-      _fetchString(variantUrl, headers),
-      _fetchString(audioUrl, headers),
+      _fetchPlaylist(variantUrl, headers),
+      _fetchPlaylist(audioUrl, headers),
     ]);
-    final videoSegments = HlsParser.extractSegmentUrls(results[0], variantUrl);
-    final audioSegments = HlsParser.extractSegmentUrls(results[1], audioUrl);
+    final videoSegments = HlsParser.extractSegmentUrls(
+      results[0].body,
+      results[0].finalUrl,
+    );
+    final audioSegments = HlsParser.extractSegmentUrls(
+      results[1].body,
+      results[1].finalUrl,
+    );
 
     if (videoSegments.isEmpty) {
       CastLogger.warning(
@@ -176,7 +186,7 @@ class HlsAltAudioPlanner {
     }
 
     // Parse durations from the variant playlist's #EXTINF lines.
-    final durations = _extractDurations(results[0]);
+    final durations = _extractDurations(results[0].body);
 
     final pairs = <HlsAltAudioSegmentPair>[];
     for (var i = 0; i < videoSegments.length; i++) {
@@ -190,11 +200,13 @@ class HlsAltAudioPlanner {
       );
     }
 
-    // CODECS — keep whatever the master advertised. The synthesised
-    // single muxed stream genuinely carries both codecs, so this is
-    // accurate.
-    final codecs = _extractCodecs(masterContent) ?? 'avc1.4D4028,mp4a.40.2';
-    final resolution = _extractResolution(masterContent);
+    // CODECS — keep what the master advertised for the variant we picked
+    // (RFC 8216 §4.3.4.2: CODECS describes that variant stream). The
+    // first CODECS in the file may belong to an I-frame playlist or a
+    // lower variant. The synthesised single muxed stream genuinely
+    // carries both codecs, so this is accurate.
+    final codecs = variant.codecs ?? 'avc1.4D4028,mp4a.40.2';
+    final resolution = variant.resolution;
 
     return HlsAltAudioPlan(
       upstreamMasterUrl: masterUrl,
@@ -233,26 +245,27 @@ class HlsAltAudioPlanner {
     return out;
   }
 
-  static String? _extractCodecs(String masterPlaylist) {
-    final re = RegExp(r'CODECS="([^"]*)"');
-    final m = re.firstMatch(masterPlaylist);
-    return m?.group(1);
-  }
-
-  static String? _extractResolution(String masterPlaylist) {
-    final re = RegExp(r'RESOLUTION=(\d+x\d+)');
-    final m = re.firstMatch(masterPlaylist);
-    return m?.group(1);
-  }
-
-  Future<String> _fetchString(String url, Map<String, String> headers) async {
-    final req = await _http.openUrl('GET', Uri.parse(url));
+  /// Fetches a playlist and returns its text with the URL it was finally
+  /// served from, which is the base for its relative URIs.
+  Future<({String body, String finalUrl})> _fetchPlaylist(
+    String url,
+    Map<String, String> headers,
+  ) async {
+    final uri = Uri.parse(url);
+    final req = await _http.openUrl('GET', uri);
     for (final e in headers.entries) {
       req.headers.set(e.key, e.value);
     }
     final res = await req.close();
     final bytes = await res.fold<List<int>>(<int>[], (a, c) => a..addAll(c));
-    return utf8.decode(bytes);
+    var finalUri = uri;
+    for (final redirect in res.redirects) {
+      finalUri = finalUri.resolveUri(redirect.location);
+    }
+    return (
+      body: utf8.decode(bytes, allowMalformed: true),
+      finalUrl: finalUri.toString(),
+    );
   }
 
   Future<List<int>> _fetchBytes(String url, Map<String, String> headers) async {

@@ -1,11 +1,70 @@
 /// HLS playlist parser with URL rewriting for proxy support.
 ///
 /// Handles both master (multivariant) and media playlists per RFC 8216.
+library;
+
+/// A media segment of an HLS media playlist (RFC 8216 §3).
+class HlsMediaSegment {
+  /// Absolute URL of the resource holding the segment.
+  final String url;
+
+  /// Duration from `#EXTINF`, in seconds; 0.0 when it does not parse.
+  final double duration;
+
+  /// Length in bytes of the sub-range when `#EXT-X-BYTERANGE` applies,
+  /// otherwise null (the segment is the whole resource).
+  final int? byteRangeLength;
+
+  /// Offset of the first byte of the sub-range; null without a byte range.
+  final int? byteRangeOffset;
+
+  /// Creates an [HlsMediaSegment].
+  const HlsMediaSegment({
+    required this.url,
+    required this.duration,
+    this.byteRangeLength,
+    this.byteRangeOffset,
+  });
+
+  /// The value for an HTTP `Range` request header that fetches exactly
+  /// this segment, or null when the segment is the whole resource.
+  String? get rangeHeader {
+    final length = byteRangeLength;
+    final offset = byteRangeOffset;
+    if (length == null || offset == null) return null;
+    return 'bytes=$offset-${offset + length - 1}';
+  }
+}
+
+/// A variant stream from an `#EXT-X-STREAM-INF` tag (RFC 8216 §4.3.4.2).
+class HlsVariantStream {
+  /// Absolute URL of the variant's media playlist.
+  final String url;
+
+  /// Peak bandwidth in bits per second; 0 when absent.
+  final int bandwidth;
+
+  /// `AUDIO` group ID, when audio comes from a separate rendition.
+  final String? audioGroup;
+
+  /// `CODECS` attribute of this variant.
+  final String? codecs;
+
+  /// `RESOLUTION` attribute of this variant, such as `1920x1080`.
+  final String? resolution;
+
+  /// Creates an [HlsVariantStream].
+  const HlsVariantStream({
+    required this.url,
+    required this.bandwidth,
+    this.audioGroup,
+    this.codecs,
+    this.resolution,
+  });
+}
+
 class HlsParser {
   HlsParser._();
-
-  /// Tags where the URI appears on the next line (Pattern A).
-  static const _nextLineUriTags = ['#EXT-X-STREAM-INF:', '#EXTINF:'];
 
   /// Tags where the URI is a quoted attribute (Pattern B).
   static const _attributeUriTags = [
@@ -15,10 +74,74 @@ class HlsParser {
     '#EXT-X-I-FRAME-STREAM-INF:',
     '#EXT-X-SESSION-KEY:',
     '#EXT-X-SESSION-DATA:',
+    // Low-Latency HLS (draft-pantos-hls-rfc8216bis §4.4.4.9, §4.4.5.2-3).
+    '#EXT-X-PART:',
+    '#EXT-X-PRELOAD-HINT:',
+    '#EXT-X-RENDITION-REPORT:',
   ];
 
-  /// Regex matching `URI="<value>"` attribute in a tag line.
-  static final _uriAttributeRegex = RegExp(r'URI="([^"]*)"');
+  /// Regex matching the `URI="<value>"` attribute in a tag line. Anchored
+  /// to an attribute boundary so a longer attribute name ending in `URI`
+  /// is not mistaken for it.
+  static final _uriAttributeRegex = RegExp(r'(?<=[:,])URI="([^"]*)"');
+
+  /// Parses an HLS attribute list (RFC 8216 §4.2) into name → value.
+  ///
+  /// Quoted-string values are returned without their quotes and may
+  /// contain commas. Attribute names are matched exactly, so
+  /// `AVERAGE-BANDWIDTH` is never read as `BANDWIDTH`.
+  static Map<String, String> parseAttributeList(String attributes) {
+    final result = <String, String>{};
+    var i = 0;
+    while (i < attributes.length) {
+      final eq = attributes.indexOf('=', i);
+      if (eq < 0) break;
+      final name = attributes.substring(i, eq).trim();
+      var j = eq + 1;
+      String value;
+      if (j < attributes.length && attributes[j] == '"') {
+        final close = attributes.indexOf('"', j + 1);
+        final end = close < 0 ? attributes.length : close;
+        value = attributes.substring(j + 1, end);
+        j = close < 0 ? attributes.length : close + 1;
+        final comma = attributes.indexOf(',', j);
+        j = comma < 0 ? attributes.length : comma + 1;
+      } else {
+        final comma = attributes.indexOf(',', j);
+        final end = comma < 0 ? attributes.length : comma;
+        value = attributes.substring(j, end).trim();
+        j = comma < 0 ? attributes.length : comma + 1;
+      }
+      if (name.isNotEmpty) result.putIfAbsent(name, () => value);
+      i = j;
+    }
+    return result;
+  }
+
+  /// The attribute list of a tag line such as `#EXT-X-STREAM-INF:...`.
+  static Map<String, String> _tagAttributes(String line) {
+    final colon = line.indexOf(':');
+    if (colon < 0) return const {};
+    return parseAttributeList(line.substring(colon + 1));
+  }
+
+  /// Whether a media playlist encrypts its segments (an `#EXT-X-KEY` with a
+  /// METHOD other than NONE). Such segments cannot be handed to a renderer
+  /// that is not given the key.
+  static bool isEncrypted(String content) {
+    for (final raw in content.split('\n')) {
+      final line = raw.trim();
+      if (!line.startsWith('#EXT-X-KEY:')) continue;
+      final method = _tagAttributes(line)['METHOD'];
+      if (method != null && method != 'NONE') return true;
+    }
+    return false;
+  }
+
+  /// Whether a media playlist uses fragmented-MP4 / CMAF segments, which
+  /// need the `#EXT-X-MAP` initialization section to decode.
+  static bool hasInitializationSection(String content) =>
+      content.contains('#EXT-X-MAP:');
 
   /// Detects whether [content] is a master (multivariant) playlist.
   ///
@@ -34,25 +157,20 @@ class HlsParser {
   /// Handles absolute URLs, protocol-relative, absolute-path, and
   /// relative-path references.
   static String resolveUrl(String url, String baseUrl) {
-    // Absolute URL — has scheme
+    // Absolute URL — has scheme. Returned untouched so its exact spelling
+    // (percent-encoding, query order) reaches the server as written.
     if (url.startsWith('http://') || url.startsWith('https://')) {
       return url;
     }
 
-    final base = Uri.parse(baseUrl);
-
-    // Protocol-relative
-    if (url.startsWith('//')) {
-      return '${base.scheme}:$url';
+    // Everything else, including protocol-relative and absolute-path
+    // references, follows RFC 3986 §5.2. Uri.resolve keeps IPv6 brackets
+    // and userinfo that hand-built strings would drop.
+    try {
+      return Uri.parse(baseUrl).resolve(url).toString();
+    } on FormatException {
+      return url;
     }
-
-    // Absolute path
-    if (url.startsWith('/')) {
-      return '${base.scheme}://${base.host}${base.hasPort ? ':${base.port}' : ''}$url';
-    }
-
-    // Relative path — resolve against base
-    return base.resolve(url).toString();
   }
 
   /// Rewrites all URLs in an HLS playlist to go through the proxy.
@@ -86,67 +204,58 @@ class HlsParser {
   ) {
     final lines = content.split('\n');
     final result = <String>[];
-    var expectUri = false;
-    var expectSegment = false; // true between #EXTINF and its URI
+    // RFC 8216 §4.1: every non-blank line not starting with '#' is a URI,
+    // and media segment tags such as #EXT-X-PROGRAM-DATE-TIME or
+    // #EXT-X-DISCONTINUITY may sit between #EXTINF and that URI. So the
+    // kind of the next URI is remembered across other tags and comments.
+    var nextUriIsSegment = false;
     var segmentIndex = 0;
+    // fMP4/CMAF playlists declare an initialization section first; their
+    // obfuscated segment URLs get an fMP4 hint instead of `.ts`.
+    var isFragmentedMp4 = false;
 
     for (final line in lines) {
-      // Empty lines pass through
-      if (line.trim().isEmpty) {
+      final trimmed = line.trim();
+      if (trimmed.isEmpty) {
         result.add(line);
         continue;
       }
 
-      // Check Pattern A: tags where next line is the URI
-      if (_isNextLineUriTag(line)) {
-        result.add(line);
-        expectUri = true;
-        expectSegment = line.startsWith('#EXTINF:');
-        continue;
-      }
-
-      // #EXT-X-BYTERANGE can appear between #EXTINF and the segment URI
-      if (line.startsWith('#EXT-X-BYTERANGE:') && expectUri) {
-        result.add(line);
-        continue;
-      }
-
-      // Check Pattern B: tags with URI="..." attribute
-      if (_isAttributeUriTag(line)) {
-        result.add(_rewriteUriAttribute(line, baseUrl, proxyBaseUrl, token));
-        continue;
-      }
-
-      // Non-tag, non-empty line while expecting URI — this is a segment/variant URI
-      if (expectUri && !line.startsWith('#')) {
-        final resolved = resolveUrl(line.trim(), baseUrl);
-        if (expectSegment) {
-          segmentIndex++;
-          result.add(
-            _buildSegmentProxyUrl(proxyBaseUrl, token, resolved, segmentIndex),
-          );
-        } else {
-          result.add(_buildProxyUrl(proxyBaseUrl, token, resolved));
+      if (trimmed.startsWith('#')) {
+        if (trimmed.startsWith('#EXTINF:')) {
+          nextUriIsSegment = true;
+        } else if (trimmed.startsWith('#EXT-X-MAP:')) {
+          isFragmentedMp4 = true;
+        } else if (trimmed.startsWith('#EXT-X-STREAM-INF:')) {
+          nextUriIsSegment = false;
         }
-        expectUri = false;
-        expectSegment = false;
+        if (_isAttributeUriTag(trimmed)) {
+          result.add(_rewriteUriAttribute(line, baseUrl, proxyBaseUrl, token));
+        } else {
+          result.add(line);
+        }
         continue;
       }
 
-      // Any other line (tags, comments)
-      result.add(line);
-      expectUri = false;
-      expectSegment = false;
+      final resolved = resolveUrl(trimmed, baseUrl);
+      if (nextUriIsSegment) {
+        segmentIndex++;
+        result.add(
+          _buildSegmentProxyUrl(
+            proxyBaseUrl,
+            token,
+            resolved,
+            segmentIndex,
+            _segmentExtension(resolved, isFragmentedMp4: isFragmentedMp4),
+          ),
+        );
+      } else {
+        result.add(_buildProxyUrl(proxyBaseUrl, token, resolved));
+      }
+      nextUriIsSegment = false;
     }
 
     return result.join('\n');
-  }
-
-  static bool _isNextLineUriTag(String line) {
-    for (final tag in _nextLineUriTags) {
-      if (line.startsWith(tag)) return true;
-    }
-    return false;
   }
 
   static bool _isAttributeUriTag(String line) {
@@ -170,52 +279,22 @@ class HlsParser {
 
     final originalUri = match.group(1)!;
     final resolved = resolveUrl(originalUri, baseUrl);
+    // Only http(s) can be fetched through the proxy. Key URIs such as
+    // `data:` (inline key material) and `skd://` (FairPlay) are handed to
+    // the player's own key system and must pass through untouched.
+    final scheme = Uri.tryParse(resolved)?.scheme.toLowerCase();
+    if (scheme != 'http' && scheme != 'https') return line;
     final proxied = _buildProxyUrl(proxyBaseUrl, token, resolved);
-    return line.replaceFirst('URI="$originalUri"', 'URI="$proxied"');
+    return line.replaceRange(match.start, match.end, 'URI="$proxied"');
   }
 
   /// Extract segment URLs from a media playlist.
   ///
-  /// Parses `#EXTINF` lines and collects the next-line URIs,
+  /// Parses `#EXTINF` lines and collects the URI of each segment,
   /// resolving them against [baseUrl].
-  static List<String> extractSegmentUrls(String content, String baseUrl) {
-    final lines = content.split('\n');
-    final segments = <String>[];
-    var expectUri = false;
-
-    for (final line in lines) {
-      final trimmed = line.trim();
-      if (trimmed.isEmpty) continue;
-
-      if (trimmed.startsWith('#EXTINF:')) {
-        expectUri = true;
-        continue;
-      }
-
-      // #EXT-X-BYTERANGE can appear between #EXTINF and the segment URI
-      if (trimmed.startsWith('#EXT-X-BYTERANGE:') && expectUri) {
-        continue;
-      }
-
-      if (expectUri && !trimmed.startsWith('#')) {
-        segments.add(resolveUrl(trimmed, baseUrl));
-        expectUri = false;
-        continue;
-      }
-
-      if (trimmed.startsWith('#')) {
-        // Other tags reset expectUri unless it's a byterange
-        if (!trimmed.startsWith('#EXT-X-BYTERANGE:')) {
-          expectUri = false;
-        }
-        continue;
-      }
-
-      expectUri = false;
-    }
-
-    return segments;
-  }
+  static List<String> extractSegmentUrls(String content, String baseUrl) => [
+    for (final segment in extractMediaSegments(content, baseUrl)) segment.url,
+  ];
 
   /// Extracts segment URLs together with their `#EXTINF` durations.
   ///
@@ -223,49 +302,81 @@ class HlsParser {
   /// the segment's declared duration in seconds. A segment whose `#EXTINF`
   /// cannot be parsed gets `0.0`, which keeps the list aligned with
   /// [extractSegmentUrls] rather than silently dropping entries.
+  ///
+  /// Byte ranges are not reported here; use [extractMediaSegments] when the
+  /// playlist may contain `#EXT-X-BYTERANGE`.
   static List<({String url, double duration})> extractSegments(
     String content,
     String baseUrl,
-  ) {
-    final lines = content.split('\n');
-    final segments = <({String url, double duration})>[];
-    var expectUri = false;
-    var pendingDuration = 0.0;
+  ) => [
+    for (final segment in extractMediaSegments(content, baseUrl))
+      (url: segment.url, duration: segment.duration),
+  ];
 
-    for (final line in lines) {
+  /// Extracts every media segment of a media playlist (RFC 8216 §4.3.2).
+  ///
+  /// Each segment's URI is the first non-blank, non-`#` line after its
+  /// `#EXTINF`; other media segment tags and comments may come between
+  /// them. `#EXT-X-BYTERANGE` sub-ranges are carried on the segment, with
+  /// a missing offset taken as the byte after the previous sub-range of
+  /// the same resource (§4.3.2.2).
+  static List<HlsMediaSegment> extractMediaSegments(
+    String content,
+    String baseUrl,
+  ) {
+    final segments = <HlsMediaSegment>[];
+    var inSegment = false;
+    var pendingDuration = 0.0;
+    int? pendingLength;
+    int? pendingOffset;
+    String? lastRangeUrl;
+    var lastRangeEnd = 0;
+
+    for (final line in content.split('\n')) {
       final trimmed = line.trim();
       if (trimmed.isEmpty) continue;
 
       if (trimmed.startsWith('#EXTINF:')) {
-        expectUri = true;
+        inSegment = true;
         // "#EXTINF:10.5,title" — the duration ends at the comma.
         final value = trimmed.substring('#EXTINF:'.length).split(',').first;
         pendingDuration = double.tryParse(value.trim()) ?? 0.0;
         continue;
       }
 
-      if (trimmed.startsWith('#EXT-X-BYTERANGE:') && expectUri) {
+      if (trimmed.startsWith('#EXT-X-BYTERANGE:')) {
+        final spec = trimmed.substring('#EXT-X-BYTERANGE:'.length).trim();
+        final at = spec.indexOf('@');
+        pendingLength = int.tryParse(at < 0 ? spec : spec.substring(0, at));
+        pendingOffset = at < 0 ? null : int.tryParse(spec.substring(at + 1));
         continue;
       }
 
-      if (expectUri && !trimmed.startsWith('#')) {
-        segments.add((
-          url: resolveUrl(trimmed, baseUrl),
-          duration: pendingDuration,
-        ));
-        expectUri = false;
-        pendingDuration = 0.0;
-        continue;
-      }
+      if (trimmed.startsWith('#')) continue;
 
-      if (trimmed.startsWith('#')) {
-        if (!trimmed.startsWith('#EXT-X-BYTERANGE:')) {
-          expectUri = false;
+      if (inSegment) {
+        final url = resolveUrl(trimmed, baseUrl);
+        int? length;
+        int? offset;
+        if (pendingLength != null) {
+          length = pendingLength;
+          offset = pendingOffset ?? (lastRangeUrl == url ? lastRangeEnd : 0);
+          lastRangeUrl = url;
+          lastRangeEnd = offset + length;
         }
-        continue;
+        segments.add(
+          HlsMediaSegment(
+            url: url,
+            duration: pendingDuration,
+            byteRangeLength: length,
+            byteRangeOffset: offset,
+          ),
+        );
       }
-
-      expectUri = false;
+      inSegment = false;
+      pendingDuration = 0.0;
+      pendingLength = null;
+      pendingOffset = null;
     }
 
     return segments;
@@ -307,33 +418,40 @@ class HlsParser {
   /// `EXT-X-MEDIA:TYPE=AUDIO`. A non-null `audioGroup` means the variant
   /// playlist is video-only and audio lives in a separate playlist.
   static List<({String url, int bandwidth, String? audioGroup})>
-  extractVariants(String content, String baseUrl) {
+  extractVariants(String content, String baseUrl) => [
+    for (final v in extractVariantStreams(content, baseUrl))
+      (url: v.url, bandwidth: v.bandwidth, audioGroup: v.audioGroup),
+  ];
+
+  /// Like [extractVariants], but also returns each variant's own `CODECS`
+  /// and `RESOLUTION`, read from the same `#EXT-X-STREAM-INF` tag.
+  static List<HlsVariantStream> extractVariantStreams(
+    String content,
+    String baseUrl,
+  ) {
     final lines = content.split('\n');
-    final variants = <({String url, int bandwidth, String? audioGroup})>[];
+    final variants = <HlsVariantStream>[];
 
     for (var i = 0; i < lines.length; i++) {
       final line = lines[i].trim();
-      if (line.startsWith('#EXT-X-STREAM-INF:')) {
-        // Extract BANDWIDTH
-        final bwMatch = RegExp(r'BANDWIDTH=(\d+)').firstMatch(line);
-        final bandwidth = bwMatch != null ? int.parse(bwMatch.group(1)!) : 0;
+      if (!line.startsWith('#EXT-X-STREAM-INF:')) continue;
+      final attributes = _tagAttributes(line);
 
-        // Extract AUDIO group reference, if present.
-        final audioMatch = RegExp(r'AUDIO="([^"]*)"').firstMatch(line);
-        final audioGroup = audioMatch?.group(1);
-
-        // Next non-empty, non-comment line is the URI
-        for (var j = i + 1; j < lines.length; j++) {
-          final nextLine = lines[j].trim();
-          if (nextLine.isEmpty) continue;
-          if (nextLine.startsWith('#')) continue;
-          variants.add((
+      // Next non-empty, non-comment line is the URI
+      for (var j = i + 1; j < lines.length; j++) {
+        final nextLine = lines[j].trim();
+        if (nextLine.isEmpty) continue;
+        if (nextLine.startsWith('#')) continue;
+        variants.add(
+          HlsVariantStream(
             url: resolveUrl(nextLine, baseUrl),
-            bandwidth: bandwidth,
-            audioGroup: audioGroup,
-          ));
-          break;
-        }
+            bandwidth: int.tryParse(attributes['BANDWIDTH'] ?? '') ?? 0,
+            audioGroup: attributes['AUDIO'],
+            codecs: attributes['CODECS'],
+            resolution: attributes['RESOLUTION'],
+          ),
+        );
+        break;
       }
     }
 
@@ -352,21 +470,17 @@ class HlsParser {
     final renditions =
         <({String groupId, String name, String? uri, bool isDefault})>[];
 
-    final groupRe = RegExp(r'GROUP-ID="([^"]*)"');
-    final nameRe = RegExp(r'NAME="([^"]*)"');
-    final defaultRe = RegExp(r'DEFAULT=(YES|NO)');
-
     for (final raw in content.split('\n')) {
       final line = raw.trim();
       if (!line.startsWith('#EXT-X-MEDIA:')) continue;
-      if (!line.contains('TYPE=AUDIO')) continue;
+      final attributes = _tagAttributes(line);
+      if (attributes['TYPE'] != 'AUDIO') continue;
 
-      final groupId = groupRe.firstMatch(line)?.group(1);
-      final name = nameRe.firstMatch(line)?.group(1);
-      final uriMatch = _uriAttributeRegex.firstMatch(line);
-      final uri =
-          uriMatch != null ? resolveUrl(uriMatch.group(1)!, baseUrl) : null;
-      final isDefault = defaultRe.firstMatch(line)?.group(1) == 'YES';
+      final groupId = attributes['GROUP-ID'];
+      final name = attributes['NAME'];
+      final rawUri = attributes['URI'];
+      final uri = rawUri != null ? resolveUrl(rawUri, baseUrl) : null;
+      final isDefault = attributes['DEFAULT'] == 'YES';
 
       renditions.add((
         groupId: groupId ?? '',
@@ -388,16 +502,40 @@ class HlsParser {
     return '$proxyBaseUrl/stream/$token?url=${Uri.encodeComponent(originalUrl)}';
   }
 
-  /// Constructs a segment proxy URL whose *path* ends in `.ts`, satisfying
-  /// the Chromecast / Shaka URL-extension capability probe even when the
-  /// upstream URL ends in `.jpg`, `.bin`, or another non-media extension.
+  /// Segment extensions whose media type a player can infer correctly, so
+  /// they are kept in the proxy path as-is.
+  static const _mediaSegmentExtensions = {
+    'ts', 'm4s', 'mp4', 'm4v', 'm4a', 'aac', 'ac3', 'ec3', 'mp3', //
+    'vtt', 'webvtt', 'cmfv', 'cmfa', 'cmft',
+  };
+
+  /// The extension for a segment's proxy path: its own when it names a
+  /// media type, otherwise `.m4s` for fMP4 playlists and `.ts` for the rest
+  /// (the obfuscated `.jpg`/`.bin`/no-extension case the hint exists for).
+  static String _segmentExtension(String url, {required bool isFragmentedMp4}) {
+    final path = Uri.tryParse(url)?.path ?? url;
+    final slash = path.lastIndexOf('/');
+    final name = path.substring(slash + 1);
+    final dot = name.lastIndexOf('.');
+    if (dot > 0) {
+      final ext = name.substring(dot + 1).toLowerCase();
+      if (_mediaSegmentExtensions.contains(ext)) return ext;
+    }
+    return isFragmentedMp4 ? 'm4s' : 'ts';
+  }
+
+  /// Constructs a segment proxy URL whose *path* ends in a media extension,
+  /// satisfying the Chromecast / Shaka URL-extension capability probe even
+  /// when the upstream URL ends in `.jpg`, `.bin`, or another non-media
+  /// extension, without mislabelling fMP4, audio or WebVTT segments as TS.
   static String _buildSegmentProxyUrl(
     String proxyBaseUrl,
     String token,
     String originalUrl,
     int segmentIndex,
+    String extension,
   ) {
-    return '$proxyBaseUrl/stream/$token/seg$segmentIndex.ts'
+    return '$proxyBaseUrl/stream/$token/seg$segmentIndex.$extension'
         '?url=${Uri.encodeComponent(originalUrl)}';
   }
 }

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:dart_cast/src/protocols/airplay/auth/binary_plist.dart';
 import 'package:dart_cast/src/protocols/airplay/plist_codec.dart';
@@ -383,6 +384,71 @@ void main() {
         expect(info.features, 0);
         expect(info.model, '');
       });
+    });
+  });
+
+  group('PlistCodec XML edge cases', () {
+    String wrap(String inner) =>
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<plist version="1.0"><dict>$inner</dict></plist>';
+
+    test('self-closing <array/> is an empty list, not the next key', () {
+      final map = PlistCodec.parseXmlPlist(
+        wrap(
+          '<key>loadedTimeRanges</key><array/>'
+          '<key>playbackBufferEmpty</key><true/>',
+        ),
+      );
+      expect(map['loadedTimeRanges'], equals(<dynamic>[]));
+      expect(map['playbackBufferEmpty'], isTrue);
+    });
+
+    test('self-closing <dict/>, <string/> and <data/> produce values', () {
+      final map = PlistCodec.parseXmlPlist(
+        wrap(
+          '<key>d</key><dict/>'
+          '<key>s</key><string/>'
+          '<key>b</key><data/>'
+          '<key>rate</key><real>1</real>',
+        ),
+      );
+      expect(map['d'], equals(<String, dynamic>{}));
+      expect(map['s'], equals(''));
+      expect(map['b'], isA<Uint8List>());
+      expect(map['b'], isEmpty);
+      expect(map['rate'], equals(1.0));
+    });
+
+    test('<data> decodes base64 and <date> decodes to DateTime', () {
+      final map = PlistCodec.parseXmlPlist(
+        wrap(
+          '<key>blob</key><data>\n\tAQID\n</data>'
+          '<key>when</key><date>2024-01-02T03:04:05Z</date>'
+          '<key>after</key><integer>7</integer>',
+        ),
+      );
+      expect(map['blob'], equals([1, 2, 3]));
+      expect(map['when'], equals(DateTime.utc(2024, 1, 2, 3, 4, 5)));
+      expect(map['after'], equals(7));
+    });
+
+    test('entities are unescaped in strings and keys', () {
+      final map = PlistCodec.parseXmlPlist(
+        wrap(
+          '<key>a&amp;b</key><string>a&amp;b</string>'
+          '<key>x</key><string>&lt;tag&gt; &quot;q&quot; &apos;s&apos; '
+          '&#65;&#x42;</string>',
+        ),
+      );
+      expect(map['a&b'], equals('a&b'));
+      expect(map['x'], equals('<tag> "q" \'s\' AB'));
+    });
+
+    test('empty arrays inside arrays keep their position', () {
+      final map = PlistCodec.parseXmlPlist(
+        wrap('<key>l</key><array><array/><integer>1</integer></array>'),
+      );
+      expect(map['l'], equals([<dynamic>[], 1]));
     });
   });
 }

@@ -40,6 +40,13 @@ class TsDvbStripper {
     0x001F, // SIT  — Selection Information Table
   };
 
+  /// PIDs the stream's own PAT/PMT assign to a PMT, an elementary stream
+  /// or the PCR. ISO/IEC 13818-1 Table 2-3 lets a non-DVB multiplex put
+  /// those on 0x0010–0x001F too, so a PID listed here is never dropped
+  /// even when it is also in [dvbPids].
+  final Set<int> _programPids = {};
+  final Set<int> _pmtPids = {};
+
   /// Bytes carried over from the previous chunk that didn't form a
   /// complete TS packet on their own.
   final List<int> _carry = [];
@@ -98,7 +105,12 @@ class TsDvbStripper {
       }
       pidCounts[pid] = (pidCounts[pid] ?? 0) + 1;
 
-      if (dvbPids.contains(pid)) {
+      final payloadUnitStart = (buf[i + 1] & 0x40) != 0;
+      if (payloadUnitStart && (pid == 0 || _pmtPids.contains(pid))) {
+        _readProgramTable(buf, i, pid);
+      }
+
+      if (dvbPids.contains(pid) && !_programPids.contains(pid)) {
         packetsDropped++;
       } else {
         packetsKept++;
@@ -113,6 +125,48 @@ class TsDvbStripper {
       _carry.addAll(buf.getRange(i, buf.length));
     }
     return output;
+  }
+
+  /// Records the PMT PIDs from a PAT, or the elementary and PCR PIDs from
+  /// a PMT, when the section starts in the packet at [start]. Sections
+  /// spanning several packets are rare for PAT/PMT and are left unread;
+  /// the packets then follow the plain [dvbPids] rule.
+  void _readProgramTable(List<int> buf, int start, int pid) {
+    final end = start + packetSize;
+    final afc = (buf[start + 3] >> 4) & 0x3;
+    if (afc == 0 || afc == 2) return; // no payload
+    var p = start + 4;
+    if (afc == 3) p += 1 + buf[p]; // skip adaptation field
+    if (p >= end) return;
+    p += 1 + buf[p]; // pointer_field
+    if (p + 3 > end) return;
+    final tableId = buf[p];
+    final sectionLength = ((buf[p + 1] & 0x0F) << 8) | buf[p + 2];
+    final sectionEnd = p + 3 + sectionLength - 4; // exclude CRC_32
+    if (sectionEnd > end) return;
+
+    if (pid == 0 && tableId == 0x00) {
+      // program_association_section: 8 bytes header, then 4-byte loops.
+      for (var q = p + 8; q + 4 <= sectionEnd; q += 4) {
+        final programNumber = (buf[q] << 8) | buf[q + 1];
+        final mapPid = ((buf[q + 2] & 0x1F) << 8) | buf[q + 3];
+        if (programNumber != 0) {
+          _pmtPids.add(mapPid);
+          _programPids.add(mapPid);
+        }
+      }
+    } else if (tableId == 0x02) {
+      // TS_program_map_section.
+      if (p + 12 > sectionEnd) return;
+      _programPids.add(((buf[p + 8] & 0x1F) << 8) | buf[p + 9]); // PCR_PID
+      final programInfoLength = ((buf[p + 10] & 0x0F) << 8) | buf[p + 11];
+      var q = p + 12 + programInfoLength;
+      while (q + 5 <= sectionEnd) {
+        _programPids.add(((buf[q + 1] & 0x1F) << 8) | buf[q + 2]);
+        final esInfoLength = ((buf[q + 3] & 0x0F) << 8) | buf[q + 4];
+        q += 5 + esInfoLength;
+      }
+    }
   }
 
   /// Final byte flush. Returns any leftover bytes that didn't form a

@@ -37,6 +37,7 @@ class TsKeyframeScanner {
       if (fileOffset >= fileLength) return offsets;
       raf.setPositionSync(fileOffset);
 
+      int? videoPid;
       while (fileOffset < fileLength) {
         final remaining = fileLength - fileOffset;
         final toRead = remaining < chunkSize ? remaining : chunkSize;
@@ -48,9 +49,34 @@ class TsKeyframeScanner {
           if (chunk[pos] != 0x47) continue; // Skip if not sync byte
 
           final packetOffset = fileOffset + pos;
+          final pid = ((chunk[pos + 1] & 0x1F) << 8) | chunk[pos + 2];
+          final adaptCtrl = (chunk[pos + 3] >> 4) & 0x03;
+          final pusi = (chunk[pos + 1] >> 6) & 0x01;
+
+          // Find where a new video PES starts in this packet, if any, and
+          // learn the video PID from it. random_access_indicator is set by
+          // muxers on audio frames too (ISO/IEC 13818-1 §2.4.3.5 leaves it
+          // to each elementary stream), so a segment must only ever start
+          // on the video PID.
+          int? pesStart;
+          if ((adaptCtrl == 1 || adaptCtrl == 3) && pusi == 1) {
+            var payloadStart = pos + 4;
+            if (adaptCtrl == 3) payloadStart += 1 + chunk[pos + 4];
+            if (payloadStart + 9 < pos + 188 &&
+                chunk[payloadStart] == 0x00 &&
+                chunk[payloadStart + 1] == 0x00 &&
+                chunk[payloadStart + 2] == 0x01) {
+              final streamId = chunk[payloadStart + 3];
+              // Video stream IDs: 0xE0-0xEF
+              if (streamId >= 0xE0 && streamId <= 0xEF) {
+                videoPid ??= pid;
+                if (pid == videoPid) pesStart = payloadStart;
+              }
+            }
+          }
+          if (videoPid != null && pid != videoPid) continue;
 
           // Method 1: Check random_access_indicator in adaptation field
-          final adaptCtrl = (chunk[pos + 3] >> 4) & 0x03;
           if (adaptCtrl >= 2) {
             final adaptLen = chunk[pos + 4];
             if (adaptLen > 0) {
@@ -62,52 +88,20 @@ class TsKeyframeScanner {
             }
           }
 
-          // Method 2: Check for H.264 IDR NAL unit in payload
-          // Only check packets with payload (adaptCtrl == 1 or 3)
-          // and payload_unit_start_indicator set (new PES packet)
-          if (adaptCtrl == 1 || adaptCtrl == 3) {
-            final pusi = (chunk[pos + 1] >> 6) & 0x01;
-            if (pusi == 1) {
-              // Find payload start
-              int payloadStart = pos + 4;
-              if (adaptCtrl == 3) {
-                payloadStart += 1 + chunk[pos + 4]; // skip adaptation field
-              }
-
-              // Check for PES header (0x00 0x00 0x01) followed by video stream
-              if (payloadStart + 9 < pos + 188) {
-                if (chunk[payloadStart] == 0x00 &&
-                    chunk[payloadStart + 1] == 0x00 &&
-                    chunk[payloadStart + 2] == 0x01) {
-                  final streamId = chunk[payloadStart + 3];
-                  // Video stream IDs: 0xE0-0xEF
-                  if (streamId >= 0xE0 && streamId <= 0xEF) {
-                    // Scan payload for H.264 NAL start code + IDR type
-                    for (int j = payloadStart + 9; j + 4 < pos + 188; j++) {
-                      if (chunk[j] == 0x00 &&
-                          chunk[j + 1] == 0x00 &&
-                          chunk[j + 2] == 0x01) {
-                        final nalType = chunk[j + 3] & 0x1F;
-                        // NAL type 5 = IDR slice (keyframe)
-                        if (nalType == 5 && packetOffset > 0) {
-                          offsets.add(packetOffset);
-                          break;
-                        }
-                      }
-                      // Also check 4-byte start code (0x00 0x00 0x00 0x01)
-                      if (j + 5 < pos + 188 &&
-                          chunk[j] == 0x00 &&
-                          chunk[j + 1] == 0x00 &&
-                          chunk[j + 2] == 0x00 &&
-                          chunk[j + 3] == 0x01) {
-                        final nalType = chunk[j + 4] & 0x1F;
-                        if (nalType == 5 && packetOffset > 0) {
-                          offsets.add(packetOffset);
-                          break;
-                        }
-                      }
-                    }
-                  }
+          // Method 2: Check for H.264 IDR NAL unit in the PES payload,
+          // which starts after the 9-byte PES header and its
+          // PES_header_data_length bytes of optional fields (PTS/DTS).
+          if (pesStart != null) {
+            final dataStart = pesStart + 9 + chunk[pesStart + 8];
+            for (int j = dataStart; j + 4 < pos + 188; j++) {
+              if (chunk[j] == 0x00 &&
+                  chunk[j + 1] == 0x00 &&
+                  chunk[j + 2] == 0x01) {
+                final nalType = chunk[j + 3] & 0x1F;
+                // NAL type 5 = IDR slice (keyframe)
+                if (nalType == 5 && packetOffset > 0) {
+                  offsets.add(packetOffset);
+                  break;
                 }
               }
             }
@@ -200,7 +194,11 @@ class TsKeyframeScanner {
                     chunk[payloadStart + 2] == 0x01) {
                   final streamId = chunk[payloadStart + 3];
                   if (streamId >= 0xE0 && streamId <= 0xEF) {
-                    for (int j = payloadStart + 9; j + 4 < pos + 188; j++) {
+                    // NAL data starts after the PES header's optional
+                    // fields (PES_header_data_length at byte 8).
+                    final dataStart =
+                        payloadStart + 9 + chunk[payloadStart + 8];
+                    for (int j = dataStart; j + 4 < pos + 188; j++) {
                       if (chunk[j] == 0x00 &&
                           chunk[j + 1] == 0x00 &&
                           chunk[j + 2] == 0x01) {

@@ -437,4 +437,80 @@ void main() {
       );
     });
   });
+
+  group('BinaryPlist type fidelity', () {
+    test('ints and doubles of equal value keep their own types', () {
+      final decoded = _roundtrip({
+        'Start-Position-Seconds': 0.0,
+        'streamType': 1,
+        'playbackRestrictions': 0,
+        'volume': 1.0,
+        'rate': 1.0,
+      });
+
+      expect(decoded['Start-Position-Seconds'], isA<double>());
+      expect(decoded['Start-Position-Seconds'], equals(0.0));
+      expect(decoded['streamType'], isA<int>());
+      expect(decoded['streamType'], equals(1));
+      expect(decoded['playbackRestrictions'], isA<int>());
+      expect(decoded['playbackRestrictions'], equals(0));
+      expect(decoded['volume'], isA<double>());
+      expect(decoded['rate'], isA<double>());
+    });
+
+    test('int, double and bool in one array keep their types', () {
+      final decoded = _roundtrip({
+        'a': [1, 1.0, true, 0, 0.0, false],
+      });
+      final list = decoded['a'] as List;
+      expect(list[0], isA<int>());
+      expect(list[1], isA<double>());
+      expect(list[2], isTrue);
+      expect(list[3], isA<int>());
+      expect(list[4], isA<double>());
+      expect(list[5], isFalse);
+    });
+
+    test('NaN encodes and decodes as NaN', () {
+      final decoded = _roundtrip({'x': double.nan, 'y': double.nan});
+      expect((decoded['x'] as double).isNaN, isTrue);
+      expect((decoded['y'] as double).isNaN, isTrue);
+    });
+
+    test('Uint8List encodes as plist data (0x4N) and round-trips', () {
+      final encoded = BinaryPlistEncoder.encode({
+        'd': Uint8List.fromList([1, 2]),
+      });
+      var found = false;
+      for (var i = 0; i + 2 < encoded.length; i++) {
+        if (encoded[i] == 0x42 &&
+            encoded[i + 1] == 0x01 &&
+            encoded[i + 2] == 0x02) {
+          found = true;
+        }
+      }
+      expect(found, isTrue, reason: 'expected data marker 0x42 01 02');
+
+      final decoded = BinaryPlistDecoder.decode(encoded);
+      expect(decoded['d'], isA<Uint8List>());
+      expect(decoded['d'], equals([1, 2]));
+    });
+
+    test('decodes a UID object instead of failing', () {
+      final bytes = Uint8List.fromList([
+        ...ascii.encode('bplist00'),
+        0xD1, 0x01, 0x02, // dict {obj1: obj2}
+        0x51, 0x75, // "u"
+        0x80, 0x05, // UID 5
+        8, 11, 13, // offset table
+        0, 0, 0, 0, 0, 0, 1, 1, // trailer: offset size 1, ref size 1
+        0, 0, 0, 0, 0, 0, 0, 3, // 3 objects
+        0, 0, 0, 0, 0, 0, 0, 0, // top object 0
+        0, 0, 0, 0, 0, 0, 0, 15, // offset table at 15
+      ]);
+
+      final decoded = BinaryPlistDecoder.decode(bytes);
+      expect(decoded['u'], equals(const PlistUid(5)));
+    });
+  });
 }

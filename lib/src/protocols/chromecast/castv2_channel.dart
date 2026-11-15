@@ -27,6 +27,11 @@ class CastV2Channel {
   // Static framing helpers (public for unit-testing)
   // ---------------------------------------------------------------------------
 
+  /// Largest message body CASTV2 allows, in bytes. Receivers drop bigger
+  /// frames, and a length header above it on the read side means the
+  /// stream is corrupt rather than that a big message is on its way.
+  static const maxMessageBodySize = 65536;
+
   /// Encodes [length] as a 4-byte big-endian [Uint8List].
   static Uint8List writeLength(int length) {
     final data = ByteData(4)..setUint32(0, length, Endian.big);
@@ -42,8 +47,17 @@ class CastV2Channel {
   ///
   /// Returns a [Uint8List] of `4 + N` bytes where the first 4 bytes are
   /// the big-endian uint32 length of the protobuf payload.
+  ///
+  /// Throws [ArgumentError] when the encoded message is larger than
+  /// [maxMessageBodySize], since the receiver would drop it.
   static Uint8List frameMessage(CastMessage message) {
     final protobufBytes = message.writeToBuffer();
+    if (protobufBytes.length > maxMessageBodySize) {
+      throw ArgumentError(
+        'Cast message is ${protobufBytes.length} bytes; CASTV2 allows at '
+        'most $maxMessageBodySize',
+      );
+    }
     final header = writeLength(protobufBytes.length);
     final frame = Uint8List(4 + protobufBytes.length);
     frame.setRange(0, 4, header);
@@ -54,7 +68,10 @@ class CastV2Channel {
   /// Transforms a raw byte stream into a stream of [CastMessage]s.
   ///
   /// Handles partial reads — buffers data until a complete
-  /// length-prefixed message is available.
+  /// length-prefixed message is available. A frame whose body does not
+  /// decode as a [CastMessage] is skipped; a length header larger than
+  /// [maxMessageBodySize] ends the stream with a [FormatException], since
+  /// the framing can no longer be trusted.
   static Stream<CastMessage> parseMessages(Stream<List<int>> source) async* {
     final buffer = BytesBuilder(copy: false);
 
@@ -75,6 +92,13 @@ class CastV2Channel {
           Uint8List.fromList(accumulated.sublist(0, 4)),
         );
 
+        if (messageLength > maxMessageBodySize) {
+          throw FormatException(
+            'Cast frame announces $messageLength bytes; CASTV2 allows at '
+            'most $maxMessageBodySize',
+          );
+        }
+
         if (accumulated.length < 4 + messageLength) {
           // Header read but body incomplete — put everything back.
           buffer.add(accumulated);
@@ -85,7 +109,15 @@ class CastV2Channel {
         final messageBytes = accumulated.sublist(4, 4 + messageLength);
         final remaining = accumulated.sublist(4 + messageLength);
 
-        yield CastMessage.fromBuffer(messageBytes);
+        CastMessage? message;
+        try {
+          message = CastMessage.fromBuffer(messageBytes);
+        } on Exception {
+          // Undecodable body: the length prefix still tells us where the
+          // next frame starts, so drop this one and keep the channel up.
+          message = null;
+        }
+        if (message != null) yield message;
 
         // Put any leftover bytes back for the next iteration.
         if (remaining.isNotEmpty) {

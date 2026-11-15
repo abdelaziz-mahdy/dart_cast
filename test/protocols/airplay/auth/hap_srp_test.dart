@@ -318,6 +318,43 @@ void main() {
         // Instead, verify indirectly: the proof matching means K is correct
         // since M1 = H(... | K).
       });
+
+      test('verifyServerProof accepts the srptools M2 = H(A | M1 | K)', () async {
+        // Same inputs as above; M2 from srptools `key_proof_hash`. A has no
+        // leading zero byte, so this is also HomeKitADK's padded-A form.
+        const expectedM2Hex =
+            '927f3cd5718028347790cde9710fa5f060f5b247a1cd220f7bd7716a67299c4727ebc339e3fb7831ea36691df1e5b9526565960fca6e365ba56f78495bb71ac9';
+        final srp = HapSrp();
+        await srp.step1(
+          privateKeyOverride: Uint8List.fromList(
+            List.generate(32, (i) => i + 1),
+          ),
+        );
+        await srp.step2(
+          serverPublicKey: _hexToBytes(
+            '1c23324867195876032a468243570beda22487d1d81c01b8a559b947c69059200d77cc65423260fb3d59bc334c33074b419d8b465963bbc4cbf66b2b23a19f0a61ed0368fed7ee2b50a03c3a2806d8a7e5ce0acb30e78d7f0a4108b6f043d2202e7fbb4a14626ff2e6135d685719e6ad34c9651fad107d7ce39e1bedd53057f0622b7f75c870cc4b831f2a3d5fde6d5d5935385a903219e2034d4ce579eb1f6702d1b7331927fa09956080156c0a30974f16e25f1d0a4d90c153716a88d906c9150ad3b54694bee922ba161bf7afd1d2100da9c2d0c279a3376dd2e8ea6a0e6ce1fbe0884435f053290a23c9970b804ff20d887993b98318c9957dceebeb7220fa5273be2bb5cd9f4560c972097c2b14ee766f8e8ad7acc77f2fe034fd29a024eef69e6c0872baef9a9718b44a830d8e2d3419646198e32f7793718dede081ae8f7572296efe554d0422f1d474ae2916240318a0087293a8ba88c1ef41543dffe4415527b4fc102844d1fa344a99d619043ccc336c2cd4405e3d496ffcf11381',
+          ),
+          salt: Uint8List.fromList(List.generate(16, (i) => i + 0x10)),
+          pin: '1234',
+        );
+
+        expect(await srp.verifyServerProof(_hexToBytes(expectedM2Hex)), isTrue);
+        expect(await srp.verifyServerProof(Uint8List(64)), isFalse);
+        final flipped = _hexToBytes(expectedM2Hex)..[63] ^= 1;
+        expect(await srp.verifyServerProof(flipped), isFalse);
+        expect(
+          await srp.verifyServerProof(
+            _hexToBytes(expectedM2Hex).sublist(0, 32),
+          ),
+          isFalse,
+        );
+      });
+
+      test('verifyServerProof throws before step2', () async {
+        final srp = HapSrp();
+        await srp.step1();
+        expect(() => srp.verifyServerProof(Uint8List(64)), throwsStateError);
+      });
     });
 
     group('SRP step1', () {

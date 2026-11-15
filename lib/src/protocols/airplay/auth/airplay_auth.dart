@@ -90,7 +90,8 @@ class AirPlayPairSetup {
     final m4Response = await _postPairSetup(m3);
     final m4 = Tlv8.decode(m4Response);
     _checkError(m4, 'M4');
-    CastLogger.info('AirPlay auth: M4 received (SRP proof accepted)');
+    await verifyAccessoryProof(srp, m4[Tlv8.tagProof], 'pair-setup');
+    CastLogger.info('AirPlay auth: M4 received (accessory proof verified)');
 
     // -- M5: Encrypted credentials --
     CastLogger.info('AirPlay auth: pair-setup M5 (credential exchange)');
@@ -630,4 +631,21 @@ class AirPlayAuthException implements Exception {
 
   @override
   String toString() => 'AirPlayAuthException: $message';
+}
+
+/// Verifies the accessory's SRP proof carried in pair-setup M4.
+///
+/// Throws [AirPlayAuthException] when [proof] is missing or does not match,
+/// i.e. the peer does not know the PIN-derived verifier.
+Future<void> verifyAccessoryProof(
+  HapSrp srp,
+  List<int>? proof,
+  String flow,
+) async {
+  if (proof == null || proof.isEmpty) {
+    throw AirPlayAuthException('$flow M4 carries no accessory SRP proof');
+  }
+  if (!await srp.verifyServerProof(Uint8List.fromList(proof))) {
+    throw AirPlayAuthException('$flow M4 accessory SRP proof is invalid');
+  }
 }

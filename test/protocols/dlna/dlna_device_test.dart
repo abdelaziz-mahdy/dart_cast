@@ -165,4 +165,78 @@ void main() {
       });
     });
   });
+
+  group('DlnaDeviceDescription spec compliance', () {
+    String description({
+      String friendlyName = 'TV',
+      String avControl = 'AVT/ctl',
+      String rcScpd = 'RCS/scpd.xml',
+      String urlBase = '',
+    }) =>
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<root xmlns="urn:schemas-upnp-org:device-1-0">$urlBase<device>'
+        '<friendlyName>$friendlyName</friendlyName>'
+        '<UDN>uuid:x</UDN><serviceList>'
+        '<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1'
+        '</serviceType><SCPDURL>AVT/scpd.xml</SCPDURL>'
+        '<controlURL>$avControl</controlURL></service>'
+        '<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1'
+        '</serviceType><SCPDURL>$rcScpd</SCPDURL>'
+        '<controlURL>RCS/ctl</controlURL></service>'
+        '</serviceList></device></root>';
+
+    test('without URLBase a relative controlURL resolves against the '
+        'description URL (UDA 1.1 §2.3)', () {
+      final desc = DlnaDeviceDescription.parse(
+        description(),
+        'http://10.0.0.5:8080/dmr/desc.xml',
+      );
+      expect(desc.avTransportControlUrl, 'http://10.0.0.5:8080/dmr/AVT/ctl');
+      expect(desc.renderingControlUrl, 'http://10.0.0.5:8080/dmr/RCS/ctl');
+    });
+
+    test('a leading-slash controlURL still resolves to the host root', () {
+      final desc = DlnaDeviceDescription.parse(
+        description(avControl: '/AVT/ctl'),
+        'http://10.0.0.5:8080/dmr/desc.xml',
+      );
+      expect(desc.avTransportControlUrl, 'http://10.0.0.5:8080/AVT/ctl');
+    });
+
+    test('URLBase still wins when present', () {
+      final desc = DlnaDeviceDescription.parse(
+        description(urlBase: '<URLBase>http://10.0.0.9:9000/base/</URLBase>'),
+        'http://10.0.0.5:8080/dmr/desc.xml',
+      );
+      expect(desc.avTransportControlUrl, 'http://10.0.0.9:9000/base/AVT/ctl');
+    });
+
+    test('XML entities are unescaped in text values', () {
+      final desc = DlnaDeviceDescription.parse(
+        description(
+          friendlyName: 'A &amp; B &lt;TV&gt; &#233;&#x41;',
+          avControl: '/ctl?a=1&amp;b=2',
+        ),
+        'http://10.0.0.5:8080/desc.xml',
+      );
+      expect(desc.friendlyName, 'A & B <TV> éA');
+      expect(desc.avTransportControlUrl, 'http://10.0.0.5:8080/ctl?a=1&b=2');
+    });
+
+    test('the RenderingControl SCPD URL is resolved and carried in device '
+        'metadata', () {
+      final desc = DlnaDeviceDescription.parse(
+        description(),
+        'http://10.0.0.5:8080/dmr/desc.xml',
+      );
+      expect(
+        desc.renderingControlScpdUrl,
+        'http://10.0.0.5:8080/dmr/RCS/scpd.xml',
+      );
+      expect(
+        desc.toCastDevice().metadata['renderingControlScpdUrl'],
+        'http://10.0.0.5:8080/dmr/RCS/scpd.xml',
+      );
+    });
+  });
 }

@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'hls_alt_audio_proxy.dart';
 import 'hls_parser.dart';
+import 'http10_file_server.dart' show DlnaContentFeatures;
 import 'ts_alt_audio_remuxer.dart';
 import '../utils/logger.dart';
 
@@ -55,34 +56,59 @@ class HlsStreamHandler {
     Map<String, String> headers,
   ) async {
     try {
-      var content = await _fetchString(m3u8Url, headers);
+      var playlist = await _fetchPlaylist(m3u8Url, headers);
 
-      if (HlsParser.isMasterPlaylist(content)) {
-        final variants = HlsParser.extractVariants(content, m3u8Url);
+      if (HlsParser.isMasterPlaylist(playlist.body)) {
+        final variants = HlsParser.extractVariants(
+          playlist.body,
+          playlist.finalUrl,
+        );
         if (variants.isEmpty) return null;
-        content = await _fetchString(variants.first.url, headers);
+        playlist = await _fetchPlaylist(variants.first.url, headers);
       }
 
-      return HlsParser.totalDuration(content);
+      return HlsParser.totalDuration(playlist.body);
     } catch (e) {
       CastLogger.debug('HlsStreamHandler: duration probe failed: $e');
       return null;
     }
   }
 
+  ///
+  /// [requestHeaders] are the renderer's request headers. When given, the
+  /// DLNA transfer headers it asks for are answered (DLNA guidelines
+  /// 7.4.1.3): `contentFeatures.dlna.org` with [contentFeatures] (by default
+  /// the value the DLNA session advertises for this route) and an echoed
+  /// `transferMode.dlna.org`.
   Future<void> streamAsTransportStream(
     String m3u8Url,
     Map<String, String> headers,
     HttpResponse response, {
     String? preferredAudioLanguage,
     Duration startAt = Duration.zero,
+    HttpHeaders? requestHeaders,
+    String? contentFeatures,
   }) async {
     try {
-      final playlistContent = await _fetchString(m3u8Url, headers);
+      if (requestHeaders != null) {
+        DlnaContentFeatures.responseHeaders(
+          requestHeaders,
+          contentFeatures ?? DlnaContentFeatures.pipedTransportStream,
+        ).forEach(response.headers.set);
+      }
+
+      // Relative URIs resolve against the URL the playlist was finally
+      // served from, after redirects (RFC 3986 §5.1.3).
+      final playlist = await _fetchPlaylist(m3u8Url, headers);
+      final playlistContent = playlist.body;
+      final playlistUrl = playlist.finalUrl;
 
       // Alt-audio HLS — mux video + audio per segment, concatenate.
       if (HlsParser.isMasterPlaylist(playlistContent)) {
-        final variants = HlsParser.extractVariants(playlistContent, m3u8Url);
+        final variants = HlsParser.extractVariants(
+          playlistContent,
+          playlistUrl,
+        );
         if (variants.isEmpty) {
           response.statusCode = HttpStatus.badGateway;
           await response.close();
@@ -94,7 +120,7 @@ class HlsStreamHandler {
         if (audioGroup != null && audioGroup.isNotEmpty) {
           final audioRenditions = HlsParser.extractAudioRenditions(
             playlistContent,
-            m3u8Url,
+            playlistUrl,
           );
           final hasMatchingAudioPlaylist = audioRenditions.any(
             (r) => r.groupId == audioGroup && r.uri != null,
@@ -105,6 +131,7 @@ class HlsStreamHandler {
               headers: headers,
               response: response,
               preferredAudioLanguage: preferredAudioLanguage,
+              startAt: startAt,
             );
             return;
           }
@@ -112,10 +139,10 @@ class HlsStreamHandler {
 
         // Single-stream master — fetch the chosen variant playlist and
         // fall through to the legacy concat path below.
-        final mediaPlaylistContent = await _fetchString(picked.url, headers);
+        final mediaPlaylist = await _fetchPlaylist(picked.url, headers);
         await _streamConcatenated(
-          mediaPlaylistUrl: picked.url,
-          mediaPlaylistContent: mediaPlaylistContent,
+          mediaPlaylistUrl: mediaPlaylist.finalUrl,
+          mediaPlaylistContent: mediaPlaylist.body,
           headers: headers,
           response: response,
           startAt: startAt,
@@ -125,7 +152,7 @@ class HlsStreamHandler {
 
       // Media playlist directly — concat its segments.
       await _streamConcatenated(
-        mediaPlaylistUrl: m3u8Url,
+        mediaPlaylistUrl: playlistUrl,
         mediaPlaylistContent: playlistContent,
         headers: headers,
         response: response,
@@ -153,7 +180,30 @@ class HlsStreamHandler {
     required HttpResponse response,
     Duration startAt = Duration.zero,
   }) async {
-    final segments = HlsParser.extractSegments(
+    // Segments this route cannot turn into a plain TS byte stream: piping
+    // AES-128 / SAMPLE-AES ciphertext, or fMP4 fragments without their
+    // initialization section, under a `video/mp2t` label only hands the
+    // renderer garbage. Refuse them up front instead.
+    if (HlsParser.isEncrypted(mediaPlaylistContent)) {
+      CastLogger.error(
+        'HlsStreamHandler: $mediaPlaylistUrl is encrypted (EXT-X-KEY) — '
+        'cannot pipe it as plain MPEG-TS, refusing with 502',
+      );
+      response.statusCode = HttpStatus.badGateway;
+      await response.close();
+      return;
+    }
+    if (HlsParser.hasInitializationSection(mediaPlaylistContent)) {
+      CastLogger.error(
+        'HlsStreamHandler: $mediaPlaylistUrl uses fMP4/CMAF segments '
+        '(EXT-X-MAP) — cannot pipe them as MPEG-TS, refusing with 502',
+      );
+      response.statusCode = HttpStatus.badGateway;
+      await response.close();
+      return;
+    }
+
+    final segments = HlsParser.extractMediaSegments(
       mediaPlaylistContent,
       mediaPlaylistUrl,
     );
@@ -168,74 +218,138 @@ class HlsStreamHandler {
     // Byte ranges are meaningless here — the body is generated on the fly and
     // its length is not known in advance.
     final total = HlsParser.totalDuration(mediaPlaylistContent);
-    var skipped = 0;
-    var startSeconds = 0.0;
-    if (startAt > Duration.zero) {
-      final target = startAt.inMilliseconds / 1000.0;
-      var elapsed = 0.0;
-      for (final segment in segments) {
-        if (elapsed + segment.duration > target) break;
-        elapsed += segment.duration;
-        skipped++;
-      }
-      startSeconds = elapsed;
-      if (skipped >= segments.length) {
-        // Seek past the end — nothing left to send.
-        response.statusCode = HttpStatus.ok;
-        response.headers.contentType = ContentType('video', 'mp2t');
-        await response.close();
-        return;
-      }
-      CastLogger.info(
-        'HlsStreamHandler: time seek to ${target.toStringAsFixed(1)}s — '
-        'skipping $skipped/${segments.length} segments, starting at '
-        '${startSeconds.toStringAsFixed(1)}s',
-      );
+    final skip = _segmentsToSkip(
+      segments.map((s) => s.duration).toList(),
+      startAt,
+    );
+    if (skip.count >= segments.length) {
+      // Seek past the end — nothing left to send.
+      response.statusCode = HttpStatus.ok;
+      response.headers.contentType = ContentType('video', 'mp2t');
+      await response.close();
+      return;
     }
 
-    final segmentUrls = segments.skip(skipped).map((s) => s.url);
+    _setStreamHeaders(
+      response,
+      startSeconds: skip.startSeconds,
+      totalSeconds: total == null ? null : total.inMilliseconds / 1000.0,
+    );
 
-    response.statusCode = HttpStatus.ok;
-    response.headers.contentType = ContentType('video', 'mp2t');
-    // The stream is generated on demand: byte ranges cannot be honoured, but
-    // time-based seeking can, so advertise exactly that.
-    response.headers.set('Accept-Ranges', 'none');
-    response.headers.set('Access-Control-Allow-Origin', '*');
-    if (total != null) {
-      final totalSeconds = total.inMilliseconds / 1000.0;
-      response.headers.set(
-        'TimeSeekRange.dlna.org',
-        'npt=${startSeconds.toStringAsFixed(3)}-'
-            '${totalSeconds.toStringAsFixed(3)}/'
-            '${totalSeconds.toStringAsFixed(3)}',
-      );
-      response.headers.set(
-        'X-Seek-Range',
-        'npt=${startSeconds.toStringAsFixed(3)}-'
-            '${totalSeconds.toStringAsFixed(3)}',
-      );
-    }
-
-    for (final segmentUrl in segmentUrls) {
+    for (final segment in segments.skip(skip.count)) {
       try {
-        final segUri = Uri.parse(segmentUrl);
-        final segRequest = await _httpClient.openUrl('GET', segUri);
-        for (final entry in headers.entries) {
-          segRequest.headers.set(entry.key, entry.value);
-        }
-        final segResponse = await segRequest.close();
-        if (segResponse.statusCode == HttpStatus.ok) {
-          await for (final chunk in segResponse) {
-            response.add(chunk);
-          }
-        } else {
-          await segResponse.drain<void>();
-        }
+        await _pipeSegment(segment, headers, response);
       } catch (_) {
         // Skip segments that fail to fetch.
       }
     }
     await response.close();
+  }
+
+  /// Fetches one media segment and adds its bytes to [response].
+  ///
+  /// An `#EXT-X-BYTERANGE` segment is fetched with a `Range` header for just
+  /// its sub-range (RFC 8216 §4.3.2.2). If the server ignores the header and
+  /// sends the whole resource with 200, only the sub-range is forwarded.
+  Future<void> _pipeSegment(
+    HlsMediaSegment segment,
+    Map<String, String> headers,
+    HttpResponse response,
+  ) async {
+    final segRequest = await _httpClient.openUrl('GET', Uri.parse(segment.url));
+    for (final entry in headers.entries) {
+      segRequest.headers.set(entry.key, entry.value);
+    }
+    final range = segment.rangeHeader;
+    if (range != null) {
+      segRequest.headers.set(HttpHeaders.rangeHeader, range);
+    }
+    final segResponse = await segRequest.close();
+
+    if (range != null && segResponse.statusCode == HttpStatus.partialContent) {
+      await for (final chunk in segResponse) {
+        response.add(chunk);
+      }
+      return;
+    }
+    if (segResponse.statusCode != HttpStatus.ok) {
+      await segResponse.drain<void>();
+      return;
+    }
+    if (range == null) {
+      await for (final chunk in segResponse) {
+        response.add(chunk);
+      }
+      return;
+    }
+
+    // Range ignored: cut [offset, offset + length) out of the full body and
+    // stop reading once it has been forwarded.
+    final from = segment.byteRangeOffset!;
+    final to = from + segment.byteRangeLength!;
+    var position = 0;
+    await for (final chunk in segResponse) {
+      final chunkEnd = position + chunk.length;
+      if (chunkEnd > from && position < to) {
+        final s = from > position ? from - position : 0;
+        final e = to < chunkEnd ? to - position : chunk.length;
+        response.add(chunk.sublist(s, e));
+      }
+      position = chunkEnd;
+      if (position >= to) break;
+    }
+  }
+
+  /// How many leading segments to drop so the stream starts at the segment
+  /// covering [startAt], and where that segment starts.
+  static ({int count, double startSeconds}) _segmentsToSkip(
+    List<double> durations,
+    Duration startAt,
+  ) {
+    if (startAt <= Duration.zero) return (count: 0, startSeconds: 0.0);
+    final target = startAt.inMilliseconds / 1000.0;
+    var elapsed = 0.0;
+    var count = 0;
+    for (final duration in durations) {
+      if (elapsed + duration > target) break;
+      elapsed += duration;
+      count++;
+    }
+    CastLogger.info(
+      'HlsStreamHandler: time seek to ${target.toStringAsFixed(1)}s — '
+      'skipping $count/${durations.length} segments, starting at '
+      '${elapsed.toStringAsFixed(1)}s',
+    );
+    return (count: count, startSeconds: elapsed);
+  }
+
+  /// Status and headers shared by both piped-TS paths.
+  ///
+  /// The stream is generated on demand: byte ranges cannot be honoured, but
+  /// time-based seeking can, so advertise exactly that. With no known total
+  /// (a live playlist) the range is `npt=<start>-/*`.
+  static void _setStreamHeaders(
+    HttpResponse response, {
+    required double startSeconds,
+    required double? totalSeconds,
+  }) {
+    response.statusCode = HttpStatus.ok;
+    response.headers.contentType = ContentType('video', 'mp2t');
+    response.headers.set('Accept-Ranges', 'none');
+    response.headers.set('Access-Control-Allow-Origin', '*');
+    // HttpServer does not add Date by itself (RFC 9110 §6.6.1).
+    response.headers.date = DateTime.now();
+    final start = startSeconds.toStringAsFixed(3);
+    if (totalSeconds != null) {
+      final total = totalSeconds.toStringAsFixed(3);
+      response.headers.set(
+        'TimeSeekRange.dlna.org',
+        'npt=$start-$total/$total',
+      );
+      response.headers.set('X-Seek-Range', 'npt=$start-$total');
+    } else {
+      response.headers.set('TimeSeekRange.dlna.org', 'npt=$start-/*');
+    }
   }
 
   /// Fetches an alt-audio HLS plan, mux-then-writes each segment pair
@@ -246,6 +360,7 @@ class HlsStreamHandler {
     required Map<String, String> headers,
     required HttpResponse response,
     String? preferredAudioLanguage,
+    Duration startAt = Duration.zero,
   }) async {
     final planner = HlsAltAudioPlanner(httpClient: _httpClient);
     final plan = await planner.plan(
@@ -260,18 +375,29 @@ class HlsStreamHandler {
       await response.close();
       return;
     }
+
+    final durations = plan.segments.map((s) => s.durationSec).toList();
+    final skip = _segmentsToSkip(durations, startAt);
+    if (skip.count >= plan.segments.length) {
+      response.statusCode = HttpStatus.ok;
+      response.headers.contentType = ContentType('video', 'mp2t');
+      await response.close();
+      return;
+    }
     CastLogger.info(
-      'HlsStreamHandler: streaming ${plan.segments.length} alt-audio '
-      'segments as concatenated muxed TS',
+      'HlsStreamHandler: streaming '
+      '${plan.segments.length - skip.count}/${plan.segments.length} '
+      'alt-audio segments as concatenated muxed TS',
     );
 
-    response.statusCode = HttpStatus.ok;
-    response.headers.contentType = ContentType('video', 'mp2t');
-    response.headers.set('Accept-Ranges', 'none');
-    response.headers.set('Access-Control-Allow-Origin', '*');
+    _setStreamHeaders(
+      response,
+      startSeconds: skip.startSeconds,
+      totalSeconds: durations.fold<double>(0.0, (a, b) => a + b),
+    );
 
     final muxer = HlsAltAudioSegmentMuxer(planner: planner);
-    for (var i = 0; i < plan.segments.length; i++) {
+    for (var i = skip.count; i < plan.segments.length; i++) {
       try {
         final muxed = await muxer.muxSegment(plan: plan, segmentIndex: i);
         response.add(muxed.bytes);
@@ -286,8 +412,14 @@ class HlsStreamHandler {
     await response.close();
   }
 
-  /// Fetches a URL and returns the body as a string.
-  Future<String> _fetchString(String url, Map<String, String> headers) async {
+  /// Fetches a playlist and returns its text with the URL it was finally
+  /// served from — the base for its relative URIs (RFC 3986 §5.1.3).
+  /// [HttpClient] follows redirects silently, so the final URL is rebuilt
+  /// from [HttpClientResponse.redirects].
+  Future<({String body, String finalUrl})> _fetchPlaylist(
+    String url,
+    Map<String, String> headers,
+  ) async {
     final uri = Uri.parse(url);
     final request = await _httpClient.openUrl('GET', uri);
     for (final entry in headers.entries) {
@@ -298,7 +430,11 @@ class HlsStreamHandler {
       <int>[],
       (prev, chunk) => prev..addAll(chunk),
     );
-    return utf8.decode(bytes);
+    var finalUri = uri;
+    for (final redirect in response.redirects) {
+      finalUri = finalUri.resolveUri(redirect.location);
+    }
+    return (body: utf8.decode(bytes), finalUrl: finalUri.toString());
   }
 
   /// Closes the underlying HTTP client.

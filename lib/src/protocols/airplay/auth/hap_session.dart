@@ -38,9 +38,11 @@ Future<({Uint8List outputKey, Uint8List inputKey})> deriveHapSessionKeys(
 
 /// Derives event channel encryption keys from an X25519 shared secret.
 ///
-/// Uses different HKDF salts/info than the control channel keys.
-/// The event channel uses `Events-Salt` as the HKDF nonce and
-/// `Events-Write-Encryption-Key` / `Events-Read-Encryption-Key` as the info.
+/// The event channel uses `Events-Salt` as the HKDF nonce. Read and write
+/// info are *reversed* relative to the control channel because the receiver
+/// is the side that originates this connection: our output key uses
+/// `Events-Read-Encryption-Key` and our input key
+/// `Events-Write-Encryption-Key` (pyatv `ap2_session._setup_event_channel`).
 Future<({Uint8List outputKey, Uint8List inputKey})> deriveEventKeys(
   Uint8List sharedSecret,
 ) async {
@@ -49,13 +51,13 @@ Future<({Uint8List outputKey, Uint8List inputKey})> deriveEventKeys(
   final outputKeyObj = await hkdf.deriveKey(
     secretKey: SecretKey(sharedSecret),
     nonce: utf8.encode('Events-Salt'),
-    info: utf8.encode('Events-Write-Encryption-Key'),
+    info: utf8.encode('Events-Read-Encryption-Key'),
   );
 
   final inputKeyObj = await hkdf.deriveKey(
     secretKey: SecretKey(sharedSecret),
     nonce: utf8.encode('Events-Salt'),
-    info: utf8.encode('Events-Read-Encryption-Key'),
+    info: utf8.encode('Events-Write-Encryption-Key'),
   );
 
   return (
@@ -178,6 +180,10 @@ class HapSession {
 
   /// Raw encrypted bytes received from the socket, waiting to be consumed.
   final BytesBuilder _rawReceiveBuffer = BytesBuilder(copy: false);
+
+  /// Decrypted bytes not yet consumed as a response — e.g. a second response
+  /// that arrived in the same frame as the first.
+  Uint8List _decryptedPending = Uint8List(0);
 
   /// Completer that is completed whenever new data arrives on the socket.
   Completer<void>? _dataArrived;
@@ -436,6 +442,7 @@ class HapSession {
 
     // Build raw HTTP request — use AirPlay User-Agent to match pyatv
     final requestHeaders = <String, String>{
+      'Host': '$host:$port',
       'User-Agent': 'AirPlay/550.10',
       'X-Apple-Session-ID': _sessionId,
       ...?headers,
@@ -443,6 +450,9 @@ class HapSession {
 
     if (body != null && body.isNotEmpty) {
       requestHeaders['Content-Length'] = '${body.length}';
+    } else if (method == 'POST' || method == 'PUT') {
+      // HTTP/1.1 servers may wait for a body forever without it.
+      requestHeaders['Content-Length'] = '0';
     }
 
     final buffer = StringBuffer();
@@ -469,11 +479,11 @@ class HapSession {
     CastLogger.debug('HAP session: waiting for encrypted response...');
 
     // Read response
-    final responseBytes = await _readEncryptedResponse();
+    final response = await _readEncryptedResponse();
     CastLogger.debug(
-      'HAP session: received ${responseBytes.length} decrypted response bytes',
+      'HAP session: received response with ${response.body.length} body bytes',
     );
-    return _parseHttpResponse(responseBytes);
+    return response;
   }
 
   /// Sends an RTSP request over the encrypted channel and returns the response.
@@ -540,11 +550,11 @@ class HapSession {
     CastLogger.debug('HAP session: waiting for encrypted RTSP response...');
 
     // Read response
-    final responseBytes = await _readEncryptedResponse();
+    final response = await _readEncryptedResponse();
     CastLogger.debug(
-      'HAP session: received ${responseBytes.length} decrypted RTSP response bytes',
+      'HAP session: received RTSP response with '
+      '${response.body.length} body bytes',
     );
-    final response = _parseHttpResponse(responseBytes);
 
     // Receivers echo the CSeq. A mismatch means the reply belongs to another
     // in-flight exchange, which serialization is supposed to make impossible —
@@ -744,47 +754,99 @@ class HapSession {
 
   /// Listens for incoming events on the event channel in the background.
   ///
-  /// When an event is received (typically `POST /event` with a binary plist
-  /// body), responds with `HTTP/1.1 200 OK` to acknowledge it.
+  /// The receiver sends requests here (typically `POST /command RTSP/1.0`
+  /// with a binary plist body). Decrypted bytes are buffered until a whole
+  /// request — headers plus `Content-Length` body — is present, and each
+  /// request gets exactly one reply in its own protocol, echoing `CSeq` and
+  /// `Server` (pyatv `channels.py`, `EventChannel`).
   void _listenForEvents() {
-    if (_eventChannel == null) return;
+    final channel = _eventChannel;
+    if (channel == null) return;
 
     // Run the event listener asynchronously — don't block the RTSP flow
     Future<void>.microtask(() async {
-      while (_eventChannel != null && !_eventChannel!._socketDone) {
+      var pending = Uint8List(0);
+      while (identical(_eventChannel, channel) && !channel._socketDone) {
         try {
-          final data = await _eventChannel!.readDecryptedData(
+          final data = await channel.readDecryptedData(
             timeout: const Duration(seconds: 120),
           );
           if (data.isEmpty) continue;
+          pending = Uint8List.fromList([...pending, ...data]);
 
-          final text = utf8.decode(data, allowMalformed: true);
-          CastLogger.debug(
-            'HAP session: event channel received ${data.length} bytes: '
-            '${text.length > 200 ? text.substring(0, 200) : text}',
-          );
+          while (true) {
+            final request = takeEventRequest(pending);
+            if (request == null) break;
+            pending = pending.sublist(request.consumed);
 
-          // Respond with 200 OK
-          const response =
-              'HTTP/1.1 200 OK\r\n'
-              'Content-Length: 0\r\n'
-              '\r\n';
-          final responseBytes = Uint8List.fromList(utf8.encode(response));
-          final encrypted = await _eventChannel!.encrypt(responseBytes);
-          _eventChannel!._socket.add(encrypted);
-          await _eventChannel!._socket.flush();
-
-          CastLogger.debug('HAP session: sent 200 OK on event channel');
+            CastLogger.debug(
+              'HAP session: event channel request: ${request.requestLine}',
+            );
+            final encrypted = await channel.encrypt(
+              Uint8List.fromList(utf8.encode(request.reply)),
+            );
+            channel._socket.add(encrypted);
+            await channel._socket.flush();
+          }
         } on HapSessionException catch (e) {
+          // A quiet receiver is not an error — keep listening.
+          if (e.message.startsWith('Timed out') && !channel._socketDone) {
+            continue;
+          }
           CastLogger.debug('HAP session: event channel read ended: $e');
           break;
         } catch (e) {
-          CastLogger.debug('HAP session: event channel error: $e');
+          // Includes MAC failures: the channel keys or nonces are wrong and
+          // nothing further on this channel can be read.
+          CastLogger.warning('HAP session: event channel error: $e');
           break;
         }
       }
       CastLogger.debug('HAP session: event listener loop exited');
     });
+  }
+
+  /// Takes one complete request off the front of [buffer], if present.
+  ///
+  /// Returns the request line, how many bytes it used, and the reply to send
+  /// (`<protocol> 200 OK` with `Content-Length: 0`, `Audio-Latency: 0`, and
+  /// the request's `Server` and `CSeq` echoed). Returns `null` while the
+  /// headers or body are still incomplete.
+  // Visible for testing.
+  static ({String requestLine, int consumed, String reply})? takeEventRequest(
+    Uint8List buffer,
+  ) {
+    final headerEnd = _findHeaderEnd(buffer);
+    if (headerEnd == -1) return null;
+    final lines = utf8
+        .decode(buffer.sublist(0, headerEnd), allowMalformed: true)
+        .split('\r\n');
+    final headers = _parseHeaderLines(lines.skip(1));
+    final contentLength = int.tryParse(headers['content-length'] ?? '') ?? 0;
+    final consumed = headerEnd + 4 + contentLength;
+    if (buffer.length < consumed) return null;
+
+    final parts = lines.first.split(' ');
+    final protocol =
+        parts.length >= 3 &&
+                RegExp(r'^(RTSP|HTTP)/\d+\.\d+$').hasMatch(parts[2])
+            ? parts[2]
+            : 'RTSP/1.0';
+    final reply =
+        StringBuffer('$protocol 200 OK\r\n')
+          ..write('Content-Length: 0\r\n')
+          ..write('Audio-Latency: 0\r\n');
+    final server = headers['server'];
+    if (server != null) reply.write('Server: $server\r\n');
+    final cseq = headers['cseq'];
+    if (cseq != null) reply.write('CSeq: $cseq\r\n');
+    reply.write('\r\n');
+
+    return (
+      requestLine: lines.first,
+      consumed: consumed,
+      reply: reply.toString(),
+    );
   }
 
   /// Starts a periodic POST /feedback loop every 2 seconds.
@@ -816,55 +878,148 @@ class HapSession {
     _feedbackActive = false;
   }
 
-  /// Reads encrypted frames from the socket until a complete HTTP response
-  /// is received.
+  /// Reads encrypted frames from the socket until one complete HTTP/RTSP
+  /// response is available, and returns it.
+  ///
+  /// The body is exactly `Content-Length` bytes (or the de-chunked body for
+  /// `Transfer-Encoding: chunked`). Anything after it stays buffered for the
+  /// next exchange on this session.
   ///
   /// Uses the persistent socket listener — never calls `_socket.listen()`
   /// directly, which would fail on second invocation since Dart sockets are
   /// single-subscription streams.
-  Future<Uint8List> _readEncryptedResponse() async {
-    final decryptedBuffer = BytesBuilder(copy: false);
+  Future<HapHttpResponse> _readEncryptedResponse() async {
     final deadline = DateTime.now().add(const Duration(seconds: 30));
 
     while (DateTime.now().isBefore(deadline)) {
+      final response = _takeResponse();
+      if (response != null) return response;
+
       // Process any raw data that has accumulated in the buffer.
       if (_rawReceiveBuffer.length > 0) {
         final raw = _rawReceiveBuffer.toBytes();
         _rawReceiveBuffer.clear();
         final decrypted = await decrypt(Uint8List.fromList(raw));
         if (decrypted.isNotEmpty) {
-          decryptedBuffer.add(decrypted);
+          _decryptedPending = Uint8List.fromList([
+            ..._decryptedPending,
+            ...decrypted,
+          ]);
         }
-
-        // Check if we have a complete HTTP response.
-        final accumulated = decryptedBuffer.toBytes();
-        if (_isCompleteHttpResponse(accumulated)) {
-          return Uint8List.fromList(accumulated);
-        }
+        continue;
       }
 
-      // If the socket is done and there is no more data, return what we have
-      // (mirrors the original onDone behaviour).
+      // The peer closed: whatever is buffered is all there will ever be.
       if (_socketDone) {
-        return Uint8List.fromList(decryptedBuffer.toBytes());
+        final rest = _decryptedPending;
+        _decryptedPending = Uint8List(0);
+        return _parseHttpResponse(rest);
       }
 
       // Wait for the next chunk of data from the persistent listener.
       _dataArrived = Completer<void>();
       final remaining = deadline.difference(DateTime.now());
       if (remaining.isNegative) break;
-      try {
-        await _dataArrived!.future.timeout(
-          remaining,
-          onTimeout:
-              () => throw HapSessionException('Timed out waiting for response'),
-        );
-      } on HapSessionException {
-        rethrow;
-      }
+      await _dataArrived!.future.timeout(
+        remaining,
+        onTimeout:
+            () => throw HapSessionException('Timed out waiting for response'),
+      );
     }
 
     throw HapSessionException('Timed out waiting for response');
+  }
+
+  /// Removes one complete response from [_decryptedPending], or returns
+  /// `null` if it is not all there yet.
+  HapHttpResponse? _takeResponse() {
+    final data = _decryptedPending;
+    final headerEnd = _findHeaderEnd(data);
+    if (headerEnd == -1) return null;
+    final head = _parseHead(data.sublist(0, headerEnd));
+    final bodyStart = headerEnd + 4;
+
+    Uint8List body;
+    int end;
+    final transferEncoding = head.headers['transfer-encoding'] ?? '';
+    final contentLength = head.headers['content-length'];
+    try {
+      if (transferEncoding.toLowerCase().contains('chunked')) {
+        final chunked = _dechunk(data, bodyStart);
+        if (chunked == null) return null;
+        body = chunked.body;
+        end = chunked.end;
+      } else if (contentLength != null) {
+        final length = int.tryParse(contentLength.trim());
+        if (length == null || length < 0) {
+          throw HapSessionException('Invalid Content-Length: $contentLength');
+        }
+        end = bodyStart + length;
+        if (data.length < end) return null;
+        body = Uint8List.fromList(data.sublist(bodyStart, end));
+      } else {
+        // No framing headers: a header-only response such as
+        // "HTTP/1.1 200 OK\r\n\r\n".
+        body = Uint8List(0);
+        end = bodyStart;
+      }
+    } on HapSessionException {
+      // The stream can no longer be framed; do not leave garbage behind for
+      // the next exchange.
+      _decryptedPending = Uint8List(0);
+      rethrow;
+    }
+
+    _decryptedPending = Uint8List.fromList(data.sublist(end));
+    return HapHttpResponse(
+      statusCode: head.statusCode,
+      reasonPhrase: head.reasonPhrase,
+      headers: head.headers,
+      body: body,
+    );
+  }
+
+  /// Decodes a chunked body starting at [start]. Returns `null` while the
+  /// terminating zero-size chunk and trailer section are incomplete.
+  static ({Uint8List body, int end})? _dechunk(Uint8List data, int start) {
+    final out = BytesBuilder(copy: false);
+    var pos = start;
+    while (true) {
+      final lineEnd = _indexOfCrlf(data, pos);
+      if (lineEnd == -1) return null;
+      final sizeText =
+          ascii
+              .decode(data.sublist(pos, lineEnd), allowInvalid: true)
+              .split(';')
+              .first
+              .trim();
+      final size = int.tryParse(sizeText, radix: 16);
+      if (size == null || size < 0) {
+        throw HapSessionException('Invalid chunk size: "$sizeText"');
+      }
+      pos = lineEnd + 2;
+      if (size == 0) {
+        // Optional trailers, then an empty line.
+        while (true) {
+          final trailerEnd = _indexOfCrlf(data, pos);
+          if (trailerEnd == -1) return null;
+          if (trailerEnd == pos) {
+            return (body: out.toBytes(), end: pos + 2);
+          }
+          pos = trailerEnd + 2;
+        }
+      }
+      if (pos + size + 2 > data.length) return null;
+      out.add(data.sublist(pos, pos + size));
+      pos += size + 2;
+    }
+  }
+
+  static int _indexOfCrlf(Uint8List data, int from) {
+    for (var i = from; i + 1 < data.length; i++) {
+      if (data[i] == 0x0D && data[i + 1] == 0x0A) return i;
+    }
+    return -1;
   }
 
   /// Waits for any decrypted data to arrive from the socket and returns it.
@@ -878,6 +1033,12 @@ class HapSession {
     Duration timeout = const Duration(seconds: 30),
   }) async {
     final deadline = DateTime.now().add(timeout);
+
+    if (_decryptedPending.isNotEmpty) {
+      final pending = _decryptedPending;
+      _decryptedPending = Uint8List(0);
+      return pending;
+    }
 
     while (DateTime.now().isBefore(deadline)) {
       if (_rawReceiveBuffer.length > 0) {
@@ -906,41 +1067,9 @@ class HapSession {
     throw HapSessionException('Timed out waiting for data');
   }
 
-  /// Checks if the accumulated bytes form a complete HTTP response.
-  bool _isCompleteHttpResponse(Uint8List data) {
-    // Find the end of headers (\r\n\r\n)
-    final headerEnd = _findHeaderEnd(data);
-    if (headerEnd == -1) return false;
-
-    final headerStr = utf8.decode(data.sublist(0, headerEnd));
-    final bodyStart = headerEnd + 4; // Skip \r\n\r\n
-
-    // Check for Content-Length
-    final contentLengthMatch = RegExp(
-      r'content-length:\s*(\d+)',
-      caseSensitive: false,
-    ).firstMatch(headerStr);
-    if (contentLengthMatch != null) {
-      final contentLength = int.parse(contentLengthMatch.group(1)!);
-      return data.length >= bodyStart + contentLength;
-    }
-
-    // Check for Transfer-Encoding: chunked
-    if (headerStr.toLowerCase().contains('transfer-encoding: chunked')) {
-      // Look for the terminal chunk (0\r\n\r\n)
-      final bodyBytes = data.sublist(bodyStart);
-      final bodyStr = utf8.decode(bodyBytes, allowMalformed: true);
-      return bodyStr.contains('0\r\n\r\n');
-    }
-
-    // No Content-Length and not chunked — assume complete if we have headers
-    // This handles responses like "HTTP/1.1 200 OK\r\n\r\n"
-    return true;
-  }
-
   /// Finds the index of the first \r\n\r\n sequence in [data].
   /// Returns -1 if not found.
-  int _findHeaderEnd(Uint8List data) {
+  static int _findHeaderEnd(Uint8List data) {
     for (int i = 0; i < data.length - 3; i++) {
       if (data[i] == 0x0D &&
           data[i + 1] == 0x0A &&
@@ -952,22 +1081,31 @@ class HapSession {
     return -1;
   }
 
-  /// Parses raw HTTP response bytes into a [HapHttpResponse].
+  /// Parses raw HTTP response bytes into a [HapHttpResponse], taking
+  /// everything after the headers as the body. Only used once the peer has
+  /// closed, when there is nothing left to frame against.
   HapHttpResponse _parseHttpResponse(Uint8List data) {
     final headerEnd = _findHeaderEnd(data);
     if (headerEnd == -1) {
       throw HapSessionException('Invalid HTTP response: no header terminator');
     }
-
-    final headerStr = utf8.decode(data.sublist(0, headerEnd));
+    final head = _parseHead(data.sublist(0, headerEnd));
     final bodyStart = headerEnd + 4;
+    return HapHttpResponse(
+      statusCode: head.statusCode,
+      reasonPhrase: head.reasonPhrase,
+      headers: head.headers,
+      body:
+          bodyStart < data.length
+              ? Uint8List.fromList(data.sublist(bodyStart))
+              : Uint8List(0),
+    );
+  }
 
-    // Parse status line
-    final lines = headerStr.split('\r\n');
-    if (lines.isEmpty) {
-      throw HapSessionException('Invalid HTTP response: empty headers');
-    }
-
+  /// Parses a status line and headers (without the final blank line).
+  static ({int statusCode, String reasonPhrase, Map<String, String> headers})
+  _parseHead(Uint8List headBytes) {
+    final lines = utf8.decode(headBytes, allowMalformed: true).split('\r\n');
     final statusLine = lines.first;
     // Accept both HTTP/1.1 and RTSP/1.0 status lines
     final statusMatch = RegExp(
@@ -978,33 +1116,24 @@ class HapSession {
         'Invalid HTTP/RTSP response status line: $statusLine',
       );
     }
+    return (
+      statusCode: int.parse(statusMatch.group(1)!),
+      reasonPhrase: statusMatch.group(2) ?? '',
+      headers: _parseHeaderLines(lines.skip(1)),
+    );
+  }
 
-    final statusCode = int.parse(statusMatch.group(1)!);
-    final reasonPhrase = statusMatch.group(2) ?? '';
-
-    // Parse headers
+  /// Parses `Name: value` lines into a map with lowercased names.
+  static Map<String, String> _parseHeaderLines(Iterable<String> lines) {
     final headers = <String, String>{};
-    for (int i = 1; i < lines.length; i++) {
-      final colonIndex = lines[i].indexOf(':');
+    for (final line in lines) {
+      final colonIndex = line.indexOf(':');
       if (colonIndex > 0) {
-        final key = lines[i].substring(0, colonIndex).trim().toLowerCase();
-        final value = lines[i].substring(colonIndex + 1).trim();
-        headers[key] = value;
+        headers[line.substring(0, colonIndex).trim().toLowerCase()] =
+            line.substring(colonIndex + 1).trim();
       }
     }
-
-    // Extract body
-    final body =
-        bodyStart < data.length
-            ? Uint8List.fromList(data.sublist(bodyStart))
-            : Uint8List(0);
-
-    return HapHttpResponse(
-      statusCode: statusCode,
-      reasonPhrase: reasonPhrase,
-      headers: headers,
-      body: body,
-    );
+    return headers;
   }
 
   /// Resets the RTSP session state so a new SETUP + RECORD can be performed.

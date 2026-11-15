@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dart_cast/src/core/cast_exceptions.dart';
 import 'package:dart_cast/src/protocols/dlna/dlna_controller.dart';
 import 'package:test/test.dart';
 
@@ -463,6 +464,130 @@ void main() {
       );
 
       expect(response, contains('PlayResponse'));
+    });
+  });
+
+  group('DlnaHttpClient spec details', () {
+    late HttpServer server;
+    late String serverUrl;
+    late List<String?> rawContentTypes;
+
+    setUp(() async {
+      rawContentTypes = [];
+      server = await HttpServer.bind('127.0.0.1', 0);
+      serverUrl = 'http://127.0.0.1:${server.port}';
+    });
+
+    tearDown(() => server.close(force: true));
+
+    test('Content-Type carries a quoted charset (UDA 1.1 §3.2.1)', () async {
+      server.listen((request) async {
+        rawContentTypes.add(request.headers.value('Content-Type'));
+        await request.drain<void>();
+        await request.response.close();
+      });
+      final client = DlnaHttpClient();
+      addTearDown(client.close);
+      await client.sendAction(
+        '$serverUrl/ctl',
+        DlnaServiceType.avTransport,
+        'Play',
+        DlnaSoapBuilder.buildPlay(),
+      );
+      expect(rawContentTypes.single, 'text/xml; charset="utf-8"');
+    });
+
+    test('a SOAP fault reports the UPnPError code and description '
+        '(UDA 1.1 §3.2.2)', () async {
+      server.listen((request) async {
+        await request.drain<void>();
+        request.response.statusCode = 500;
+        request.response.headers.set(
+          'Content-Type',
+          'text/xml; charset="utf-8"',
+        );
+        request.response.write(
+          '<?xml version="1.0"?>'
+          '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+          's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+          '<s:Body><s:Fault>'
+          '<faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>'
+          '<detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0">'
+          '<errorCode>701</errorCode>'
+          '<errorDescription>Transition not available</errorDescription>'
+          '</UPnPError></detail></s:Fault></s:Body></s:Envelope>',
+        );
+        await request.response.close();
+      });
+      final client = DlnaHttpClient();
+      addTearDown(client.close);
+      await expectLater(
+        client.sendAction(
+          '$serverUrl/ctl',
+          DlnaServiceType.avTransport,
+          'Seek',
+          DlnaSoapBuilder.buildSeek(const Duration(seconds: 5)),
+        ),
+        throwsA(
+          isA<ProtocolException>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('500'),
+              contains('701'),
+              contains('Transition not available'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('fetchText GETs a document', () async {
+      server.listen((request) async {
+        request.response.write('method=${request.method}');
+        await request.response.close();
+      });
+      final client = DlnaHttpClient();
+      addTearDown(client.close);
+      expect(await client.fetchText('$serverUrl/scpd.xml'), 'method=GET');
+    });
+  });
+
+  group('DlnaScpdParser.volumeRange', () {
+    String scpd(String volumeVariable) =>
+        '<?xml version="1.0"?>'
+        '<scpd xmlns="urn:schemas-upnp-org:service-1-0"><serviceStateTable>'
+        '<stateVariable sendEvents="no"><name>Mute</name>'
+        '<dataType>boolean</dataType></stateVariable>'
+        '<stateVariable sendEvents="no"><name>A_ARG_TYPE_InstanceID</name>'
+        '<dataType>ui4</dataType><allowedValueRange><minimum>0</minimum>'
+        '<maximum>9999</maximum></allowedValueRange></stateVariable>'
+        '$volumeVariable'
+        '</serviceStateTable></scpd>';
+
+    test('reads the Volume maximum, not another variable\'s', () {
+      final range = DlnaScpdParser.volumeRange(
+        scpd(
+          '<stateVariable sendEvents="no"><name>Volume</name>'
+          '<dataType>ui2</dataType><allowedValueRange>'
+          '<minimum>0</minimum><maximum>60</maximum><step>1</step>'
+          '</allowedValueRange></stateVariable>',
+        ),
+      );
+      expect(range, (min: 0, max: 60));
+    });
+
+    test('returns null when Volume has no usable range', () {
+      expect(
+        DlnaScpdParser.volumeRange(
+          scpd(
+            '<stateVariable><name>Volume</name><dataType>ui2</dataType>'
+            '</stateVariable>',
+          ),
+        ),
+        isNull,
+      );
+      expect(DlnaScpdParser.volumeRange('garbage'), isNull);
     });
   });
 }

@@ -121,7 +121,8 @@ class AirPlayTransientPairing {
       (Tlv8.tagProof, proof),
     ]);
 
-    _decode(await _post(m3), 'M4');
+    final m4 = _decode(await _post(m3), 'M4');
+    await verifyAccessoryProof(_srp, m4[Tlv8.tagProof], 'transient pairing');
 
     final sharedKey = _srp.sharedKey;
     if (sharedKey == null) {

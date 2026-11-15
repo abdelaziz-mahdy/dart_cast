@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:http/http.dart' as http;
 
 import '../../core/cast_device.dart';
@@ -239,6 +241,19 @@ class DlnaSoapParser {
     return int.tryParse(value) ?? 0;
   }
 
+  /// Extracts `errorCode` / `errorDescription` from a SOAP fault's
+  /// `UPnPError` detail (UDA 1.1 §3.2.2), or null when there is none.
+  static ({int code, String? description})? parseUpnpError(String xml) {
+    final code = int.tryParse(_extractElement(xml, 'errorCode') ?? '');
+    if (code == null) return null;
+    final description = _extractElement(xml, 'errorDescription');
+    return (
+      code: code,
+      description:
+          description == null || description.isEmpty ? null : description,
+    );
+  }
+
   /// Parses a GetProtocolInfo response, returning supported MIME types.
   ///
   /// Extracts the `Sink` field from the response, splits by comma,
@@ -327,8 +342,17 @@ class DlnaHttpClient {
         'DLNA: SOAP $action failed: HTTP ${response.statusCode}',
       );
       CastLogger.debug('DLNA: SOAP error body: ${response.body}');
+      // A SOAP fault carries the UPnP error code and description (UDA 1.1
+      // §3.2.2) — e.g. 701 "Transition not available" — which is the only
+      // way to tell why the renderer refused.
+      final fault = DlnaSoapParser.parseUpnpError(response.body);
+      final detail =
+          fault == null
+              ? ''
+              : ' — UPnPError ${fault.code}'
+                  '${fault.description == null ? '' : ': ${fault.description}'}';
       throw ProtocolException(
-        'DLNA SOAP error: HTTP ${response.statusCode}',
+        'DLNA SOAP $action error: HTTP ${response.statusCode}$detail',
         CastProtocol.dlna,
       );
     }
@@ -346,7 +370,8 @@ class DlnaHttpClient {
         .post(
           Uri.parse(controlUrl),
           headers: {
-            'Content-Type': 'text/xml; charset=utf-8',
+            // UDA 1.1 §3.2.1 spells the charset quoted.
+            'Content-Type': 'text/xml; charset="utf-8"',
             'SOAPAction': '"$serviceType#$action"',
           },
           body: body,
@@ -363,8 +388,61 @@ class DlnaHttpClient {
         );
   }
 
+  /// GETs [url] and returns its body as text (used for SCPD documents).
+  ///
+  /// Throws on a non-2xx status or when [timeout] elapses.
+  Future<String> fetchText(
+    String url, {
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final response = await _client.get(Uri.parse(url)).timeout(timeout);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ProtocolException(
+        'DLNA: GET $url failed: HTTP ${response.statusCode}',
+        CastProtocol.dlna,
+      );
+    }
+    return utf8.decode(response.bodyBytes, allowMalformed: true);
+  }
+
   /// Closes the underlying HTTP client.
   void close() {
     _client.close();
+  }
+}
+
+/// Reads service descriptions (SCPD documents, UDA 1.1 §2.5).
+class DlnaScpdParser {
+  DlnaScpdParser._();
+
+  /// The `allowedValueRange` of RenderingControl's `Volume` state variable,
+  /// or null when the document does not declare a usable one.
+  ///
+  /// `Volume` is a `ui2` whose maximum is vendor-defined; it is not
+  /// necessarily 100.
+  static ({int min, int max})? volumeRange(String scpdXml) {
+    final variables = RegExp(
+      r'<stateVariable\b[^>]*>([\s\S]*?)</stateVariable>',
+    ).allMatches(scpdXml);
+    for (final match in variables) {
+      final block = match.group(1)!;
+      final name = RegExp(r'<name>\s*([^<]*?)\s*</name>').firstMatch(block);
+      if (name?.group(1) != 'Volume') continue;
+      final min = int.tryParse(
+        RegExp(
+              r'<minimum>\s*([^<]*?)\s*</minimum>',
+            ).firstMatch(block)?.group(1) ??
+            '0',
+      );
+      final max = int.tryParse(
+        RegExp(
+              r'<maximum>\s*([^<]*?)\s*</maximum>',
+            ).firstMatch(block)?.group(1) ??
+            '',
+      );
+      if (min == null || max == null || max <= min) return null;
+      return (min: min, max: max);
+    }
+    return null;
   }
 }

@@ -9,6 +9,57 @@ import 'package:dart_cast/src/protocols/airplay/auth/hap_srp.dart';
 import 'package:dart_cast/src/protocols/airplay/auth/tlv8.dart';
 import 'package:test/test.dart';
 
+import 'srp_accessory.dart';
+
+/// Serves `/pair-setup` with real accessory-side SRP for PIN `1234`.
+///
+/// M4 carries `m4Proof(realProof)`; M5 is answered with HTTP 500 so a test
+/// can tell "got past the M4 proof check" from "stopped at M4".
+Future<({HttpServer server, List<int> seqNos})> _startSrpPairSetupServer({
+  required Uint8List? Function(Uint8List realProof) m4Proof,
+}) async {
+  final accessory = await SrpAccessory.create(pin: '1234');
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  final seqNos = <int>[];
+  server.listen((request) async {
+    final body = await request.fold<List<int>>(
+      [],
+      (prev, chunk) => [...prev, ...chunk],
+    );
+    final tlv = Tlv8.decode(body);
+    final seqNo = tlv[Tlv8.tagSeqNo]?.first ?? 0;
+    seqNos.add(seqNo);
+    Uint8List reply;
+    if (seqNo == 1) {
+      reply = Tlv8.encode([
+        (Tlv8.tagSeqNo, [0x02]),
+        (Tlv8.tagSalt, accessory.salt),
+        (Tlv8.tagPublicKey, accessory.publicKey),
+      ]);
+    } else if (seqNo == 3) {
+      final realProof = await accessory.verifyM1(
+        tlv[Tlv8.tagPublicKey] ?? const [],
+        tlv[Tlv8.tagProof] ?? const [],
+      );
+      final proof = realProof == null ? null : m4Proof(realProof);
+      reply = Tlv8.encode([
+        (Tlv8.tagSeqNo, [0x04]),
+        if (realProof == null) (Tlv8.tagError, [0x02]),
+        if (proof != null) (Tlv8.tagProof, proof),
+      ]);
+    } else {
+      request.response.statusCode = 500;
+      await request.response.close();
+      return;
+    }
+    request.response
+      ..statusCode = 200
+      ..add(reply);
+    await request.response.close();
+  });
+  return (server: server, seqNos: seqNos);
+}
+
 void main() {
   group('AirPlayPairSetup', () {
     test('startPinDisplay sends POST to /pair-pin-start', () async {
@@ -90,6 +141,69 @@ void main() {
         await server.close();
       }
     });
+
+    test('pairSetup rejects a wrong M4 accessory proof', () async {
+      final ctx = await _startSrpPairSetupServer(m4Proof: (_) => Uint8List(64));
+      addTearDown(() => ctx.server.close(force: true));
+
+      await expectLater(
+        AirPlayPairSetup(
+          host: '127.0.0.1',
+          port: ctx.server.port,
+        ).pairSetup(pin: '1234', clientId: 'test-client'),
+        throwsA(
+          isA<AirPlayAuthException>().having(
+            (e) => e.message,
+            'message',
+            contains('proof'),
+          ),
+        ),
+      );
+      expect(ctx.seqNos, equals([1, 3]), reason: 'M5 must not be sent');
+    });
+
+    test('pairSetup rejects an M4 without an accessory proof', () async {
+      final ctx = await _startSrpPairSetupServer(m4Proof: (_) => null);
+      addTearDown(() => ctx.server.close(force: true));
+
+      await expectLater(
+        AirPlayPairSetup(
+          host: '127.0.0.1',
+          port: ctx.server.port,
+        ).pairSetup(pin: '1234', clientId: 'test-client'),
+        throwsA(
+          isA<AirPlayAuthException>().having(
+            (e) => e.message,
+            'message',
+            contains('proof'),
+          ),
+        ),
+      );
+      expect(ctx.seqNos, equals([1, 3]), reason: 'M5 must not be sent');
+    });
+
+    test(
+      'pairSetup accepts the real M4 accessory proof and sends M5',
+      () async {
+        final ctx = await _startSrpPairSetupServer(m4Proof: (proof) => proof);
+        addTearDown(() => ctx.server.close(force: true));
+
+        await expectLater(
+          AirPlayPairSetup(
+            host: '127.0.0.1',
+            port: ctx.server.port,
+          ).pairSetup(pin: '1234', clientId: 'test-client'),
+          throwsA(
+            isA<AirPlayAuthException>().having(
+              (e) => e.message,
+              'message',
+              contains('HTTP 500'),
+            ),
+          ),
+        );
+        expect(ctx.seqNos, equals([1, 3, 5]));
+      },
+    );
 
     test('pairSetup throws on HTTP 500 error', () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);

@@ -342,7 +342,7 @@ class MediaProxy {
       final targetPtsDelta = (segmentSeconds * 90000).round();
       int lastSegmentPts = keyframesWithPts.first.pts;
       for (int i = 1; i < keyframesWithPts.length; i++) {
-        final ptsDelta = keyframesWithPts[i].pts - lastSegmentPts;
+        final ptsDelta = _ptsDelta(lastSegmentPts, keyframesWithPts[i].pts);
         if (ptsDelta >= targetPtsDelta) {
           segmentOffsets.add(keyframesWithPts[i].offset);
           segmentPtsValues.add(keyframesWithPts[i].pts);
@@ -373,15 +373,19 @@ class MediaProxy {
       // Use actual PTS differences for accurate durations
       for (int i = 0; i < segmentCount; i++) {
         if (i + 1 < segmentCount) {
-          final ptsDelta = segmentPtsValues[i + 1]! - segmentPtsValues[i]!;
+          final ptsDelta = _ptsDelta(
+            segmentPtsValues[i]!,
+            segmentPtsValues[i + 1]!,
+          );
           segmentDurations.add(ptsDelta / 90000.0);
         } else {
           // Last segment: use totalDuration or estimate from PTS
           if (totalDuration != null && totalDuration > 0) {
             // Total elapsed PTS so far
             final elapsedPts =
-                (segmentPtsValues[i]! - segmentPtsValues[0]!) / 90000.0;
-            segmentDurations.add(totalDuration - elapsedPts);
+                _ptsDelta(segmentPtsValues[0]!, segmentPtsValues[i]!) / 90000.0;
+            final remaining = totalDuration - elapsedPts;
+            segmentDurations.add(remaining > 0 ? remaining : 0.0);
           } else {
             // Estimate last segment from byte proportion as fallback
             final offset = segmentOffsets[i];
@@ -497,13 +501,19 @@ class MediaProxy {
 
     try {
       if (File(originalPath).existsSync()) {
-        content = File(originalPath).readAsStringSync();
+        content = SubtitleConverter.decodeText(
+          File(originalPath).readAsBytesSync(),
+        );
       }
     } catch (_) {}
 
     if (content == null) {
-      // Can't read file, just return original with guessed format
-      final isVtt = urlOrPath.toLowerCase().endsWith('.vtt');
+      // Remote (or unreadable) subtitle. Remote ones go through
+      // `/stream/`, which always serves WebVTT, so they are labelled VTT:
+      // the DIDL-Lite protocolInfo must describe the bytes the renderer
+      // will actually receive.
+      final isLocal = urlOrPath.startsWith('file://');
+      final isVtt = !isLocal || urlOrPath.toLowerCase().endsWith('.vtt');
       return [(url: originalUrl, format: isVtt ? 'vtt' : 'srt')];
     }
 
@@ -523,8 +533,15 @@ class MediaProxy {
       );
       variants.add((url: '$_baseUrl/synthetic/$srtToken.srt', format: 'srt'));
     } else if (isSrt) {
-      // Original is SRT — generate VTT variant
-      variants.add((url: originalUrl, format: 'srt'));
+      // Original is SRT. The `/file/` route converts SRT to WebVTT for
+      // Chromecast, so the SRT variant is served from a synthetic copy of
+      // the original bytes — a renderer told `text/srt` must get SRT.
+      final srtToken = _generateToken();
+      _syntheticContent['$srtToken.srt'] = _SyntheticContent(
+        content: content,
+        contentType: ContentType('text', 'srt', charset: 'utf-8'),
+      );
+      variants.add((url: '$_baseUrl/synthetic/$srtToken.srt', format: 'srt'));
       final vttContent = SubtitleConverter.srtToVtt(content);
       final vttToken = _generateToken();
       _syntheticContent['$vttToken.vtt'] = _SyntheticContent(
@@ -538,6 +555,170 @@ class MediaProxy {
     }
 
     return variants;
+  }
+
+  /// Returns [proxyUrl] with a readable last path segment built from
+  /// [name], e.g. `/file/<token>.mp4/My_Movie.mp4`.
+  ///
+  /// Some DLNA renderers (TCL's) show the URL's last path segment as the
+  /// title instead of the DIDL-Lite `dc:title`, which made the random token
+  /// appear on screen. Routing ignores the extra segment. URLs that are not
+  /// `/file/`, `/stream/` or `/ts-stream/` routes, and an empty [name], are
+  /// returned unchanged.
+  String withDisplayName(String proxyUrl, String? name) {
+    final slug = _displaySlug(name);
+    if (slug == null) return proxyUrl;
+    final uri = Uri.parse(proxyUrl);
+    final segments = uri.pathSegments;
+    if (segments.length < 2) return proxyUrl;
+    final String token;
+    final String ext;
+    switch (segments.first) {
+      case 'file':
+        if (segments.length != 2) return proxyUrl;
+        token = segments[1];
+        ext = _extensionOf(token);
+      case 'ts-stream':
+        if (segments.length != 2) return proxyUrl;
+        token = segments[1];
+        ext = '.ts';
+      case 'stream':
+        if (segments.length > 3) return proxyUrl;
+        token = segments[1];
+        ext = segments.length == 3 ? _extensionOf(segments[2]) : '';
+      default:
+        return proxyUrl;
+    }
+    return uri
+        .replace(pathSegments: [segments.first, token, '$slug$ext'])
+        .toString();
+  }
+
+  static final _videoExtension = RegExp(
+    r'\.(mp4|m4v|mkv|ts|m2ts|mov|webm|avi|m3u8)$',
+    caseSensitive: false,
+  );
+  // Only characters that need no percent-encoding in a path: the TCL
+  // renderer shows the segment verbatim, so `%20` would appear on screen.
+  // Spaces become `_`; anything else outside this set is dropped.
+  static final _unsafeNameChars = RegExp(r"[^A-Za-z0-9\-_.()' ]+");
+
+  static String? _displaySlug(String? name) {
+    if (name == null) return null;
+    var slug = name.trim().replaceFirst(_videoExtension, '');
+    slug = String.fromCharCodes(
+      slug.runes.expand(
+        (r) => (_asciiFold[r] ?? String.fromCharCode(r)).codeUnits,
+      ),
+    );
+    slug = slug.replaceAll(_unsafeNameChars, ' ');
+    slug = slug.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (slug.length > 80) slug = slug.substring(0, 80).trim();
+    // A leading dot would hide the name; dots alone are no name.
+    slug = slug.replaceFirst(RegExp(r'^\.+'), '').replaceAll(' ', '_');
+    return slug.isEmpty ? null : slug;
+  }
+
+  /// Latin letters with diacritics folded to ASCII for [_displaySlug].
+  static const _asciiFold = <int, String>{
+    0x00E0: 'a',
+    0x00E1: 'a',
+    0x00E2: 'a',
+    0x00E3: 'a',
+    0x00E4: 'a',
+    0x00E5: 'a',
+    0x0101: 'a',
+    0x00C0: 'A',
+    0x00C1: 'A',
+    0x00C2: 'A',
+    0x00C3: 'A',
+    0x00C4: 'A',
+    0x00C5: 'A',
+    0x0100: 'A',
+    0x00E7: 'c',
+    0x0107: 'c',
+    0x010D: 'c',
+    0x00C7: 'C',
+    0x0106: 'C',
+    0x010C: 'C',
+    0x00E8: 'e',
+    0x00E9: 'e',
+    0x00EA: 'e',
+    0x00EB: 'e',
+    0x0113: 'e',
+    0x0117: 'e',
+    0x00C8: 'E',
+    0x00C9: 'E',
+    0x00CA: 'E',
+    0x00CB: 'E',
+    0x0112: 'E',
+    0x0116: 'E',
+    0x00EC: 'i',
+    0x00ED: 'i',
+    0x00EE: 'i',
+    0x00EF: 'i',
+    0x012B: 'i',
+    0x00CC: 'I',
+    0x00CD: 'I',
+    0x00CE: 'I',
+    0x00CF: 'I',
+    0x012A: 'I',
+    0x00F1: 'n',
+    0x0144: 'n',
+    0x00D1: 'N',
+    0x0143: 'N',
+    0x00F2: 'o',
+    0x00F3: 'o',
+    0x00F4: 'o',
+    0x00F5: 'o',
+    0x00F6: 'o',
+    0x00F8: 'o',
+    0x014D: 'o',
+    0x00D2: 'O',
+    0x00D3: 'O',
+    0x00D4: 'O',
+    0x00D5: 'O',
+    0x00D6: 'O',
+    0x00D8: 'O',
+    0x014C: 'O',
+    0x00F9: 'u',
+    0x00FA: 'u',
+    0x00FB: 'u',
+    0x00FC: 'u',
+    0x016B: 'u',
+    0x00D9: 'U',
+    0x00DA: 'U',
+    0x00DB: 'U',
+    0x00DC: 'U',
+    0x016A: 'U',
+    0x00FD: 'y',
+    0x00FF: 'y',
+    0x00DD: 'Y',
+    0x015B: 's',
+    0x0161: 's',
+    0x015A: 'S',
+    0x0160: 'S',
+    0x017A: 'z',
+    0x017C: 'z',
+    0x017E: 'z',
+    0x0179: 'Z',
+    0x017B: 'Z',
+    0x017D: 'Z',
+    0x0142: 'l',
+    0x0141: 'L',
+    0x011F: 'g',
+    0x011E: 'G',
+    0x00DF: 'ss',
+    0x00E6: 'ae',
+    0x00C6: 'AE',
+    0x0153: 'oe',
+    0x0152: 'OE',
+    0x2019: "'",
+  };
+
+  static String _extensionOf(String segment) {
+    final dot = segment.lastIndexOf('.');
+    return dot <= 0 ? '' : segment.substring(dot);
   }
 
   /// Registers an HLS stream to be served as continuous MPEG-TS.
@@ -652,8 +833,11 @@ class MediaProxy {
     final proxiedVttUrl = registerSubtitle(vttUrl, headers: headers);
 
     // Create a simple HLS playlist wrapping the VTT
+    // EXT-X-VERSION 3: a decimal EXTINF needs protocol version 3 or later
+    // (RFC 8216 §4.3.2.1).
     final playlistContent =
         '#EXTM3U\n'
+        '#EXT-X-VERSION:3\n'
         '#EXT-X-TARGETDURATION:99999\n'
         '#EXTINF:99999.0,\n'
         '$proxiedVttUrl\n'
@@ -688,8 +872,10 @@ class MediaProxy {
       final isDefault = i == 0 ? 'YES' : 'NO';
       buffer.writeln(
         '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",'
-        'NAME="${entry.name}",DEFAULT=$isDefault,AUTOSELECT=$isDefault,'
-        'LANGUAGE="${entry.language}",URI="${entry.url}"',
+        'NAME="${_quotedStringValue(entry.name)}",'
+        'DEFAULT=$isDefault,AUTOSELECT=$isDefault,'
+        'LANGUAGE="${_quotedStringValue(entry.language)}",'
+        'URI="${entry.url}"',
       );
     }
 
@@ -782,8 +968,10 @@ class MediaProxy {
       }
 
       // Route: /ts-stream/<token> — HLS-to-MPEG-TS streaming
+      // A trailing `/<name>.ts` segment is a display name, see
+      // [withDisplayName]; routing uses the token alone.
       if (path.startsWith('/ts-stream/')) {
-        final token = path.substring('/ts-stream/'.length);
+        final token = _firstSegment(path.substring('/ts-stream/'.length));
         await _handleHlsStreamRequest(request, token);
         return;
       }
@@ -816,7 +1004,7 @@ class MediaProxy {
 
       // Route: /file/<token> — local file serving
       if (path.startsWith('/file/')) {
-        final token = path.substring('/file/'.length);
+        final token = _firstSegment(path.substring('/file/'.length));
         await _handleFileRequest(request, token);
         return;
       }
@@ -832,6 +1020,11 @@ class MediaProxy {
         // Response may already be closed
       }
     }
+  }
+
+  static String _firstSegment(String rest) {
+    final slash = rest.indexOf('/');
+    return slash < 0 ? rest : rest.substring(0, slash);
   }
 
   Future<void> _handleSyntheticRequest(
@@ -858,8 +1051,15 @@ class MediaProxy {
     try {
       final headers = StringBuffer();
       headers.write('HTTP/1.0 200 OK\r\n');
-      headers.write('Content-Type: ${synthetic.contentType.mimeType}\r\n');
+      headers.write('Date: ${HttpDate.format(DateTime.now())}\r\n');
+      // The body is always UTF-8 encoded above; say so for text types.
+      headers.write(
+        'Content-Type: ${synthetic.contentType.mimeType}; charset=utf-8\r\n',
+      );
       headers.write('Content-Length: ${encoded.length}\r\n');
+      // Synthetic playlists are fetched cross-origin by the Chromecast
+      // receiver's player; the header is ignored by DLNA renderers.
+      headers.write('Access-Control-Allow-Origin: *\r\n');
       headers.write('\r\n');
       socket.add(utf8.encode(headers.toString()));
       if (request.method != 'HEAD') {
@@ -1104,13 +1304,35 @@ class MediaProxy {
       upstreamRequest.headers.set(entry.key, entry.value);
     }
 
-    // Forward Range header if present
+    // Forward Range header if present — but not for playlists and
+    // subtitles, which are rewritten or converted whole: a 206 partial
+    // playlist would skip the rewrite and reach the receiver with its raw
+    // relative URIs.
     final rangeHeader = request.headers.value('Range');
-    if (rangeHeader != null) {
+    if (rangeHeader != null &&
+        !_isHlsResponse(targetUrl, null) &&
+        !_isSubtitleResponse(targetUrl, null)) {
       upstreamRequest.headers.set('Range', rangeHeader);
+      // Byte ranges count encoded bytes; ask for identity so the range we
+      // forward back describes the body we actually send.
+      upstreamRequest.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
     }
 
     final upstreamResponse = await upstreamRequest.close();
+
+    // RFC 3986 §5.1.3: relative URIs in a fetched playlist resolve against
+    // the URL it was retrieved from, i.e. after any redirects.
+    var finalUpstreamUri = upstreamUri;
+    for (final redirect in upstreamResponse.redirects) {
+      finalUpstreamUri = finalUpstreamUri.resolveUri(redirect.location);
+    }
+
+    // HttpClient transparently gunzips. The upstream Content-Length and
+    // Content-Range then describe the compressed bytes, not the ones we
+    // send (RFC 9110 §8.6), so they must not be forwarded.
+    final upstreamWasDecompressed =
+        upstreamResponse.compressionState ==
+        HttpClientResponseCompressionState.decompressed;
 
     // Set response status
     request.response.statusCode = upstreamResponse.statusCode;
@@ -1157,8 +1379,13 @@ class MediaProxy {
       request.response.headers.contentType = effectiveContentType;
     }
 
+    // Stripping DVB packets from a 206 body would make it shorter than the
+    // forwarded Content-Range says (RFC 9110 §14.4), so partial content
+    // passes through untouched.
+    final isPartial = upstreamResponse.statusCode == HttpStatus.partialContent;
+
     final contentRange = upstreamResponse.headers.value('Content-Range');
-    if (contentRange != null) {
+    if (contentRange != null && !upstreamWasDecompressed) {
       request.response.headers.set('Content-Range', contentRange);
       request.response.headers.set('Accept-Ranges', 'bytes');
     }
@@ -1177,13 +1404,14 @@ class MediaProxy {
     final willStripMp2t =
         effectiveContentType?.primaryType.toLowerCase() == 'video' &&
         effectiveContentType?.subType.toLowerCase() == 'mp2t' &&
-        route.stripDvbTables;
+        route.stripDvbTables &&
+        !isPartial;
     final willMutateBody =
         _isSubtitleResponse(targetUrl, upstreamContentType) ||
         _isHlsResponse(targetUrl, upstreamContentType) ||
         willStripMp2t;
     final contentLength = upstreamResponse.headers.value('Content-Length');
-    if (contentLength != null && !willMutateBody) {
+    if (contentLength != null && !willMutateBody && !upstreamWasDecompressed) {
       request.response.headers.set('Content-Length', contentLength);
     }
 
@@ -1194,7 +1422,7 @@ class MediaProxy {
         <int>[],
         (prev, chunk) => prev..addAll(chunk),
       );
-      var content = utf8.decode(body);
+      var content = SubtitleConverter.decodeText(body);
 
       CastLogger.debug(
         'MediaProxy: subtitle response (${content.length} chars, '
@@ -1211,10 +1439,11 @@ class MediaProxy {
         CastLogger.debug('MediaProxy: converted SRT → VTT');
       }
 
-      // Strip X-TIMESTAMP-MAP from VTT — this header is for HLS subtitle
-      // segments and causes cast devices to apply an incorrect PTS offset
-      // when the VTT is served as a sidecar track.
-      if (content.contains('X-TIMESTAMP-MAP')) {
+      // Strip X-TIMESTAMP-MAP from a sidecar VTT — the header is for HLS
+      // subtitle segments and makes cast devices apply a PTS offset to a
+      // sidecar track. A WebVTT segment fetched through a rewritten HLS
+      // playlist (`?url=`) needs it to stay in sync (RFC 8216 §3.5).
+      if (urlParam == null && content.contains('X-TIMESTAMP-MAP')) {
         CastLogger.debug('MediaProxy: stripping X-TIMESTAMP-MAP from VTT');
         content = SubtitleConverter.stripTimestampMap(content);
       }
@@ -1235,12 +1464,12 @@ class MediaProxy {
         <int>[],
         (prev, chunk) => prev..addAll(chunk),
       );
-      final content = utf8.decode(body);
+      final content = utf8.decode(body, allowMalformed: true);
 
       if (content.trimLeft().startsWith('#EXTM3U')) {
         final rewritten = HlsParser.rewritePlaylist(
           content,
-          targetUrl,
+          finalUpstreamUri.toString(),
           _baseUrl!,
           token,
         );
@@ -1286,7 +1515,8 @@ class MediaProxy {
     final isMp2t =
         effectiveContentType?.primaryType.toLowerCase() == 'video' &&
         effectiveContentType?.subType.toLowerCase() == 'mp2t';
-    final stripper = (isMp2t && route.stripDvbTables) ? TsDvbStripper() : null;
+    final stripper =
+        (isMp2t && route.stripDvbTables && !isPartial) ? TsDvbStripper() : null;
 
     var isFirstChunk = true;
     await for (final chunk in upstreamResponse) {
@@ -1431,7 +1661,7 @@ class MediaProxy {
     // HTTP/1.0 for DLNA compatibility. Non-subtitle files fall through
     // to the HTTP/1.0 file server below.
     if (_isSubtitleFile(route.url)) {
-      var content = await file.readAsString();
+      var content = SubtitleConverter.decodeText(await file.readAsBytes());
 
       CastLogger.debug(
         'MediaProxy: local subtitle file (${content.length} chars, '
@@ -1489,6 +1719,11 @@ class MediaProxy {
 
       request.response.statusCode = HttpStatus.ok;
       request.response.contentLength = totalLength;
+      // These segments are fetched by the Chromecast receiver's player
+      // across origins, like every other HLS resource we serve, and need a
+      // media type (RFC 9110 §8.3).
+      request.response.headers.contentType = ContentType('video', 'mp2t');
+      _addCorsHeaders(request.response, request.headers.value('Origin'));
 
       if (patPmt != null) {
         request.response.add(patPmt);
@@ -1626,6 +1861,16 @@ class MediaProxy {
   ///   - Allow-Headers must include `Content-Type, Accept-Encoding, Range`
   ///   - Allow-Methods must include `GET, POST, OPTIONS`
   ///   - Expose-Headers must include `Content-Length, Content-Range`
+  /// Makes [value] safe inside an HLS quoted-string, which may not contain
+  /// a double quote, CR or LF (RFC 8216 §4.2).
+  /// Ticks from PTS [from] to PTS [to] on the 33-bit, 90 kHz MPEG clock,
+  /// which wraps about every 26.5 hours (ISO/IEC 13818-1 §2.4.3.7). A
+  /// recording that crosses the wrap would otherwise get a negative delta.
+  static int _ptsDelta(int from, int to) => (to - from) & ((1 << 33) - 1);
+
+  static String _quotedStringValue(String value) =>
+      value.replaceAll('"', "'").replaceAll(RegExp(r'[\r\n]+'), ' ');
+
   void _addCorsHeaders(HttpResponse response, [String? requestOrigin]) {
     response.headers.set(
       'Access-Control-Allow-Origin',

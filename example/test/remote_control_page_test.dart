@@ -2,7 +2,7 @@ import 'dart:io';
 
 import 'package:dart_cast/dart_cast.dart';
 import 'package:dart_cast_example/remote_control_page.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Fake session that records every command the UI sends, so tests can
@@ -47,12 +47,12 @@ class FakeCastSession extends CastSession {
 }
 
 CastDevice _device() => CastDevice(
-      id: 'tv-1',
-      name: 'Living room TV',
-      protocol: CastProtocol.chromecast,
-      address: InternetAddress('192.168.2.17'),
-      port: 8009,
-    );
+  id: 'tv-1',
+  name: 'Living room TV',
+  protocol: CastProtocol.chromecast,
+  address: InternetAddress('192.168.2.17'),
+  port: 8009,
+);
 
 Widget _wrap(Widget child) => MaterialApp(home: child);
 
@@ -72,18 +72,18 @@ void main() {
   RemoteControlPage page({
     CastMedia? initialMedia,
     List<CastMedia>? customMedia,
-  }) =>
-      RemoteControlPage(
-        session: session,
-        device: session.device,
-        castService: castService,
-        customMedia: customMedia ?? [],
-        initialMedia: initialMedia,
-      );
+  }) => RemoteControlPage(
+    session: session,
+    device: session.device,
+    castService: castService,
+    customMedia: customMedia ?? [],
+    initialMedia: initialMedia,
+  );
 
   group('volume', () {
-    testWidgets('slider seeds from the level the device reported',
-        (tester) async {
+    testWidgets('slider seeds from the level the device reported', (
+      tester,
+    ) async {
       // The device announced 18% during the connect handshake, before the
       // page ever subscribed to the stream.
       session.updateVolume(0.18);
@@ -98,8 +98,9 @@ void main() {
       expect(session.volumeCalls, isEmpty);
     });
 
-    testWidgets('loading media never rewrites the device volume',
-        (tester) async {
+    testWidgets('loading media never rewrites the device volume', (
+      tester,
+    ) async {
       session.updateVolume(0.18);
       await tester.pumpWidget(_wrap(page()));
 
@@ -110,8 +111,9 @@ void main() {
       expect(session.volumeCalls, isEmpty);
     });
 
-    testWidgets('mute sends 0 and unmute restores the device level',
-        (tester) async {
+    testWidgets('mute sends 0 and unmute restores the device level', (
+      tester,
+    ) async {
       session.updateVolume(0.18);
       await tester.pumpWidget(_wrap(page()));
       await tester.tap(find.text('Big Buck Bunny (HLS)'));
@@ -131,16 +133,16 @@ void main() {
   });
 
   group('layout', () {
-    testWidgets('player panel is hidden until media is loaded',
-        (tester) async {
+    testWidgets('player panel is hidden until media is loaded', (tester) async {
       await tester.pumpWidget(_wrap(page()));
 
       expect(find.byTooltip('Play'), findsNothing);
       expect(find.byType(Slider), findsNothing);
     });
 
-    testWidgets('player panel is pinned outside the scrolling library',
-        (tester) async {
+    testWidgets('player panel is pinned outside the scrolling library', (
+      tester,
+    ) async {
       await tester.pumpWidget(_wrap(page()));
       await tester.tap(find.text('Big Buck Bunny (HLS)'));
       await tester.pump();
@@ -160,8 +162,7 @@ void main() {
       );
     });
 
-    testWidgets('app bar offers switch-device and disconnect',
-        (tester) async {
+    testWidgets('app bar offers switch-device and disconnect', (tester) async {
       await tester.pumpWidget(_wrap(page()));
 
       expect(find.byTooltip('Switch device'), findsOneWidget);
@@ -170,8 +171,9 @@ void main() {
   });
 
   group('library', () {
-    testWidgets('tapping an item casts it, tapping it again is a no-op',
-        (tester) async {
+    testWidgets('tapping an item casts it, tapping it again is a no-op', (
+      tester,
+    ) async {
       // Tall surface so the whole library renders without scrolling.
       tester.view.physicalSize = const Size(800, 2400);
       tester.view.devicePixelRatio = 1.0;
@@ -185,10 +187,12 @@ void main() {
 
       // Same item again: already playing, must not reload. (Scoped to the
       // ListTile — the player panel now shows the same title.)
-      await tester.tap(find.descendant(
-        of: find.byType(ListTile),
-        matching: find.text('Big Buck Bunny (HLS)'),
-      ));
+      await tester.tap(
+        find.descendant(
+          of: find.byType(ListTile),
+          matching: find.text('Big Buck Bunny (HLS)'),
+        ),
+      );
       await tester.pump();
       expect(session.loadedMedia, hasLength(1));
 
@@ -201,8 +205,9 @@ void main() {
   });
 
   group('adding sources while connected', () {
-    testWidgets('Add URL dialog appends to the shared custom media list',
-        (tester) async {
+    testWidgets('Add URL dialog appends to the shared custom media list', (
+      tester,
+    ) async {
       // Tall surface: the custom item lands at the end of the library.
       tester.view.physicalSize = const Size(800, 2400);
       tester.view.devicePixelRatio = 1.0;
@@ -272,8 +277,9 @@ void main() {
   });
 
   group('device switching handoff', () {
-    testWidgets('initialMedia auto-loads with its start position preserved',
-        (tester) async {
+    testWidgets('initialMedia auto-loads with its start position preserved', (
+      tester,
+    ) async {
       final resumed = _resumableMp4.copyWith(
         startPosition: const Duration(minutes: 12),
       );
@@ -323,8 +329,7 @@ void main() {
 
 /// Shorthand for the demo MP4 item used in the handoff test.
 const CastMedia _resumableMp4 = CastMedia(
-  url:
-      'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
+  url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
   type: CastMediaType.mp4,
   title: 'Elephants Dream (MP4)',
 );

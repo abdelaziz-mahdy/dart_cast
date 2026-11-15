@@ -1,3 +1,39 @@
+## 0.8.0
+
+A protocol audit against the Cast, UPnP/DLNA, HLS, HTTP, WebVTT, MPEG-TS,
+DNS-SD and AirPlay specifications, followed by a day of testing on a TCL
+Google TV. Results: `doc/specs/2026-11-15-spec-compliance-hardware-results.md`.
+
+### New
+- `HlsParser.extractMediaSegments` and `HlsParser.extractVariantStreams` return segments with their byte ranges and variants with their codecs, resolution and audio group; `HlsParser.parseAttributeList`, `isEncrypted` and `hasInitializationSection` read playlist tags
+- `MediaProxy.withDisplayName` ends a proxy URL in a readable name
+- `MdnsDiscovery.parseTxtRecords` parses DNS-SD TXT records
+
+### Fixed
+Seen on a TCL Google TV:
+- DLNA: HLS streams play, pause and seek. They previously stopped after a few seconds when the playlist was behind a redirect, and otherwise played with no position and could not be paused or stopped
+- DLNA: the TV shows the video's title instead of a random string of letters
+- DLNA: switching subtitles keeps the playback position instead of restarting the video, and no longer leaves the TV playing something the app cannot control
+- Chromecast: fMP4 (CMAF) HLS streams load — they previously failed with `LOAD_FAILED`
+- Chromecast: SRT subtitle lines that are only a number ("42", "1984") are shown, and `&` and `<` display correctly
+- Chromecast: the session ends when another phone stops the cast app, and stays connected while idle by answering the TV's keep-alive
+- Chromecast: volume requests outside 0–1 are clamped
+- HLS through the proxy: playlists behind redirects, byte-range segments, tags between `#EXTINF` and the segment line, and segment names that hide their type (`.jpg`) play on Chromecast
+
+Checked against tests only (**unverified on hardware**):
+- DLNA: volume follows the renderer's declared volume range instead of assuming 0–100 (the TV tested uses 0–100)
+- DLNA: renderers whose control URLs are relative to a sub-path, and device names containing `&` or accented characters
+- DLNA: encrypted or fMP4 HLS is refused instead of being sent to the TV as noise
+- Chromecast: a LOAD is only reported as done by the TV's answer to that LOAD; local MPEG-TS keyframes are found on the video stream only (both ran on the TV without regressions, but the cases they fix did not occur)
+- SRT files saved as UTF-16 or Latin-1, gzip-compressed sources, 416 range replies, and Bonjour TXT records with unusual encodings
+- AirPlay: pairing checks the receiver's proof, the event channel uses the right keys and answers the receiver, and property lists keep their data types. Video playback over AirPlay has not started on any receiver tested so far
+
+### Changed
+- Example app: uses `package:material_ui` (Flutter 3.47 or newer)
+
+### Known limitations
+- DLNA on TCL TVs: subtitles from a separate file are not shown. The TV hands only the video to its player; subtitles embedded in an MKV are shown
+
 ## 0.7.5
 
 ### New

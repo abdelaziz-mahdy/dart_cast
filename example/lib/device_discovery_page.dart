@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:dart_cast/dart_cast.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'cast_connector.dart';
 import 'device_list_sheet.dart';
@@ -114,9 +114,8 @@ class _DeviceDiscoveryPageState extends State<DeviceDiscoveryPage> {
     _customUrlController.clear();
     _customSubUrlController.clear();
 
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Added to media list')));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('Added to media list')));
   }
 
   /// Picks a local video file and adds it to the media list.
@@ -194,13 +193,12 @@ class _DeviceDiscoveryPageState extends State<DeviceDiscoveryPage> {
 
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder:
-            (_) => RemoteControlPage(
-              session: session,
-              device: device,
-              castService: _castService,
-              customMedia: _customMedia,
-            ),
+        builder: (_) => RemoteControlPage(
+          session: session,
+          device: device,
+          castService: _castService,
+          customMedia: _customMedia,
+        ),
       ),
     );
   }
@@ -251,12 +249,11 @@ class _DeviceDiscoveryPageState extends State<DeviceDiscoveryPage> {
           // Cast button in the AppBar — the standard UX pattern.
           ValueListenableBuilder<bool>(
             valueListenable: _isDiscovering,
-            builder:
-                (context, discovering, _) => IconButton(
-                  icon: Icon(discovering ? Icons.cast_connected : Icons.cast),
-                  tooltip: 'Discover devices',
-                  onPressed: _startDiscovery,
-                ),
+            builder: (context, discovering, _) => IconButton(
+              icon: Icon(discovering ? Icons.cast_connected : Icons.cast),
+              tooltip: 'Discover devices',
+              onPressed: _startDiscovery,
+            ),
           ),
         ],
       ),
