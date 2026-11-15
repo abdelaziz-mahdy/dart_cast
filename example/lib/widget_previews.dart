@@ -7,7 +7,7 @@ library;
 import 'dart:io';
 
 import 'package:dart_cast/dart_cast.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/widget_previews.dart';
 
 import 'cast_media_demo.dart';
@@ -75,12 +75,12 @@ class _PreviewCastSession extends CastSession {
 }
 
 CastDevice _previewDevice() => CastDevice(
-      id: 'preview-tv',
-      name: 'Living room TV',
-      protocol: CastProtocol.chromecast,
-      address: const _FakeInternetAddress('192.168.2.17'),
-      port: 8009,
-    );
+  id: 'preview-tv',
+  name: 'Living room TV',
+  protocol: CastProtocol.chromecast,
+  address: const _FakeInternetAddress('192.168.2.17'),
+  port: 8009,
+);
 
 Widget _theme(Widget child, {Brightness brightness = Brightness.light}) {
   return MaterialApp(
@@ -94,7 +94,10 @@ Widget _theme(Widget child, {Brightness brightness = Brightness.light}) {
   );
 }
 
-Widget _remote({CastMedia? initialMedia, Brightness brightness = Brightness.light}) {
+Widget _remote({
+  CastMedia? initialMedia,
+  Brightness brightness = Brightness.light,
+}) {
   final session = _PreviewCastSession(_previewDevice());
   return _theme(
     brightness: brightness,
@@ -116,9 +119,9 @@ Widget remotePlaying() => _remote(initialMedia: CastMediaDemo.mp4TearsOfSteel);
 
 @Preview(name: 'Remote — playing, dark mode', size: Size(420, 860))
 Widget remotePlayingDark() => _remote(
-      initialMedia: CastMediaDemo.mp4TearsOfSteel,
-      brightness: Brightness.dark,
-    );
+  initialMedia: CastMediaDemo.mp4TearsOfSteel,
+  brightness: Brightness.dark,
+);
 
 @Preview(name: 'Remote — desktop, playing', size: Size(1280, 800))
 Widget remotePlayingDesktop() =>

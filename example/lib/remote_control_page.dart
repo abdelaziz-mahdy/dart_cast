@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:dart_cast/dart_cast.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
 import 'cast_connector.dart';
@@ -23,8 +23,7 @@ class OptimisticSliderState {
   final VoidCallback _onStateChanged;
   static const _lockDuration = Duration(seconds: 3);
 
-  OptimisticSliderState({required VoidCallback onStateChanged})
-    : _onStateChanged = onStateChanged;
+  OptimisticSliderState({required this._onStateChanged});
 
   double displayValue(double polledValue) {
     return _dragValue ?? _lockedValue ?? polledValue;
@@ -396,9 +395,8 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
           _currentMedia == null
               ? 'Pick something to cast to ${widget.device.name}.'
               : 'Tap another item to switch what is playing.',
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
-          ),
+          style: Theme.of(context).textTheme.bodySmall
+              ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
         ),
         const SizedBox(height: 8),
         ...CastMediaDemo.allMedia.map((media) => _buildMediaTile(media)),
@@ -559,17 +557,16 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
         return IconButton.filled(
           iconSize: 36,
           onPressed: isBuffering ? null : (isPlaying ? _pause : _play),
-          icon:
-              isBuffering
-                  ? const SizedBox(
-                    width: 36,
-                    height: 36,
-                    child: Padding(
-                      padding: EdgeInsets.all(6),
-                      child: CircularProgressIndicator(strokeWidth: 3),
-                    ),
-                  )
-                  : Icon(isPlaying ? Icons.pause : Icons.play_arrow),
+          icon: isBuffering
+              ? const SizedBox(
+                  width: 36,
+                  height: 36,
+                  child: Padding(
+                    padding: EdgeInsets.all(6),
+                    child: CircularProgressIndicator(strokeWidth: 3),
+                  ),
+                )
+              : Icon(isPlaying ? Icons.pause : Icons.play_arrow),
           tooltip: isPlaying ? 'Pause' : 'Play',
         );
       },
@@ -589,10 +586,9 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
             final position = posSnapshot.data ?? Duration.zero;
             final duration = durSnapshot.data ?? Duration.zero;
             final maxSeconds = duration.inSeconds.toDouble();
-            final polledSeconds =
-                maxSeconds > 0
-                    ? position.inSeconds.toDouble().clamp(0.0, maxSeconds)
-                    : 0.0;
+            final polledSeconds = maxSeconds > 0
+                ? position.inSeconds.toDouble().clamp(0.0, maxSeconds)
+                : 0.0;
             final displaySeconds = _seekState.displayValue(polledSeconds);
 
             return Row(
@@ -603,21 +599,18 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
                 ),
                 Expanded(
                   child: Slider(
-                    value:
-                        maxSeconds > 0
-                            ? displaySeconds.clamp(0.0, maxSeconds)
-                            : 0,
+                    value: maxSeconds > 0
+                        ? displaySeconds.clamp(0.0, maxSeconds)
+                        : 0,
                     max: maxSeconds > 0 ? maxSeconds : 1,
-                    onChanged:
-                        maxSeconds > 0
-                            ? (value) => _seekState.onDragUpdate(value)
-                            : null,
-                    onChangeEnd:
-                        maxSeconds > 0
-                            ? (value) => _seekState.onDragEnd(value, () {
-                              _seek(Duration(seconds: value.toInt()));
-                            })
-                            : null,
+                    onChanged: maxSeconds > 0
+                        ? (value) => _seekState.onDragUpdate(value)
+                        : null,
+                    onChangeEnd: maxSeconds > 0
+                        ? (value) => _seekState.onDragEnd(value, () {
+                            _seek(Duration(seconds: value.toInt()));
+                          })
+                        : null,
                   ),
                 ),
                 Text(
@@ -667,10 +660,9 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
         return Slider(
           value: displayVol.clamp(0.0, 1.0),
           onChanged: (value) => _volumeState.onDragUpdate(value),
-          onChangeEnd:
-              (value) => _volumeState.onDragEnd(value, () {
-                _setVolume(value);
-              }),
+          onChangeEnd: (value) => _volumeState.onDragEnd(value, () {
+            _setVolume(value);
+          }),
         );
       },
     );
@@ -697,30 +689,28 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     return PopupMenuButton<CastSubtitle?>(
       icon: Icon(
         _selectedSubtitle != null ? Icons.subtitles : Icons.subtitles_outlined,
-        color:
-            _selectedSubtitle != null
-                ? Theme.of(context).colorScheme.primary
-                : null,
+        color: _selectedSubtitle != null
+            ? Theme.of(context).colorScheme.primary
+            : null,
       ),
       tooltip: 'Subtitles',
       onSelected: (_) {},
-      itemBuilder:
-          (context) => [
-            CheckedPopupMenuItem<CastSubtitle?>(
-              value: null,
-              checked: _selectedSubtitle == null,
-              onTap: () => _setSubtitle(null),
-              child: const Text('Off'),
-            ),
-            ...subtitles.map(
-              (sub) => CheckedPopupMenuItem<CastSubtitle?>(
-                value: sub,
-                checked: _selectedSubtitle?.language == sub.language,
-                onTap: () => _setSubtitle(sub),
-                child: Text(sub.label),
-              ),
-            ),
-          ],
+      itemBuilder: (context) => [
+        CheckedPopupMenuItem<CastSubtitle?>(
+          value: null,
+          checked: _selectedSubtitle == null,
+          onTap: () => _setSubtitle(null),
+          child: const Text('Off'),
+        ),
+        ...subtitles.map(
+          (sub) => CheckedPopupMenuItem<CastSubtitle?>(
+            value: sub,
+            checked: _selectedSubtitle?.language == sub.language,
+            onTap: () => _setSubtitle(sub),
+            child: Text(sub.label),
+          ),
+        ),
+      ],
     );
   }
 
@@ -887,14 +877,13 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute<void>(
-        builder:
-            (_) => RemoteControlPage(
-              session: session,
-              device: device,
-              castService: widget.castService,
-              customMedia: widget.customMedia,
-              initialMedia: media?.copyWith(startPosition: position),
-            ),
+        builder: (_) => RemoteControlPage(
+          session: session,
+          device: device,
+          castService: widget.castService,
+          customMedia: widget.customMedia,
+          initialMedia: media?.copyWith(startPosition: position),
+        ),
       ),
     );
   }
@@ -911,9 +900,8 @@ class _RemoteControlPageState extends State<RemoteControlPage> {
 
   void _showError(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
   }
 
   // -- Helpers --
