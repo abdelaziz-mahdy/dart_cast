@@ -42,6 +42,16 @@ class FakeRawDatagramSocket implements RawDatagramSocket {
     return buffer.length;
   }
 
+  final List<List<int>> multicastInterfaceOptions = [];
+
+  @override
+  void setRawOption(RawSocketOption option) {
+    if (option.level == RawSocketOption.levelIPv4 &&
+        option.option == RawSocketOption.IPv4MulticastInterface) {
+      multicastInterfaceOptions.add(option.value.toList());
+    }
+  }
+
   @override
   Datagram? receive() => nextDatagram;
 
@@ -79,8 +89,6 @@ class FakeRawDatagramSocket implements RawDatagramSocket {
   set writeEventsEnabled(bool value) {}
   @override
   Uint8List getRawOption(RawSocketOption option) => Uint8List(0);
-  @override
-  void setRawOption(RawSocketOption option) {}
   @override
   int multicastHops = 1;
   @override
@@ -227,6 +235,53 @@ void main() {
     test('protocol is CastProtocol.dlna', () {
       final provider = DlnaDiscoveryProvider();
       expect(provider.protocol, equals(CastProtocol.dlna));
+    });
+
+    test('searches from every local IPv4 address, each socket pinned to '
+        'its own interface (UDA 1.1 §1.1.2)', () async {
+      final bound = <String, FakeRawDatagramSocket>{};
+      final provider = DlnaDiscoveryProvider(
+        socketFactory:
+            (host, port) async =>
+                bound[(host as InternetAddress).address] =
+                    FakeRawDatagramSocket(),
+        httpFetcher: (url) async => _deviceXml,
+        localAddresses:
+            () async => [
+              InternetAddress('192.168.2.15'),
+              InternetAddress('10.0.0.7'),
+            ],
+      );
+      final results = <List<CastDevice>>[];
+      final sub = provider
+          .startDiscovery(timeout: const Duration(milliseconds: 400))
+          .listen(results.add);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(bound.keys, unorderedEquals(['192.168.2.15', '10.0.0.7']));
+      for (final socket in bound.values) {
+        expect(socket.sentData, isNotEmpty);
+        expect(socket.multicastInterfaceOptions, hasLength(1));
+      }
+      expect(bound['10.0.0.7']!.multicastInterfaceOptions.single, [
+        10,
+        0,
+        0,
+        7,
+      ]);
+
+      // A renderer answering on the second network is found.
+      bound['10.0.0.7']!.simulateResponse(
+        'HTTP/1.1 200 OK\r\n'
+        'LOCATION: http://10.0.0.20:8080/description.xml\r\n'
+        'USN: uuid:second-lan::urn:schemas-upnp-org:device:MediaRenderer:1\r\n'
+        '\r\n',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(results, isNotEmpty);
+      await sub.cancel();
+      provider.stopDiscovery();
+      expect(bound.values.every((s) => s.closed), isTrue);
     });
 
     test('discovers devices from SSDP responses', () async {

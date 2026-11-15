@@ -12,6 +12,9 @@ import 'ssdp_discovery.dart';
 typedef RawDatagramSocketFactory =
     Future<RawDatagramSocket> Function(dynamic host, int port);
 
+/// Function type listing the local IPv4 addresses to search from.
+typedef LocalAddressLister = Future<List<InternetAddress>> Function();
+
 /// Function type for fetching a URL and returning its body.
 typedef HttpFetcher = Future<String> Function(String url);
 
@@ -23,8 +26,9 @@ typedef HttpFetcher = Future<String> Function(String url);
 class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
   final RawDatagramSocketFactory _socketFactory;
   final HttpFetcher _httpFetcher;
+  final LocalAddressLister _localAddresses;
 
-  RawDatagramSocket? _socket;
+  final List<RawDatagramSocket> _sockets = [];
   StreamController<List<CastDevice>>? _controller;
   Timer? _searchTimer;
   Timer? _timeoutTimer;
@@ -32,12 +36,39 @@ class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
 
   /// Creates a [DlnaDiscoveryProvider].
   ///
-  /// Optional [socketFactory] and [httpFetcher] can be provided for testing.
+  /// Optional [socketFactory], [httpFetcher] and [localAddresses] can be
+  /// provided for testing. With a [socketFactory] but no [localAddresses],
+  /// one socket bound to the wildcard address is used.
   DlnaDiscoveryProvider({
     RawDatagramSocketFactory? socketFactory,
     HttpFetcher? httpFetcher,
+    LocalAddressLister? localAddresses,
   }) : _socketFactory = socketFactory ?? RawDatagramSocket.bind,
-       _httpFetcher = httpFetcher ?? _defaultHttpFetch;
+       _httpFetcher = httpFetcher ?? _defaultHttpFetch,
+       _localAddresses =
+           localAddresses ??
+           (socketFactory == null
+               ? _ipv4InterfaceAddresses
+               : () async => [InternetAddress.anyIPv4]);
+
+  /// Every non-loopback IPv4 address of this host, or the wildcard address
+  /// when none can be listed.
+  static Future<List<InternetAddress>> _ipv4InterfaceAddresses() async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+      );
+      final addresses = [
+        for (final i in interfaces)
+          for (final a in i.addresses)
+            if (!a.isLoopback && !a.isLinkLocal) a,
+      ];
+      if (addresses.isNotEmpty) return addresses;
+    } catch (e) {
+      CastLogger.debug('DLNA: could not list interfaces ($e)');
+    }
+    return [InternetAddress.anyIPv4];
+  }
 
   @override
   CastProtocol get protocol => CastProtocol.dlna;
@@ -57,46 +88,59 @@ class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
 
   Future<void> _doDiscovery(Duration timeout) async {
     try {
-      CastLogger.info('DLNA: binding UDP socket for SSDP discovery');
       final controller = _controller;
-      final socket = await _socketFactory(InternetAddress.anyIPv4, 0);
-      if (!identical(controller, _controller)) {
-        // stopDiscovery() or a newer startDiscovery() ran while binding.
-        socket.close();
-        return;
-      }
-      _socket = socket;
-      _socket!.broadcastEnabled = true;
-      _socket!.multicastLoopback = false;
-      // UDA 1.1 §1.1.2: the multicast TTL SHOULD default to 2.
-      _socket!.multicastHops = 2;
-
-      _socket!.listen((event) {
-        if (event == RawSocketEvent.read) {
-          final datagram = _socket!.receive();
-          if (datagram != null) {
-            _handleResponse(String.fromCharCodes(datagram.data));
-          }
+      // UDA 1.1 §1.1.2: a control point searches on every network it is
+      // attached to. One wildcard socket only reaches the interface of the
+      // default multicast route, so a TV on a second LAN (Ethernet beside
+      // Wi-Fi, a VPN) was never asked. One socket per IPv4 address, each
+      // sending through its own interface.
+      final addresses = await _localAddresses();
+      CastLogger.info(
+        'DLNA: binding ${addresses.length} UDP socket(s) for SSDP discovery',
+      );
+      for (final address in addresses) {
+        final RawDatagramSocket socket;
+        try {
+          socket = await _socketFactory(address, 0);
+        } catch (e) {
+          CastLogger.debug('DLNA: cannot bind ${address.address}: $e');
+          continue;
         }
-      });
+        if (!identical(controller, _controller)) {
+          // stopDiscovery() or a newer startDiscovery() ran while binding.
+          socket.close();
+          return;
+        }
+        _configure(socket, address);
+        _sockets.add(socket);
+      }
+      if (_sockets.isEmpty) {
+        throw const SocketException('DLNA: no socket could be bound');
+      }
 
       // Send M-SEARCH for MediaRenderer
       final searchTarget = SsdpConstants.searchTargets[2]; // MediaRenderer
       final mSearch = SsdpMessage.mSearch(searchTarget, 3);
       final data = mSearch.codeUnits;
-      final address = InternetAddress(SsdpConstants.multicastAddress);
+      final group = InternetAddress(SsdpConstants.multicastAddress);
+
+      void sendAll() {
+        for (final socket in _sockets) {
+          try {
+            socket.send(data, group, SsdpConstants.multicastPort);
+          } catch (e) {
+            CastLogger.debug('DLNA: M-SEARCH send failed: $e');
+          }
+        }
+      }
 
       CastLogger.info(
         'DLNA: sending M-SEARCH to ${SsdpConstants.multicastAddress}:${SsdpConstants.multicastPort}',
       );
-      _socket!.send(data, address, SsdpConstants.multicastPort);
+      sendAll();
 
       // Send again after a short delay for reliability
-      _searchTimer = Timer(const Duration(milliseconds: 500), () {
-        try {
-          _socket?.send(data, address, SsdpConstants.multicastPort);
-        } catch (_) {}
-      });
+      _searchTimer = Timer(const Duration(milliseconds: 500), sendAll);
 
       // Close after timeout
       _timeoutTimer = Timer(timeout, () {
@@ -108,6 +152,38 @@ class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
       _controller?.addError(e);
       _controller?.close();
     }
+  }
+
+  void _configure(RawDatagramSocket socket, InternetAddress address) {
+    socket.broadcastEnabled = true;
+    socket.multicastLoopback = false;
+    // UDA 1.1 §1.1.2: the multicast TTL SHOULD default to 2.
+    socket.multicastHops = 2;
+    if (address != InternetAddress.anyIPv4) {
+      // Send this socket's multicast through the interface owning
+      // [address] (IP_MULTICAST_IF takes the interface's IPv4 address).
+      try {
+        socket.setRawOption(
+          RawSocketOption(
+            RawSocketOption.levelIPv4,
+            RawSocketOption.IPv4MulticastInterface,
+            address.rawAddress,
+          ),
+        );
+      } catch (e) {
+        CastLogger.debug(
+          'DLNA: cannot pin multicast to ${address.address}: $e',
+        );
+      }
+    }
+    socket.listen((event) {
+      if (event == RawSocketEvent.read) {
+        final datagram = socket.receive();
+        if (datagram != null) {
+          _handleResponse(String.fromCharCodes(datagram.data));
+        }
+      }
+    });
   }
 
   void _handleResponse(String data) async {
@@ -150,8 +226,10 @@ class DlnaDiscoveryProvider implements DeviceDiscoveryProvider {
     _timeoutTimer = null;
     _searchTimer?.cancel();
     _searchTimer = null;
-    _socket?.close();
-    _socket = null;
+    for (final socket in _sockets) {
+      socket.close();
+    }
+    _sockets.clear();
     if (_controller?.isClosed == false) {
       _controller?.close();
     }
