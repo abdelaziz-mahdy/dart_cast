@@ -4,7 +4,9 @@ import 'dart:typed_data';
 /// Decodes Apple binary plist format (`bplist00`) into Dart objects.
 ///
 /// Supports the same types as [BinaryPlistEncoder]: [String], [int], [double],
-/// [bool], `null`, [Map<String, dynamic>] (dict), and [List] (array).
+/// [bool], `null`, [Uint8List] (data), [Map<String, dynamic>] (dict), and
+/// [List] (array). Dates decode as their raw Core Foundation seconds
+/// ([double]) and UIDs as [PlistUid].
 ///
 /// The binary plist format consists of:
 /// 1. Header: `bplist00` (8 bytes)
@@ -114,6 +116,8 @@ class BinaryPlistDecoder {
         return _readAsciiString(offset, objectInfo);
       case 0x6: // Unicode string (UTF-16 BE)
         return _readUnicodeString(offset, objectInfo);
+      case 0x8: // UID — objectInfo + 1 bytes, big-endian
+        return PlistUid(_readUnsignedInt(offset + 1, objectInfo + 1));
       case 0xA: // array
         return _readArray(offset, objectInfo);
       case 0xD: // dict
@@ -260,7 +264,7 @@ class BinaryPlistDecoder {
 
 /// Encodes Dart objects into Apple binary plist format (`bplist00`).
 ///
-/// Supports: [String], [int], [double], [bool], `null`,
+/// Supports: [String], [int], [double], [bool], `null`, [Uint8List] (data),
 /// [Map<String, dynamic>] (dict), and [List] (array).
 ///
 /// The binary plist format consists of:
@@ -284,74 +288,56 @@ class BinaryPlistEncoder {
   /// Flattened list of all objects in order of their reference index.
   final List<Object?> _objects = [];
 
-  /// Maps objects to their reference indices to enable deduplication.
-  /// Keys are identity-based for non-primitive types.
-  final Map<Object, int> _objectRefs = {};
-
-  /// Tracks the reference index for `null` separately, since
-  /// `Map<Object, int>` cannot store null keys.
-  int? _nullObjectIndex;
+  /// Child reference indices for each container object, keyed by the
+  /// container's own index (dict: keys then values; array: items).
+  ///
+  /// References are recorded positionally while flattening rather than looked
+  /// up by value afterwards. A value-keyed lookup conflates `0` with `0.0`
+  /// (Dart's `==` and `hashCode` treat them as equal), which silently swapped
+  /// int and real types, and could not find `NaN` at all.
+  final Map<int, List<int>> _childRefs = {};
 
   /// Assigns a reference index to [obj], recursively flattening dicts/lists.
   ///
   /// Returns the reference index for [obj].
   int _flatten(Object? obj) {
-    // Booleans, null — use sentinel objects for dedup
-    if (obj == null) {
-      if (_nullObjectIndex != null) return _nullObjectIndex!;
-      return _addObject(null);
-    }
-    if (obj is bool) {
-      // Booleans are singletons, safe to use identity
-      final existing = _objectRefs[obj];
-      if (existing != null) return existing;
-      return _addObject(obj);
-    }
-    if (obj is int) {
-      // Small ints could be deduped but for simplicity just add
-      return _addObject(obj);
-    }
-    if (obj is double) {
-      return _addObject(obj);
-    }
-    if (obj is String) {
+    if (obj == null ||
+        obj is bool ||
+        obj is int ||
+        obj is double ||
+        obj is String ||
+        obj is Uint8List) {
       return _addObject(obj);
     }
     if (obj is Map<String, dynamic>) {
       // Add the dict object first to get its index, then flatten children.
       final refIndex = _addObject(obj);
-      // Flatten all keys and values so they get indices.
+      final keyRefs = <int>[];
+      final valueRefs = <int>[];
       for (final entry in obj.entries) {
-        _flatten(entry.key);
-        _flatten(entry.value);
+        keyRefs.add(_flatten(entry.key));
+        valueRefs.add(_flatten(entry.value));
       }
+      _childRefs[refIndex] = [...keyRefs, ...valueRefs];
       return refIndex;
     }
     if (obj is List) {
       final refIndex = _addObject(obj);
-      for (final item in obj) {
-        _flatten(item);
-      }
+      _childRefs[refIndex] = [for (final item in obj) _flatten(item)];
       return refIndex;
     }
     throw ArgumentError('Unsupported plist type: ${obj.runtimeType}');
   }
 
   int _addObject(Object? obj) {
-    final index = _objects.length;
     _objects.add(obj);
-    if (obj == null) {
-      _nullObjectIndex = index;
-    } else {
-      _objectRefs[obj] = index;
-    }
-    return index;
+    return _objects.length - 1;
   }
 
   Uint8List _encode(Map<String, dynamic> rootDict) {
     // Phase 1: Flatten all objects to get reference indices.
     _objects.clear();
-    _objectRefs.clear();
+    _childRefs.clear();
     _flatten(rootDict);
 
     final numObjects = _objects.length;
@@ -368,7 +354,7 @@ class BinaryPlistEncoder {
 
     for (int i = 0; i < numObjects; i++) {
       offsets.add(objectData.length);
-      _writeObject(_objects[i], objectData, objectRefSize);
+      _writeObject(i, objectData, objectRefSize);
     }
 
     // Phase 3: Write offset table.
@@ -396,8 +382,9 @@ class BinaryPlistEncoder {
     return Uint8List.fromList(objectData.toBytes());
   }
 
-  /// Serializes a single object into the byte builder.
-  void _writeObject(Object? obj, BytesBuilder builder, int objectRefSize) {
+  /// Serializes the object at [index] into the byte builder.
+  void _writeObject(int index, BytesBuilder builder, int objectRefSize) {
+    final obj = _objects[index];
     if (obj == null) {
       builder.addByte(0x00); // null
       return;
@@ -418,12 +405,29 @@ class BinaryPlistEncoder {
       _writeString(obj, builder);
       return;
     }
+    if (obj is Uint8List) {
+      _writeSizeHeader(0x40, obj.length, builder);
+      builder.add(obj);
+      return;
+    }
     if (obj is Map<String, dynamic>) {
-      _writeDict(obj, builder, objectRefSize);
+      _writeContainer(
+        0xD0,
+        obj.length,
+        _childRefs[index]!,
+        builder,
+        objectRefSize,
+      );
       return;
     }
     if (obj is List) {
-      _writeArray(obj, builder, objectRefSize);
+      _writeContainer(
+        0xA0,
+        obj.length,
+        _childRefs[index]!,
+        builder,
+        objectRefSize,
+      );
       return;
     }
     throw ArgumentError('Unsupported plist type: ${obj.runtimeType}');
@@ -491,36 +495,18 @@ class BinaryPlistEncoder {
     }
   }
 
-  /// Writes a dict object.
-  ///
-  /// Format: 0xDN (N = count) followed by N key refs then N value refs.
-  void _writeDict(
-    Map<String, dynamic> dict,
+  /// Writes a dict (`0xDN`: N key refs then N value refs) or array
+  /// (`0xAN`: N item refs) from the refs recorded while flattening.
+  void _writeContainer(
+    int marker,
+    int count,
+    List<int> refs,
     BytesBuilder builder,
     int objectRefSize,
   ) {
-    _writeSizeHeader(0xD0, dict.length, builder);
-
-    // Write key references first, then value references.
-    for (final key in dict.keys) {
-      final keyRef = _objectRefs[key]!;
-      builder.add(_encodeUnsignedInt(keyRef, objectRefSize));
-    }
-    for (final value in dict.values) {
-      final valueRef = value == null ? _nullObjectIndex! : _objectRefs[value]!;
-      builder.add(_encodeUnsignedInt(valueRef, objectRefSize));
-    }
-  }
-
-  /// Writes an array object.
-  ///
-  /// Format: 0xAN (N = count) followed by N object refs.
-  void _writeArray(List list, BytesBuilder builder, int objectRefSize) {
-    _writeSizeHeader(0xA0, list.length, builder);
-
-    for (final item in list) {
-      final itemRef = item == null ? _nullObjectIndex! : _objectRefs[item]!;
-      builder.add(_encodeUnsignedInt(itemRef, objectRefSize));
+    _writeSizeHeader(marker, count, builder);
+    for (final ref in refs) {
+      builder.add(_encodeUnsignedInt(ref, objectRefSize));
     }
   }
 
@@ -560,4 +546,21 @@ class BinaryPlistEncoder {
     bd.setUint32(offset, (value >> 32) & 0xFFFFFFFF, Endian.big);
     bd.setUint32(offset + 4, value & 0xFFFFFFFF, Endian.big);
   }
+}
+
+/// A binary plist UID (`0x8N`) — an `NSKeyedArchiver` object reference.
+class PlistUid {
+  /// The referenced object index.
+  final int value;
+
+  const PlistUid(this.value);
+
+  @override
+  bool operator ==(Object other) => other is PlistUid && other.value == value;
+
+  @override
+  int get hashCode => Object.hash(PlistUid, value);
+
+  @override
+  String toString() => 'PlistUid($value)';
 }

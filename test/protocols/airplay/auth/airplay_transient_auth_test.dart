@@ -1,13 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:dart_cast/src/protocols/airplay/auth/airplay_auth.dart';
 import 'package:dart_cast/src/protocols/airplay/auth/airplay_transient_auth.dart';
 import 'package:dart_cast/src/protocols/airplay/auth/tlv8.dart';
 import 'package:test/test.dart';
+
+import 'srp_accessory.dart';
 
 /// One request captured by [_MockHapServer].
 class _CapturedRequest {
@@ -23,26 +24,35 @@ class _CapturedRequest {
 
 /// A raw TCP server that speaks just enough HAP to drive transient pairing.
 ///
-/// It answers `/pair-setup` M1 with a plausible salt and SRP public key. The
-/// client's SRP maths is exercised for real; only the accessory's side of the
-/// proof check is skipped, which is what makes an offline test possible at
-/// all. The wire shape — headers, TLV tags, message count — is the point.
+/// By default it plays the accessory side of SRP for real ([SrpAccessory]):
+/// M2 carries a genuine salt and B for PIN `3939`, M3's proof is checked
+/// (a wrong one gets `kTLVError_Authentication`), and M4 carries the real
+/// accessory proof M2. [m4Proof] lets a test tamper with that proof.
 class _MockHapServer {
   final ServerSocket _server;
   final List<_CapturedRequest> requests = [];
 
-  /// Response body to return for each successive `/pair-setup` POST.
-  final List<Uint8List> pairSetupResponses;
+  /// Canned body for each successive `/pair-setup` POST, or `null` to run
+  /// real SRP through [_accessory].
+  final List<Uint8List>? pairSetupResponses;
 
   /// Status code to return for each successive `/pair-setup` POST.
   final List<int> pairSetupStatuses;
 
+  /// Maps the real accessory proof to the one sent in M4 (`null` omits it).
+  final Uint8List? Function(Uint8List realProof) m4Proof;
+
+  final SrpAccessory _accessory;
+
   int _pairSetupCount = 0;
+  Future<void> _replies = Future<void>.value();
 
   _MockHapServer._(
-    this._server, {
+    this._server,
+    this._accessory, {
     required this.pairSetupResponses,
     required this.pairSetupStatuses,
+    required this.m4Proof,
   });
 
   int get port => _server.port;
@@ -52,32 +62,45 @@ class _MockHapServer {
   static Future<_MockHapServer> start({
     List<Uint8List>? pairSetupResponses,
     List<int>? pairSetupStatuses,
+    Uint8List? Function(Uint8List realProof)? m4Proof,
   }) async {
     final socket = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     final server = _MockHapServer._(
       socket,
-      pairSetupResponses: pairSetupResponses ?? [_defaultM2(), _defaultM4()],
+      await SrpAccessory.create(pin: AirPlayTransientPairing.transientPin),
+      pairSetupResponses: pairSetupResponses,
       pairSetupStatuses: pairSetupStatuses ?? [200, 200],
+      m4Proof: m4Proof ?? (proof) => proof,
     );
     socket.listen(server._handleConnection);
     return server;
   }
 
-  static Uint8List _defaultM2() {
-    final random = Random(1234);
-    final salt = List<int>.generate(16, (_) => random.nextInt(256));
-    // SRP-3072 public key B is 384 bytes; any non-zero value works here.
-    final publicKey = List<int>.generate(384, (i) => (i * 7 + 3) & 0xFF);
+  Future<Uint8List> _srpResponse(int index, Uint8List requestBody) async {
+    if (index == 0) {
+      return Tlv8.encode([
+        (Tlv8.tagSeqNo, [0x02]),
+        (Tlv8.tagSalt, _accessory.salt),
+        (Tlv8.tagPublicKey, _accessory.publicKey),
+      ]);
+    }
+    final m3 = Tlv8.decode(requestBody);
+    final realProof = await _accessory.verifyM1(
+      m3[Tlv8.tagPublicKey] ?? const [],
+      m3[Tlv8.tagProof] ?? const [],
+    );
+    if (realProof == null) {
+      return Tlv8.encode([
+        (Tlv8.tagSeqNo, [0x04]),
+        (Tlv8.tagError, [0x02]), // kTLVError_Authentication
+      ]);
+    }
+    final proof = m4Proof(realProof);
     return Tlv8.encode([
-      (Tlv8.tagSeqNo, [0x02]),
-      (Tlv8.tagSalt, salt),
-      (Tlv8.tagPublicKey, publicKey),
+      (Tlv8.tagSeqNo, [0x04]),
+      if (proof != null) (Tlv8.tagProof, proof),
     ]);
   }
-
-  static Uint8List _defaultM4() => Tlv8.encode([
-    (Tlv8.tagSeqNo, [0x04]),
-  ]);
 
   void _handleConnection(Socket socket) {
     final buffer = BytesBuilder(copy: false);
@@ -123,11 +146,12 @@ class _MockHapServer {
       buffer.clear();
       buffer.add(bytes.sublist(bodyStart + contentLength));
 
-      _respond(socket, requestLine[1]);
+      final path = requestLine[1];
+      _replies = _replies.then((_) => _respond(socket, path, body));
     }
   }
 
-  void _respond(Socket socket, String path) {
+  Future<void> _respond(Socket socket, String path, Uint8List request) async {
     if (path == '/pair-pin-start') {
       socket.add(utf8.encode('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'));
       return;
@@ -136,9 +160,12 @@ class _MockHapServer {
     final index = _pairSetupCount++;
     final status =
         index < pairSetupStatuses.length ? pairSetupStatuses[index] : 200;
+    final canned = pairSetupResponses;
     final body =
-        index < pairSetupResponses.length
-            ? pairSetupResponses[index]
+        canned == null
+            ? (index < 2 ? await _srpResponse(index, request) : Uint8List(0))
+            : index < canned.length
+            ? canned[index]
             : Uint8List(0);
 
     socket.add(
@@ -171,10 +198,12 @@ Future<
 _connect({
   List<Uint8List>? pairSetupResponses,
   List<int>? pairSetupStatuses,
+  Uint8List? Function(Uint8List realProof)? m4Proof,
 }) async {
   final server = await _MockHapServer.start(
     pairSetupResponses: pairSetupResponses,
     pairSetupStatuses: pairSetupStatuses,
+    m4Proof: m4Proof,
   );
   final socket = await Socket.connect('127.0.0.1', server.port);
   final pairing = AirPlayTransientPairing.withSocket(
@@ -314,6 +343,55 @@ void main() {
             (e) => e.message,
             'message',
             contains('M2 error'),
+          ),
+        ),
+      );
+    });
+
+    test('accepts M4 carrying the real accessory proof', () async {
+      final ctx = await _connect();
+      addTearDown(() async {
+        ctx.socket.destroy();
+        await ctx.server.close();
+      });
+
+      final sharedKey = await ctx.pairing.execute();
+      expect(sharedKey, hasLength(64));
+    });
+
+    test('throws when the M4 accessory proof is wrong', () async {
+      final ctx = await _connect(m4Proof: (_) => Uint8List(64));
+      addTearDown(() async {
+        ctx.socket.destroy();
+        await ctx.server.close();
+      });
+
+      await expectLater(
+        ctx.pairing.execute(),
+        throwsA(
+          isA<AirPlayAuthException>().having(
+            (e) => e.message,
+            'message',
+            contains('proof'),
+          ),
+        ),
+      );
+    });
+
+    test('throws when M4 carries no accessory proof', () async {
+      final ctx = await _connect(m4Proof: (_) => null);
+      addTearDown(() async {
+        ctx.socket.destroy();
+        await ctx.server.close();
+      });
+
+      await expectLater(
+        ctx.pairing.execute(),
+        throwsA(
+          isA<AirPlayAuthException>().having(
+            (e) => e.message,
+            'message',
+            contains('proof'),
           ),
         ),
       );

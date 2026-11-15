@@ -11,7 +11,10 @@ import 'auth/binary_plist.dart';
 /// header and falls back to sniffing the `bplist00` magic.
 ///
 /// The XML parser supports the subset needed for AirPlay: `<real>`,
-/// `<integer>`, `<string>`, `<true/>`, `<false/>`, `<dict>`, and `<array>`.
+/// `<integer>`, `<string>`, `<true/>`, `<false/>`, `<dict>`, `<array>`,
+/// `<data>` (base64, decoded to [Uint8List]) and `<date>` (to [DateTime]),
+/// including their self-closing empty forms (`<array/>`, `<string/>`, ...).
+/// XML entities are unescaped in keys and strings.
 class PlistCodec {
   PlistCodec._();
 
@@ -95,7 +98,7 @@ class PlistCodec {
       final token = tokens[i];
       if (token.tag == 'key') {
         if (i + 1 < tokens.length) {
-          result[token.value!] = _tokenValue(tokens, i + 1);
+          result[_unescape(token.value!)] = _tokenValue(tokens, i + 1);
           // Skip past the value token(s)
           i = _skipValue(tokens, i + 1) + 1;
         } else {
@@ -120,7 +123,17 @@ class PlistCodec {
       case 'integer':
         return int.tryParse(token.value ?? '') ?? 0;
       case 'string':
-        return token.value ?? '';
+        return _unescape(token.value ?? '');
+      case 'data':
+        try {
+          return base64.decode(
+            (token.value ?? '').replaceAll(RegExp(r'\s'), ''),
+          );
+        } on FormatException {
+          return Uint8List(0);
+        }
+      case 'date':
+        return DateTime.tryParse((token.value ?? '').trim());
       case 'true':
         return true;
       case 'false':
@@ -173,21 +186,20 @@ class PlistCodec {
         continue;
       }
 
-      // Self-closing boolean tags
-      final boolMatch = RegExp(
-        r'<(true|false)\s*/>',
-      ).matchAsPrefix(content, pos);
-      if (boolMatch != null) {
-        tokens.add(_Token(boolMatch.group(1)!, null));
-        pos = boolMatch.end;
+      // Self-closing tags: booleans, and the empty form of every other
+      // element (`<array/>`, `<dict/>`, `<string/>`, `<data/>`, ...). Each
+      // must still produce a token, or the following <key> is consumed as
+      // this key's value.
+      final selfClosing = _selfClosingTag.matchAsPrefix(content, pos);
+      if (selfClosing != null) {
+        final tag = selfClosing.group(1)!;
+        tokens.add(_Token(tag, tag == 'true' || tag == 'false' ? null : ''));
+        pos = selfClosing.end;
         continue;
       }
 
-      // Simple value tags: key, real, integer, string
-      final simpleMatch = RegExp(
-        r'<(key|real|integer|string)>(.*?)</\1>',
-        dotAll: true,
-      ).matchAsPrefix(content, pos);
+      // Simple value tags: key, real, integer, string, data, date
+      final simpleMatch = _simpleTag.matchAsPrefix(content, pos);
       if (simpleMatch != null) {
         tokens.add(_Token(simpleMatch.group(1)!, simpleMatch.group(2)!));
         pos = simpleMatch.end;
@@ -240,6 +252,48 @@ class PlistCodec {
     }
 
     return -1;
+  }
+
+  static final RegExp _selfClosingTag = RegExp(
+    r'<(true|false|array|dict|string|key|data|date|integer|real)\s*/>',
+  );
+
+  static final RegExp _simpleTag = RegExp(
+    r'<(key|real|integer|string|data|date)>(.*?)</\1>',
+    dotAll: true,
+  );
+
+  static final RegExp _entity = RegExp(r'&(#x[0-9a-fA-F]+|#[0-9]+|\w+);');
+
+  /// Replaces the five predefined XML entities and numeric character
+  /// references. Unknown named entities are left as written.
+  static String _unescape(String text) {
+    if (!text.contains('&')) return text;
+    return text.replaceAllMapped(_entity, (m) {
+      final name = m.group(1)!;
+      int? codePoint;
+      if (name.startsWith('#x')) {
+        codePoint = int.tryParse(name.substring(2), radix: 16);
+      } else if (name.startsWith('#')) {
+        codePoint = int.tryParse(name.substring(1));
+      } else {
+        switch (name) {
+          case 'lt':
+            return '<';
+          case 'gt':
+            return '>';
+          case 'amp':
+            return '&';
+          case 'quot':
+            return '"';
+          case 'apos':
+            return "'";
+        }
+        return m.group(0)!;
+      }
+      if (codePoint == null || codePoint > 0x10FFFF) return m.group(0)!;
+      return String.fromCharCode(codePoint);
+    });
   }
 
   static bool _isWhitespace(String ch) =>

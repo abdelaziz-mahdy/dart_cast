@@ -48,6 +48,7 @@ class HapSrp {
   BigInt? _publicKey; // client public key 'A'
   BigInt? _sessionKey; // shared session key 'S'
   Uint8List? _sharedSecret; // H(S) — the SRP shared secret 'K'
+  Uint8List? _clientProof; // M1, kept to check the accessory's M2
 
   // Ed25519 key pair generated for this pairing
   SimpleKeyPair? _signingKeyPair;
@@ -166,7 +167,39 @@ class HapSrp {
       ..._sharedSecret!,
     ]);
 
+    _clientProof = proof;
     return proof;
+  }
+
+  /// Checks the accessory's SRP proof from pair-setup M4 (TLV `0x04`).
+  ///
+  /// HAP R2 §5.6.4: the controller must verify `M2 = H(A | M1 | K)` before
+  /// trusting the session. HomeKitADK (`HAP_srp_proof_m2`) hashes A at its
+  /// full 384 bytes; srptools (what pyatv uses) hashes A with leading zero
+  /// bytes stripped. The two differ only when A's top byte is zero, so both
+  /// forms are accepted. Comparison is constant-time.
+  ///
+  /// Throws [StateError] if [step2] has not run.
+  Future<bool> verifyServerProof(Uint8List m2) async {
+    final a = _publicKey;
+    final m1 = _clientProof;
+    final k = _sharedSecret;
+    if (a == null || m1 == null || k == null) {
+      throw StateError('SRP: step2 must be completed before verifying M2');
+    }
+    final padded = await _hash([..._bigIntToBytes(a, 384), ...m1, ...k]);
+    final stripped = await _hash([..._bigIntToBytesUnpadded(a), ...m1, ...k]);
+    // Non-short-circuiting `|` so both comparisons always run.
+    return _constantTimeEquals(padded, m2) | _constantTimeEquals(stripped, m2);
+  }
+
+  static bool _constantTimeEquals(List<int> expected, List<int> actual) {
+    if (expected.length != actual.length) return false;
+    var diff = 0;
+    for (var i = 0; i < expected.length; i++) {
+      diff |= expected[i] ^ actual[i];
+    }
+    return diff == 0;
   }
 
   /// Derives the encryption key and builds the encrypted credential payload

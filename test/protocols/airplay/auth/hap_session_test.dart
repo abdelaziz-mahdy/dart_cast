@@ -1,9 +1,57 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:cryptography/cryptography.dart';
+import 'package:dart_cast/src/protocols/airplay/auth/binary_plist.dart';
 import 'package:dart_cast/src/protocols/airplay/auth/hap_session.dart';
 import 'package:test/test.dart';
+
+Future<Uint8List> _hkdf(Uint8List secret, String salt, String info) async {
+  final key = await Hkdf(hmac: Hmac(Sha512()), outputLength: 32).deriveKey(
+    secretKey: SecretKey(secret),
+    nonce: utf8.encode(salt),
+    info: utf8.encode(info),
+  );
+  return Uint8List.fromList(await key.extractBytes());
+}
+
+Uint8List _testKey() => Uint8List.fromList(List.generate(32, (i) => i));
+
+/// A client [HapSession] connected to a fresh loopback server, plus a future
+/// for the server-side [HapSession] (same symmetric test key both ways).
+Future<
+  ({
+    ServerSocket server,
+    HapSession client,
+    Future<({HapSession session, Socket socket})> peer,
+  })
+>
+_loopbackPair({Uint8List? sharedSecret}) async {
+  final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+  final peer = server.first.then(
+    (sock) => (
+      session: HapSession(
+        socket: sock,
+        outputKey: _testKey(),
+        inputKey: _testKey(),
+        host: '127.0.0.1',
+        port: server.port,
+      ),
+      socket: sock,
+    ),
+  );
+  final client = HapSession(
+    socket: await Socket.connect('127.0.0.1', server.port),
+    outputKey: _testKey(),
+    inputKey: _testKey(),
+    host: '127.0.0.1',
+    port: server.port,
+    sharedSecret: sharedSecret,
+  );
+  return (server: server, client: client, peer: peer);
+}
 
 void main() {
   group('deriveHapSessionKeys', () {
@@ -77,6 +125,40 @@ void main() {
       expect(eventKeys.outputKey, isNot(equals(controlKeys.outputKey)));
       expect(eventKeys.inputKey, isNot(equals(controlKeys.inputKey)));
     });
+
+    test(
+      'reverses read/write info: the receiver opens the connection',
+      () async {
+        // pyatv ap2_session._setup_event_channel passes EVENTS_READ_INFO as the
+        // output info and EVENTS_WRITE_INFO as the input info.
+        final sharedSecret = Uint8List.fromList(
+          List.generate(32, (i) => i * 5),
+        );
+
+        final keys = await deriveEventKeys(sharedSecret);
+
+        expect(
+          keys.outputKey,
+          equals(
+            await _hkdf(
+              sharedSecret,
+              'Events-Salt',
+              'Events-Read-Encryption-Key',
+            ),
+          ),
+        );
+        expect(
+          keys.inputKey,
+          equals(
+            await _hkdf(
+              sharedSecret,
+              'Events-Salt',
+              'Events-Write-Encryption-Key',
+            ),
+          ),
+        );
+      },
+    );
 
     test('deterministic: same input produces same keys', () async {
       final sharedSecret = Uint8List.fromList(List.generate(32, (i) => i * 3));
@@ -1014,9 +1096,7 @@ void main() {
       final response = await clientSession.sendRequest('GET', '/chunked');
 
       expect(response.statusCode, equals(200));
-      // The body will contain the raw chunked data since _parseHttpResponse
-      // doesn't decode chunks, it just returns everything after headers
-      expect(response.bodyText, contains('hello'));
+      expect(response.bodyText, equals('hello'));
 
       await clientSession.close();
       await server.close();
@@ -1426,5 +1506,235 @@ void main() {
       await clientSession.close();
       await server.close();
     });
+  });
+
+  group('response framing', () {
+    test(
+      'two responses in one frame are handed to two sendRequest calls',
+      () async {
+        final pair = await _loopbackPair();
+        addTearDown(() async {
+          await pair.client.close();
+          await pair.server.close();
+        });
+
+        unawaited(
+          pair.peer.then((peer) async {
+            await peer.session.readDecryptedData();
+            // Both answers in a single encrypted write.
+            final both =
+                'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst'
+                'HTTP/1.1 201 Created\r\ncontent-length: 6\r\n\r\nsecond';
+            final encrypted = await peer.session.encrypt(
+              Uint8List.fromList(utf8.encode(both)),
+            );
+            final sock = peer.socket;
+            sock.add(encrypted);
+            await sock.flush();
+            // Swallow the second request; it is already answered.
+            await peer.session.readDecryptedData();
+          }),
+        );
+
+        final first = await pair.client.sendRequest('GET', '/a');
+        final second = await pair.client.sendRequest('GET', '/b');
+
+        expect(first.statusCode, equals(200));
+        expect(first.bodyText, equals('first'));
+        expect(second.statusCode, equals(201));
+        expect(second.bodyText, equals('second'));
+      },
+      timeout: const Timeout(Duration(seconds: 10)),
+    );
+
+    test(
+      'de-chunks a chunked body (header matched case-insensitively)',
+      () async {
+        final pair = await _loopbackPair();
+        addTearDown(() async {
+          await pair.client.close();
+          await pair.server.close();
+        });
+
+        unawaited(
+          pair.peer.then((peer) async {
+            await peer.session.readDecryptedData();
+            const resp =
+                'HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n'
+                '5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n';
+            final encrypted = await peer.session.encrypt(
+              Uint8List.fromList(utf8.encode(resp)),
+            );
+            peer.socket.add(encrypted);
+            await peer.socket.flush();
+          }),
+        );
+
+        final response = await pair.client.sendRequest('GET', '/chunked');
+        expect(response.bodyText, equals('hello world'));
+      },
+    );
+  });
+
+  group('request headers', () {
+    test(
+      'sendRequest sends Host and Content-Length: 0 on a bodiless POST',
+      () async {
+        final pair = await _loopbackPair();
+        addTearDown(() async {
+          await pair.client.close();
+          await pair.server.close();
+        });
+
+        final captured = Completer<String>();
+        unawaited(
+          pair.peer.then((peer) async {
+            captured.complete(
+              utf8.decode(await peer.session.readDecryptedData()),
+            );
+            final encrypted = await peer.session.encrypt(
+              Uint8List.fromList(
+                utf8.encode('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'),
+              ),
+            );
+            peer.socket.add(encrypted);
+            await peer.socket.flush();
+          }),
+        );
+
+        await pair.client.sendRequest('POST', '/stop');
+        final request = await captured.future;
+
+        expect(request, startsWith('POST /stop HTTP/1.1\r\n'));
+        expect(request, contains('Host: 127.0.0.1:${pair.server.port}\r\n'));
+        expect(request, contains('Content-Length: 0\r\n'));
+      },
+    );
+  });
+
+  group('event channel', () {
+    test(
+      'answers one RTSP request split across frames with one RTSP reply',
+      () async {
+        final sharedSecret = Uint8List.fromList(
+          List.generate(32, (i) => 99 - i),
+        );
+
+        // The receiver's view of the event channel: it opened the connection,
+        // so it writes with the "Write" key and reads with the "Read" key.
+        final receiverOut = await _hkdf(
+          sharedSecret,
+          'Events-Salt',
+          'Events-Write-Encryption-Key',
+        );
+        final receiverIn = await _hkdf(
+          sharedSecret,
+          'Events-Salt',
+          'Events-Read-Encryption-Key',
+        );
+
+        final eventServer = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4,
+          0,
+        );
+        final pair = await _loopbackPair(sharedSecret: sharedSecret);
+        addTearDown(() async {
+          await pair.client.close();
+          await pair.server.close();
+          await eventServer.close();
+        });
+
+        // Control channel: SETUP advertises the event port, rest are 200s.
+        unawaited(
+          pair.peer.then((peer) async {
+            try {
+              while (true) {
+                final req = utf8.decode(
+                  await peer.session.readDecryptedData(),
+                  allowMalformed: true,
+                );
+                final cseq = RegExp(r'CSeq: (\d+)').firstMatch(req)?.group(1);
+                final body =
+                    req.startsWith('SETUP')
+                        ? BinaryPlistEncoder.encode({
+                          'eventPort': eventServer.port,
+                        })
+                        : Uint8List(0);
+                final head = utf8.encode(
+                  'RTSP/1.0 200 OK\r\nCSeq: $cseq\r\n'
+                  'Content-Length: ${body.length}\r\n\r\n',
+                );
+                final encrypted = await peer.session.encrypt(
+                  Uint8List.fromList([...head, ...body]),
+                );
+                peer.socket.add(encrypted);
+                await peer.socket.flush();
+              }
+            } catch (_) {}
+          }),
+        );
+
+        final replies = Completer<String>();
+        eventServer.listen((sock) async {
+          final receiver = HapSession(
+            socket: sock,
+            outputKey: receiverOut,
+            inputKey: receiverIn,
+            host: '127.0.0.1',
+            port: eventServer.port,
+          );
+          final body = List<int>.filled(1500, 0x41);
+          final request = Uint8List.fromList([
+            ...utf8.encode(
+              'POST /command RTSP/1.0\r\nCSeq: 5\r\n'
+              'Server: AirTunes/366.0\r\n'
+              'Content-Type: application/x-apple-binary-plist\r\n'
+              'Content-Length: ${body.length}\r\n\r\n',
+            ),
+            ...body,
+          ]);
+          final encrypted = await receiver.encrypt(request);
+          const firstFrame = 2 + HapSession.frameLength + 16;
+          expect(encrypted.length, greaterThan(firstFrame));
+
+          // Deliver the two frames as separate reads.
+          sock.add(encrypted.sublist(0, firstFrame));
+          await sock.flush();
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          sock.add(encrypted.sublist(firstFrame));
+          await sock.flush();
+
+          // Collect everything the sender writes back for a while.
+          final got = StringBuffer();
+          try {
+            while (true) {
+              got.write(
+                utf8.decode(
+                  await receiver.readDecryptedData(
+                    timeout: const Duration(milliseconds: 800),
+                  ),
+                ),
+              );
+            }
+          } catch (_) {}
+          replies.complete(got.toString());
+        });
+
+        await pair.client.setupRtspSession(timingPort: 1234);
+        final text = await replies.future;
+
+        expect(
+          RegExp('200 OK').allMatches(text).length,
+          equals(1),
+          reason: 'one request must get exactly one reply, got: $text',
+        );
+        expect(text, startsWith('RTSP/1.0 200 OK\r\n'));
+        expect(text, contains('CSeq: 5\r\n'));
+        expect(text, contains('Content-Length: 0\r\n'));
+        expect(text, contains('Audio-Latency: 0\r\n'));
+        expect(text, contains('Server: AirTunes/366.0\r\n'));
+      },
+      timeout: const Timeout(Duration(seconds: 20)),
+    );
   });
 }
