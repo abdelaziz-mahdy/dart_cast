@@ -1300,8 +1300,27 @@ class ChromecastSession extends CastSession {
         return;
       }
 
-      // Playable state — LOAD succeeded.
+      // Playable state — LOAD succeeded, but only if the status is ours:
+      // a direct answer to our LOAD's requestId, or a later broadcast for
+      // the media session that answer named. A requestId-0 broadcast from
+      // a media session another sender started (joining a running Default
+      // Media Receiver) is not proof that our LOAD worked, and ending the
+      // wait on it would miss our own LOAD_FAILED.
       if (parsed.playerState != 'IDLE') {
+        final isOurs =
+            expectedRequestId == null ||
+            responseRequestId == expectedRequestId ||
+            (ourMediaSessionId != null &&
+                parsed.mediaSessionId == ourMediaSessionId);
+        if (!isOurs) {
+          CastLogger.debug(
+            'Chromecast: ignoring ${parsed.playerState} from '
+            'mediaSessionId=${parsed.mediaSessionId} '
+            '(requestId=$responseRequestId, expected=$expectedRequestId) — '
+            'not attributable to our LOAD, continuing to wait',
+          );
+          return;
+        }
         if (!completer.isCompleted) {
           completer.complete();
         }
