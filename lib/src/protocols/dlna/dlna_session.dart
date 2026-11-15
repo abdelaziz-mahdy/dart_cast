@@ -191,8 +191,8 @@ class DlnaSession extends CastSession {
     // so the 4th field comes from DlnaContentFeatures, which the proxy's
     // servers also use to answer `getcontentFeatures.dlna.org`. Flags are
     // 01700000 (STREAMING + BACKGROUND + CONNECTION_STALL + V1.5) — same as
-    // VLC and MiniDLNA — with a DLNA.ORG_PN profile name so the renderer
-    // knows the codec without probing the stream.
+    // VLC and MiniDLNA. No DLNA.ORG_PN profile is named: the media is not
+    // inspected, so the renderer probes it instead.
     //
     // Piped-TS routes are generated on the fly: there is no Content-Length and
     // byte ranges cannot be served. DLNA.ORG_OP is "<time-seek><byte-seek>",

@@ -228,32 +228,24 @@ class DlnaContentFeatures {
     return '${pn}DLNA.ORG_OP=$op;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$flags';
   }
 
+  // No DLNA.ORG_PN below: a profile name is a promise about codec, level,
+  // resolution and packaging (MPEG_TS_HD_NA_ISO is HD, North-American
+  // rates, 188-byte packets; AVC_MP4_HP_HD_AAC is H.264 High at HD with
+  // AAC). Nothing here inspects the media, so naming one would claim what
+  // nobody checked. DLNA allows the parameter to be left out (7.4.1.3.17).
+
   /// The value advertised for a generated (piped) MPEG-TS route, which
   /// supports time seek only.
-  static final pipedTransportStream = build(
-    profile: 'MPEG_TS_HD_NA_ISO',
-    timeSeek: true,
-    byteSeek: false,
-  );
+  static final pipedTransportStream = build(timeSeek: true, byteSeek: false);
 
   /// The value advertised for a byte-seekable file of [mimeType], or null
   /// for a type the DLNA session does not advertise this way.
   static String? forByteSeekableMime(String mimeType) {
     switch (mimeType.toLowerCase()) {
       case 'video/mp2t':
-        return build(
-          profile: 'MPEG_TS_HD_NA_ISO',
-          timeSeek: false,
-          byteSeek: true,
-        );
       case 'video/x-matroska':
-        return build(timeSeek: false, byteSeek: true);
       case 'video/mp4':
-        return build(
-          profile: 'AVC_MP4_HP_HD_AAC',
-          timeSeek: false,
-          byteSeek: true,
-        );
+        return build(timeSeek: false, byteSeek: true);
     }
     return null;
   }

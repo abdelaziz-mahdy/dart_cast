@@ -186,7 +186,7 @@ void main() {
 
   group('Http10FileServer DLNA transfer headers (DLNA 7.4.1.3)', () {
     const features =
-        'DLNA.ORG_PN=AVC_MP4_HP_HD_AAC;DLNA.ORG_OP=01;DLNA.ORG_CI=0;'
+        'DLNA.ORG_OP=01;DLNA.ORG_CI=0;'
         'DLNA.ORG_FLAGS=01700000000000000000000000000000';
     late _Harness harness;
 
@@ -234,6 +234,17 @@ void main() {
   });
 
   group('DlnaContentFeatures', () {
+    test('names no DLNA.ORG_PN profile for media it never inspected', () {
+      for (final value in [
+        DlnaContentFeatures.pipedTransportStream,
+        DlnaContentFeatures.forByteSeekableMime('video/mp4')!,
+        DlnaContentFeatures.forByteSeekableMime('video/mp2t')!,
+        DlnaContentFeatures.forByteSeekableMime('video/x-matroska')!,
+      ]) {
+        expect(value, isNot(contains('DLNA.ORG_PN')));
+      }
+    });
+
     test('builds the 4th protocolInfo field', () {
       expect(
         DlnaContentFeatures.build(
@@ -265,7 +276,7 @@ void main() {
       );
       expect(
         r.headers['contentfeatures.dlna.org'],
-        contains('DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;DLNA.ORG_OP=01'),
+        startsWith('DLNA.ORG_OP=01;'),
       );
     });
   });
