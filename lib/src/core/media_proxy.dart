@@ -22,7 +22,15 @@ class _SyntheticContent {
   final String content;
   final ContentType contentType;
 
-  _SyntheticContent({required this.content, required this.contentType});
+  /// Builds the body per request instead of serving [content], which is
+  /// then the fallback when building fails.
+  final Future<String> Function()? build;
+
+  _SyntheticContent({
+    required this.content,
+    required this.contentType,
+    this.build,
+  });
 }
 
 /// A registered proxy route.
@@ -701,29 +709,90 @@ class MediaProxy {
     required String originalM3u8ProxyUrl,
     required List<({String name, String language, String url})> subtitleEntries,
   }) {
-    final buffer = StringBuffer('#EXTM3U\n');
+    const groupId = 'dart_cast_subs';
+    final media = <String>[
+      for (var i = 0; i < subtitleEntries.length; i++)
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="$groupId",'
+            'NAME="${_quotedStringValue(subtitleEntries[i].name)}",'
+            'DEFAULT=${i == 0 ? 'YES' : 'NO'},'
+            'AUTOSELECT=${i == 0 ? 'YES' : 'NO'},'
+            'LANGUAGE="${_quotedStringValue(subtitleEntries[i].language)}",'
+            'URI="${subtitleEntries[i].url}"',
+    ];
 
-    for (var i = 0; i < subtitleEntries.length; i++) {
-      final entry = subtitleEntries[i];
-      final isDefault = i == 0 ? 'YES' : 'NO';
-      buffer.writeln(
-        '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",'
-        'NAME="${_quotedStringValue(entry.name)}",'
-        'DEFAULT=$isDefault,AUTOSELECT=$isDefault,'
-        'LANGUAGE="${_quotedStringValue(entry.language)}",'
-        'URI="${entry.url}"',
-      );
+    // When the original is a media playlist, a one-variant master pointing
+    // at it is valid (RFC 8216 §4.3.4.2: the URI after STREAM-INF names a
+    // media playlist).
+    final fallback = StringBuffer('#EXTM3U\n');
+    media.forEach(fallback.writeln);
+    fallback.writeln(
+      '#EXT-X-STREAM-INF:BANDWIDTH=1280000,SUBTITLES="$groupId"',
+    );
+    fallback.writeln(originalM3u8ProxyUrl);
+
+    // When it is a master, nesting it as a variant is not: copy its
+    // variants instead and point each at our subtitle group.
+    Future<String> build() async {
+      final client = HttpClient();
+      try {
+        final request = await client.getUrl(Uri.parse(originalM3u8ProxyUrl));
+        final response = await request.close();
+        final body = utf8.decode(
+          await response.fold<List<int>>(<int>[], (a, c) => a..addAll(c)),
+          allowMalformed: true,
+        );
+        if (response.statusCode != HttpStatus.ok ||
+            !HlsParser.isMasterPlaylist(body)) {
+          return fallback.toString();
+        }
+        return _addSubtitleGroup(body, groupId, media);
+      } finally {
+        client.close(force: true);
+      }
     }
-
-    buffer.writeln('#EXT-X-STREAM-INF:BANDWIDTH=1280000,SUBTITLES="subs"');
-    buffer.writeln(originalM3u8ProxyUrl);
 
     final token = _generateToken();
     _syntheticContent[token] = _SyntheticContent(
-      content: buffer.toString(),
+      content: fallback.toString(),
       contentType: ContentType('application', 'x-mpegURL'),
+      build: build,
     );
     return '$_baseUrl/synthetic/$token';
+  }
+
+  /// Adds [mediaLines] (a SUBTITLES rendition group [groupId]) to a master
+  /// playlist and points every variant's SUBTITLES attribute at it.
+  static String _addSubtitleGroup(
+    String master,
+    String groupId,
+    List<String> mediaLines,
+  ) {
+    final out = <String>[];
+    var inserted = false;
+    for (final line in master.split('\n')) {
+      final trimmed = line.trim();
+      if (!inserted &&
+          trimmed.isNotEmpty &&
+          trimmed != '#EXTM3U' &&
+          !trimmed.startsWith('#EXT-X-VERSION') &&
+          !trimmed.startsWith('#EXT-X-INDEPENDENT-SEGMENTS')) {
+        out.addAll(mediaLines);
+        inserted = true;
+      }
+      if (trimmed.startsWith('#EXT-X-STREAM-INF:')) {
+        final withoutGroup = trimmed
+            .replaceAllMapped(RegExp(r'([:,])SUBTITLES="[^"]*"'), (m) => m[1]!)
+            .replaceAll(':,', ':')
+            .replaceAll(',,', ',');
+        final separator =
+            withoutGroup.endsWith(':') || withoutGroup.endsWith(',') ? '' : ',';
+        out.add('$withoutGroup${separator}SUBTITLES="$groupId"');
+      } else {
+        out.add(line);
+      }
+    }
+    if (!inserted) out.addAll(mediaLines);
+    return out.join('\n');
   }
 
   /// Removes all previously registered routes and synthetic content,
@@ -873,7 +942,18 @@ class MediaProxy {
       'size=${synthetic.content.length} chars',
     );
 
-    final encoded = utf8.encode(synthetic.content);
+    var content = synthetic.content;
+    final build = synthetic.build;
+    if (build != null) {
+      try {
+        content = await build();
+      } catch (e) {
+        CastLogger.warning(
+          'MediaProxy: building synthetic $token failed, serving fallback: $e',
+        );
+      }
+    }
+    final encoded = utf8.encode(content);
 
     // Serve via HTTP/1.0 for DLNA compatibility (same as file serving)
     final socket = await request.response.detachSocket(writeHeaders: false);

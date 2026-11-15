@@ -116,14 +116,21 @@ void main() {
           final body = await response.transform(utf8.decoder).join();
           expect(body, contains('#EXTM3U'));
           expect(body, contains('#EXT-X-MEDIA:TYPE=SUBTITLES'));
-          expect(body, contains('GROUP-ID="subs"'));
+          expect(body, contains('GROUP-ID="dart_cast_subs"'));
           expect(body, contains('NAME="English"'));
           expect(body, contains('LANGUAGE="en"'));
           expect(body, contains('DEFAULT=YES'));
-          expect(body, contains('#EXT-X-STREAM-INF:BANDWIDTH=1280000'));
-          expect(body, contains('SUBTITLES="subs"'));
-          // Should reference the original proxy URL
-          expect(body, contains(originalProxyUrl));
+          // The original is a master: its variant is copied (with our
+          // subtitle group) rather than the master nested as a variant.
+          expect(
+            body,
+            contains(
+              '#EXT-X-STREAM-INF:BANDWIDTH=2000000,'
+              'SUBTITLES="dart_cast_subs"',
+            ),
+          );
+          expect(body.split('\n'), isNot(contains(originalProxyUrl)));
+          expect(body, contains('$originalProxyUrl?url='));
           // Should reference the subtitle playlist URL
           expect(body, contains(subPlaylistUrl));
         } finally {

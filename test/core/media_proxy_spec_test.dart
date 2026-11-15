@@ -206,6 +206,58 @@ void main() {
     );
   });
 
+  group('subtitle wrapper over a master playlist', () {
+    late HttpServer origin;
+    late MediaProxy proxy;
+
+    setUp(() async {
+      origin = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      origin.listen((request) async {
+        request.response.headers.contentType = ContentType(
+          'application',
+          'vnd.apple.mpegurl',
+        );
+        request.response.write(
+          '#EXTM3U\n#EXT-X-VERSION:4\n'
+          '#EXT-X-STREAM-INF:SUBTITLES="old",BANDWIDTH=900000\nhi.m3u8\n'
+          '#EXT-X-STREAM-INF:BANDWIDTH=300000,CODECS="avc1.42e01e"\nlo.m3u8\n',
+        );
+        await request.response.close();
+      });
+      proxy = MediaProxy();
+      await proxy.start();
+    });
+
+    tearDown(() async {
+      await proxy.stop();
+      await origin.close(force: true);
+    });
+
+    test('copies the variants instead of nesting the master', () async {
+      final master = proxy.registerMedia(
+        'http://127.0.0.1:${origin.port}/master.m3u8',
+      );
+      final url = proxy.registerSubtitleWrapper(
+        originalM3u8ProxyUrl: master,
+        subtitleEntries: [(name: 'English', language: 'en', url: 'http://s')],
+      );
+      final body = utf8.decode((await _get(url)).body);
+      final lines = body.split('\n');
+      final variants =
+          lines.where((l) => l.startsWith('#EXT-X-STREAM-INF:')).toList();
+      expect(variants, hasLength(2));
+      expect(variants, everyElement(endsWith('SUBTITLES="dart_cast_subs"')));
+      expect(
+        variants.first,
+        '#EXT-X-STREAM-INF:BANDWIDTH=900000,'
+        'SUBTITLES="dart_cast_subs"',
+      );
+      expect(body, contains('#EXT-X-MEDIA:TYPE=SUBTITLES'));
+      // The URI after each STREAM-INF is a media playlist, never the master.
+      expect(lines, isNot(contains(master)));
+    });
+  });
+
   group('DLNA subtitle variants', () {
     late MediaProxy proxy;
     late Directory dir;
