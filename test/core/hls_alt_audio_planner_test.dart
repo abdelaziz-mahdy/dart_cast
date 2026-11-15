@@ -73,4 +73,49 @@ void main() {
     expect(plan.segments.single.videoUrl, '$origin/b/video/v1.ts');
     expect(plan.segments.single.audioUrl, '$origin/b/audio/a1.aac');
   });
+
+  group('pairSegmentsByTime', () {
+    List<({String url, double duration})> segs(String p, List<double> d) => [
+      for (var i = 0; i < d.length; i++) (url: '$p$i', duration: d[i]),
+    ];
+
+    test('equal boundaries pair one to one', () {
+      final pairs = HlsAltAudioPlanner.pairSegmentsByTime(
+        segs('v', [6, 6, 6]),
+        segs('a', [6, 6, 6]),
+      );
+      expect(pairs.map((p) => p.audioUrls), [
+        ['a0'],
+        ['a1'],
+        ['a2'],
+      ]);
+    });
+
+    test('shorter audio segments are grouped by start time, not index', () {
+      // Video 6 s segments; audio 4 s segments start at 0,4,8,12,16.
+      final pairs = HlsAltAudioPlanner.pairSegmentsByTime(
+        segs('v', [6, 6, 6]),
+        segs('a', [4, 4, 4, 4, 4]),
+      );
+      expect(pairs.map((p) => p.audioUrls), [
+        ['a0', 'a1'], // 0, 4
+        ['a2'], // 8
+        ['a3', 'a4'], // 12, 16
+      ]);
+    });
+
+    test('a video segment with no audio start reuses the playing one', () {
+      // Audio 10 s segments start at 0, 10; video at 0, 4, 8, 12.
+      final pairs = HlsAltAudioPlanner.pairSegmentsByTime(
+        segs('v', [4, 4, 4, 4]),
+        segs('a', [10, 10]),
+      );
+      expect(pairs.map((p) => p.audioUrls), [
+        ['a0'],
+        ['a0'],
+        ['a1'],
+        ['a1'],
+      ]);
+    });
+  });
 }

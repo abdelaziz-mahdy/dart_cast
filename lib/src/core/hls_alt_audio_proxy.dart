@@ -71,14 +71,25 @@ class HlsAltAudioPlan {
 
 class HlsAltAudioSegmentPair {
   final String videoUrl;
-  final String audioUrl;
+
+  /// Audio segments to mux with [videoUrl], in playback order: those whose
+  /// start time falls inside this video segment. Never empty.
+  final List<String> audioUrls;
   final double durationSec;
 
-  const HlsAltAudioSegmentPair({
+  /// The first of [audioUrls].
+  String get audioUrl => audioUrls.first;
+
+  HlsAltAudioSegmentPair({
     required this.videoUrl,
-    required this.audioUrl,
+    String? audioUrl,
+    List<String>? audioUrls,
     required this.durationSec,
-  });
+  }) : audioUrls = audioUrls ?? [audioUrl!] {
+    if (this.audioUrls.isEmpty) {
+      throw ArgumentError.value(audioUrls, 'audioUrls', 'must not be empty');
+    }
+  }
 }
 
 /// Builder that fetches an upstream master + chosen variant/rendition
@@ -162,11 +173,11 @@ class HlsAltAudioPlanner {
       _fetchPlaylist(variantUrl, headers),
       _fetchPlaylist(audioUrl, headers),
     ]);
-    final videoSegments = HlsParser.extractSegmentUrls(
+    final videoSegments = HlsParser.extractSegments(
       results[0].body,
       results[0].finalUrl,
     );
-    final audioSegments = HlsParser.extractSegmentUrls(
+    final audioSegments = HlsParser.extractSegments(
       results[1].body,
       results[1].finalUrl,
     );
@@ -177,28 +188,14 @@ class HlsAltAudioPlanner {
       );
       return null;
     }
-    if (audioSegments.length != videoSegments.length) {
+    if (audioSegments.isEmpty) {
       CastLogger.warning(
-        'HlsAltAudioPlanner: audio rendition has ${audioSegments.length} '
-        'segments but video has ${videoSegments.length} — segments will '
-        'be paired by index (mismatch may cause AV drift)',
+        'HlsAltAudioPlanner: audio rendition has 0 segments — abort',
       );
+      return null;
     }
 
-    // Parse durations from the variant playlist's #EXTINF lines.
-    final durations = _extractDurations(results[0].body);
-
-    final pairs = <HlsAltAudioSegmentPair>[];
-    for (var i = 0; i < videoSegments.length; i++) {
-      pairs.add(
-        HlsAltAudioSegmentPair(
-          videoUrl: videoSegments[i],
-          audioUrl:
-              i < audioSegments.length ? audioSegments[i] : audioSegments.last,
-          durationSec: i < durations.length ? durations[i] : 6.0,
-        ),
-      );
-    }
+    final pairs = pairSegmentsByTime(videoSegments, audioSegments);
 
     // CODECS — keep what the master advertised for the variant we picked
     // (RFC 8216 §4.3.4.2: CODECS describes that variant stream). The
@@ -236,13 +233,52 @@ class HlsAltAudioPlanner {
     return renditions.first;
   }
 
-  static List<double> _extractDurations(String mediaPlaylist) {
-    final out = <double>[];
-    final re = RegExp(r'^#EXTINF:([0-9]+(?:\.[0-9]+)?)', multiLine: true);
-    for (final m in re.allMatches(mediaPlaylist)) {
-      out.add(double.tryParse(m.group(1)!) ?? 6.0);
+  /// Pairs each video segment with the audio segments whose start time
+  /// (the sum of the EXTINF durations before it) falls inside it.
+  ///
+  /// RFC 8216 does not require renditions to share segment boundaries, so
+  /// pairing by index drifts as soon as their durations or counts differ.
+  /// A video segment in which no audio segment starts gets the audio
+  /// segment playing at its start, so every muxed segment carries audio.
+  static List<HlsAltAudioSegmentPair> pairSegmentsByTime(
+    List<({String url, double duration})> video,
+    List<({String url, double duration})> audio,
+  ) {
+    final audioStarts = <double>[];
+    var t = 0.0;
+    for (final a in audio) {
+      audioStarts.add(t);
+      t += a.duration > 0 ? a.duration : 6.0;
     }
-    return out;
+
+    const epsilon = 1e-3; // tolerate EXTINF rounding
+    final pairs = <HlsAltAudioSegmentPair>[];
+    var videoStart = 0.0;
+    var next = 0; // first audio segment not yet assigned
+    for (var i = 0; i < video.length; i++) {
+      final duration = video[i].duration > 0 ? video[i].duration : 6.0;
+      final videoEnd = videoStart + duration;
+      final isLast = i == video.length - 1;
+      final urls = <String>[];
+      while (next < audio.length &&
+          (isLast || audioStarts[next] < videoEnd - epsilon)) {
+        urls.add(audio[next].url);
+        next++;
+      }
+      if (urls.isEmpty) {
+        // No audio segment starts here: use the one that is playing.
+        urls.add(audio[next == 0 ? 0 : next - 1].url);
+      }
+      pairs.add(
+        HlsAltAudioSegmentPair(
+          videoUrl: video[i].url,
+          audioUrls: urls,
+          durationSec: duration,
+        ),
+      );
+      videoStart = videoEnd;
+    }
+    return pairs;
   }
 
   /// Fetches a playlist and returns its text with the URL it was finally
@@ -366,12 +402,16 @@ class HlsAltAudioSegmentMuxer {
     // Fetch both source segments in parallel.
     final byteResults = await Future.wait([
       _planner.fetchSegmentBytes(pair.videoUrl, plan.upstreamHeaders),
-      _planner.fetchSegmentBytes(pair.audioUrl, plan.upstreamHeaders),
+      for (final audioUrl in pair.audioUrls)
+        _planner.fetchSegmentBytes(audioUrl, plan.upstreamHeaders),
     ]);
+    // Several audio TS segments concatenate into one valid TS stream; the
+    // remuxer keeps only the audio PID's packets from it.
+    final audioBytes = [for (final b in byteResults.skip(1)) ...b];
 
     final muxed = TsAltAudioRemuxer.mux(
       videoSegment: byteResults[0],
-      audioSegment: byteResults[1],
+      audioSegment: audioBytes,
       continuity: continuity,
     );
     CastLogger.debug(
