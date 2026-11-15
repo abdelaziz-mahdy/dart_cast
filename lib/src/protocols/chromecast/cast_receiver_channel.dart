@@ -208,8 +208,7 @@ class CastReceiverChannel {
         sessionId: sessionId,
         appId: appId,
         volumeLevel:
-            (volume is Map ? volume['level'] as num? : null)?.toDouble() ??
-            1.0,
+            (volume is Map ? volume['level'] as num? : null)?.toDouble() ?? 1.0,
         isMuted: (volume is Map ? volume['muted'] as bool? : null) ?? false,
       );
     }
