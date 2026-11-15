@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:dart_cast/src/core/cast_device.dart';
 import 'package:dart_cast/src/core/cast_media.dart';
 import 'package:dart_cast/src/core/cast_session.dart';
+import 'package:dart_cast/src/core/http10_file_server.dart';
 import 'package:dart_cast/src/protocols/dlna/dlna_controller.dart';
 import 'package:dart_cast/src/protocols/dlna/dlna_device.dart';
 import 'package:dart_cast/src/protocols/dlna/dlna_session.dart';
@@ -35,6 +36,18 @@ class MockDlnaServer {
   set trackDuration(String value) => _trackDuration = value;
   set volume(int value) => _volume = value;
 
+  /// Delay before answering SetAVTransportURI, to widen the window in which
+  /// a poll can land in the middle of a Stop → SetAVTransportURI → Play.
+  Duration setUriDelay = Duration.zero;
+
+  /// Body served at [scpdUrl]; null answers 404.
+  String? renderingControlScpd;
+  int scpdRequests = 0;
+  String get scpdUrl => '$baseUrl/RenderingControl/scpd.xml';
+
+  /// A 60-second VOD playlist (six 10 s segments) for piped HLS routes.
+  String get playlistUrl => '$baseUrl/media.m3u8';
+
   Future<void> start() async {
     _server = await HttpServer.bind('127.0.0.1', 0);
     _server.listen(_handleRequest);
@@ -45,6 +58,10 @@ class MockDlnaServer {
   }
 
   Future<void> _handleRequest(HttpRequest request) async {
+    if (request.method == 'GET') {
+      await _handleGet(request);
+      return;
+    }
     final body = await utf8.decoder.bind(request).join();
     final soapAction = request.headers.value('SOAPAction') ?? '';
 
@@ -58,6 +75,9 @@ class MockDlnaServer {
 
     switch (action) {
       case 'SetAVTransportURI':
+        if (setUriDelay > Duration.zero) {
+          await Future<void>.delayed(setUriDelay);
+        }
         request.response.write(
           _soapResponse(
             'SetAVTransportURIResponse',
@@ -144,6 +164,30 @@ class MockDlnaServer {
         request.response.write('Unknown action: $action');
     }
 
+    await request.response.close();
+  }
+
+  Future<void> _handleGet(HttpRequest request) async {
+    switch (request.uri.path) {
+      case '/RenderingControl/scpd.xml':
+        scpdRequests++;
+        final scpd = renderingControlScpd;
+        if (scpd == null) {
+          request.response.statusCode = HttpStatus.notFound;
+        } else {
+          request.response.headers.contentType = ContentType('text', 'xml');
+          request.response.write(scpd);
+        }
+      case '/media.m3u8':
+        final b = StringBuffer('#EXTM3U\n#EXT-X-TARGETDURATION:10\n');
+        for (var i = 0; i < 6; i++) {
+          b.write('#EXTINF:10.0,\nseg$i.ts\n');
+        }
+        b.write('#EXT-X-ENDLIST\n');
+        request.response.write(b.toString());
+      default:
+        request.response.statusCode = HttpStatus.notFound;
+    }
     await request.response.close();
   }
 
@@ -862,5 +906,235 @@ void main() {
         await mockServer.stop();
       },
     );
+  });
+
+  group('DlnaSession spec compliance', () {
+    String scpdWithMax(int max) =>
+        '<?xml version="1.0"?><scpd><serviceStateTable>'
+        '<stateVariable sendEvents="no"><name>Volume</name>'
+        '<dataType>ui2</dataType><allowedValueRange><minimum>0</minimum>'
+        '<maximum>$max</maximum><step>1</step></allowedValueRange>'
+        '</stateVariable></serviceStateTable></scpd>';
+
+    DlnaSession sessionWithScpd() {
+      final s = DlnaSession(
+        device: device,
+        description: DlnaDeviceDescription(
+          friendlyName: 'Test TV',
+          udn: 'uuid:test-device',
+          avTransportControlUrl: mockServer.avTransportUrl,
+          renderingControlUrl: mockServer.renderingControlUrl,
+          renderingControlScpdUrl: mockServer.scpdUrl,
+          locationUrl: mockServer.baseUrl,
+        ),
+      );
+      addTearDown(s.dispose);
+      return s;
+    }
+
+    List<String> bodiesOf(String action) =>
+        mockServer.capturedActions
+            .where((a) => a.action == action)
+            .map((a) => a.body)
+            .toList();
+
+    test('volume is scaled by the renderer\'s SCPD maximum', () async {
+      mockServer.renderingControlScpd = scpdWithMax(60);
+      final s = sessionWithScpd();
+      await s.connect();
+
+      await s.setVolume(1.0);
+      expect(bodiesOf('SetVolume').last, contains('<DesiredVolume>60<'));
+      await s.setVolume(0.5);
+      expect(bodiesOf('SetVolume').last, contains('<DesiredVolume>30<'));
+      expect(mockServer.scpdRequests, 1, reason: 'SCPD is fetched once');
+
+      mockServer.volume = 30;
+      mockServer.transportState = 'PLAYING';
+      await s.loadMedia(
+        const CastMedia(
+          url: 'http://example.com/video.mp4',
+          type: CastMediaType.mp4,
+        ),
+      );
+      final volume = await s.volumeStream.first.timeout(
+        const Duration(seconds: 3),
+      );
+      expect(volume, closeTo(0.5, 1e-9));
+      expect(mockServer.scpdRequests, 1);
+    });
+
+    test('volume falls back to 0..100 when the SCPD cannot be read', () async {
+      mockServer.renderingControlScpd = null; // 404
+      final s = sessionWithScpd();
+      await s.connect();
+      await s.setVolume(1.0);
+      expect(bodiesOf('SetVolume').last, contains('<DesiredVolume>100<'));
+    });
+
+    test('a poll that sees STOPPED during a piped-seek reload does not end '
+        'the session', () async {
+      await session.connect();
+      mockServer.transportState = 'PLAYING';
+      await session.loadMedia(
+        CastMedia(
+          url: mockServer.playlistUrl,
+          type: CastMediaType.hls,
+          title: 'Piped',
+        ),
+      );
+      expect(session.state, SessionState.playing);
+
+      // The renderer sits in STOPPED from the Stop until the Play, and the
+      // SetAVTransportURI in between is slow: the 1 s poll lands inside.
+      mockServer.setUriDelay = const Duration(milliseconds: 2500);
+      final states = <SessionState>[];
+      final sub = session.stateStream.listen(states.add);
+      addTearDown(sub.cancel);
+      await session.seek(const Duration(seconds: 30));
+      mockServer.setUriDelay = Duration.zero;
+
+      // The renderer sat in STOPPED for longer than two poll periods; before
+      // the guard, the poll read that and moved the session to idle.
+      expect(states, isNot(contains(SessionState.idle)));
+      expect(session.state, SessionState.playing);
+
+      // Polling must still be running afterwards.
+      final before =
+          mockServer.capturedActions
+              .where((a) => a.action == 'GetPositionInfo')
+              .length;
+      await Future<void>.delayed(const Duration(milliseconds: 2200));
+      final after =
+          mockServer.capturedActions
+              .where((a) => a.action == 'GetPositionInfo')
+              .length;
+      expect(after, greaterThan(before));
+    });
+
+    test('setSubtitle on a piped route reloads at the current position and '
+        'keeps the metadata', () async {
+      await session.connect();
+      mockServer.transportState = 'PLAYING';
+      await session.loadMedia(
+        CastMedia(
+          url: mockServer.playlistUrl,
+          type: CastMediaType.hls,
+          title: 'Piped',
+        ),
+      );
+      final loadBody = bodiesOf('SetAVTransportURI').single;
+      expect(loadBody, contains('duration=&quot;00:01:00&quot;'));
+
+      await session.seek(const Duration(seconds: 30));
+      mockServer.capturedActions.clear();
+
+      await session.setSubtitle(
+        const CastSubtitle(
+          url: 'http://example.com/subs.srt',
+          label: 'English',
+          language: 'en',
+          format: 'srt',
+        ),
+      );
+
+      final setUri = bodiesOf('SetAVTransportURI');
+      expect(setUri, hasLength(1));
+      expect(setUri.single, contains('t=30.000'));
+      expect(setUri.single, contains('duration=&quot;00:01:00&quot;'));
+      expect(setUri.single, contains('DLNA.ORG_OP=10'));
+      // The subtitle is attached (proxied, not the raw URL).
+      expect(setUri.single, contains('CaptionInfoEx'));
+      expect(setUri.single, isNot(contains('example.com/subs.srt')));
+      final actions = mockServer.capturedActions.map((a) => a.action).toList();
+      expect(
+        actions.where(
+          (a) =>
+              a != 'GetPositionInfo' &&
+              a != 'GetTransportInfo' &&
+              a != 'GetVolume',
+        ),
+        ['Stop', 'SetAVTransportURI', 'Play'],
+      );
+
+      // Positions keep the 30 s offset rather than restarting at 0.
+      mockServer.relTime = '00:00:02';
+      final position = await session.positionStream.first.timeout(
+        const Duration(seconds: 3),
+      );
+      expect(position, const Duration(seconds: 32));
+    });
+
+    test('setSubtitle on a byte-seekable route seeks back to where it was '
+        'and keeps the duration', () async {
+      await session.connect();
+      mockServer.transportState = 'PLAYING';
+      mockServer.relTime = '00:00:40';
+      await session.loadMedia(
+        const CastMedia(
+          url: 'http://example.com/video.mp4',
+          type: CastMediaType.mp4,
+          duration: Duration(minutes: 2),
+        ),
+      );
+      await session.positionStream
+          .firstWhere((p) => p == const Duration(seconds: 40))
+          .timeout(const Duration(seconds: 3));
+      mockServer.capturedActions.clear();
+
+      await session.setSubtitle(
+        const CastSubtitle(
+          url: 'http://example.com/subs.srt',
+          label: 'English',
+          language: 'en',
+          format: 'srt',
+        ),
+      );
+      final setUri = bodiesOf('SetAVTransportURI').single;
+      expect(setUri, contains('duration=&quot;00:02:00&quot;'));
+
+      // The renderer restarts the item at 0; we put it back at 40 s once it
+      // reports PLAYING again.
+      for (var i = 0; i < 30 && bodiesOf('Seek').isEmpty; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      expect(bodiesOf('Seek').single, contains('<Target>00:00:40</Target>'));
+    });
+
+    test('the DIDL protocolInfo 4th field is what the servers answer '
+        'getcontentFeatures with', () async {
+      await session.connect();
+      mockServer.transportState = 'PLAYING';
+      await session.loadMedia(
+        CastMedia(url: mockServer.playlistUrl, type: CastMediaType.hls),
+      );
+      expect(
+        bodiesOf('SetAVTransportURI').single,
+        contains(
+          'protocolInfo=&quot;http-get:*:video/mp2t:'
+          '${DlnaContentFeatures.pipedTransportStream}&quot;',
+        ),
+      );
+    });
+
+    test('fromDevice carries the RenderingControl SCPD URL', () {
+      final d = CastDevice(
+        id: 'uuid:x',
+        name: 'TV',
+        protocol: CastProtocol.dlna,
+        address: InternetAddress('127.0.0.1'),
+        port: 1,
+        metadata: {
+          'avTransportControlUrl': 'http://127.0.0.1:1/avt',
+          'renderingControlScpdUrl': 'http://127.0.0.1:1/rcs.xml',
+        },
+      );
+      final s = DlnaSession.fromDevice(d);
+      addTearDown(s.dispose);
+      expect(
+        s.description.renderingControlScpdUrl,
+        'http://127.0.0.1:1/rcs.xml',
+      );
+    });
   });
 }
