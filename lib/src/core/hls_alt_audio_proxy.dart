@@ -347,9 +347,13 @@ class HlsAltAudioSegmentMuxer {
   HlsAltAudioSegmentMuxer({required HlsAltAudioPlanner planner})
     : _planner = planner;
 
+  ///
+  /// Pass one [continuity] for every segment of a single concatenated
+  /// output stream so continuity counters carry across segments.
   Future<RemuxedSegment> muxSegment({
     required HlsAltAudioPlan plan,
     required int segmentIndex,
+    TsMuxContinuity? continuity,
   }) async {
     if (segmentIndex < 0 || segmentIndex >= plan.segments.length) {
       throw RangeError(
@@ -368,6 +372,7 @@ class HlsAltAudioSegmentMuxer {
     final muxed = TsAltAudioRemuxer.mux(
       videoSegment: byteResults[0],
       audioSegment: byteResults[1],
+      continuity: continuity,
     );
     CastLogger.debug(
       'HlsAltAudioSegmentMuxer: segment $segmentIndex muxed → $muxed',

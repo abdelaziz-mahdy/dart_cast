@@ -272,6 +272,33 @@ class _PsiBuilder {
   }
 }
 
+/// Continuity counters per output PID, carried across consecutive
+/// [TsAltAudioRemuxer.mux] calls whose outputs form one stream.
+class TsMuxContinuity {
+  final Map<int, int> _next = {};
+
+  /// The counter for a packet with payload on [pid]; advances it.
+  int _nextFor(int pid) {
+    final value = _next[pid] ?? 0;
+    _next[pid] = (value + 1) & 0x0F;
+    return value;
+  }
+
+  /// The counter for a packet without payload on [pid], which repeats the
+  /// previous payload packet's value (§2.4.3.3).
+  int _currentFor(int pid) => ((_next[pid] ?? 0) - 1) & 0x0F;
+}
+
+class _TimedPacket {
+  final Uint8List bytes;
+
+  /// Decode time (DTS, else PTS; PCR base for PCR-only packets) of the PES
+  /// this packet belongs to, on the 90 kHz clock; null before the first.
+  final int? time;
+
+  const _TimedPacket(this.bytes, this.time);
+}
+
 class _PmtStream {
   final int streamType;
   final int elementaryPid;
@@ -317,6 +344,64 @@ class _TsScan {
         return pmtPid;
       }
     }
+    return null;
+  }
+
+  /// The PCR_PID of the first program in [bytes], or null.
+  static int? findPcrPid(List<int> bytes) {
+    final pmtPid = findPmtPid(bytes);
+    if (pmtPid == null) return null;
+    for (var i = 0; i + kTsPacketSize <= bytes.length; i += kTsPacketSize) {
+      if (bytes[i] != kTsSyncByte) continue;
+      final pid = ((bytes[i + 1] & 0x1F) << 8) | bytes[i + 2];
+      if (pid != pmtPid || (bytes[i + 1] & 0x40) == 0) continue;
+      final sectionStart = i + 5 + bytes[i + 4];
+      if (sectionStart + 10 > i + kTsPacketSize) return null;
+      return ((bytes[sectionStart + 8] & 0x1F) << 8) | bytes[sectionStart + 9];
+    }
+    return null;
+  }
+
+  /// The decode time carried by the TS packet at [i]: the DTS (else PTS)
+  /// of a PES that starts in it, or the PCR base of its adaptation field.
+  /// Null when it carries neither.
+  static int? decodeTime(List<int> bytes, int i) {
+    final afc = (bytes[i + 3] >> 4) & 0x03;
+    var payload = i + 4;
+    if (afc == 0x02 || afc == 0x03) {
+      final adaptationLength = bytes[i + 4];
+      if (adaptationLength > 0 &&
+          (bytes[i + 5] & 0x10) != 0 &&
+          i + 11 <= i + kTsPacketSize) {
+        // PCR: 33-bit base in the first 33 bits of the 48-bit field.
+        final pcrBase =
+            (bytes[i + 6] << 25) |
+            (bytes[i + 7] << 17) |
+            (bytes[i + 8] << 9) |
+            (bytes[i + 9] << 1) |
+            (bytes[i + 10] >> 7);
+        if (afc == 0x02) return pcrBase;
+      }
+      payload += 1 + adaptationLength;
+    }
+    if (afc == 0x02 || (bytes[i + 1] & 0x40) == 0) return null;
+    if (payload + 14 > i + kTsPacketSize) return null;
+    if (bytes[payload] != 0 ||
+        bytes[payload + 1] != 0 ||
+        bytes[payload + 2] != 1) {
+      return null;
+    }
+    final flags = (bytes[payload + 7] >> 6) & 0x03;
+    int read(int at) =>
+        (((bytes[at] >> 1) & 0x07) << 30) |
+        (bytes[at + 1] << 22) |
+        (((bytes[at + 2] >> 1) & 0x7F) << 15) |
+        (bytes[at + 3] << 7) |
+        ((bytes[at + 4] >> 1) & 0x7F);
+    if (flags == 0x03 && payload + 19 <= i + kTsPacketSize) {
+      return read(payload + 14); // DTS
+    }
+    if (flags >= 0x02) return read(payload + 9); // PTS
     return null;
   }
 
@@ -370,13 +455,22 @@ class TsAltAudioRemuxer {
   ///
   /// [outputPmtPid] is the PID of the synthesised PMT. 0x1000 is a
   /// conventional choice and avoids the DVB-reserved range and PAT.
+  ///
+  /// Pass the same [continuity] to consecutive calls when their outputs
+  /// are concatenated into one stream (the DLNA pipe), so every PID's
+  /// continuity_counter runs on across segment boundaries as ISO/IEC
+  /// 13818-1 §2.4.3.3 requires. Without it each segment starts at 0.
   static RemuxedSegment mux({
     required List<int> videoSegment,
     required List<int> audioSegment,
     int outputVideoPid = 0x100,
     int outputAudioPid = 0x101,
     int outputPmtPid = 0x1000,
+    int outputPcrPid = 0x1FF,
+    TsMuxContinuity? continuity,
   }) {
+    final cc = continuity ?? TsMuxContinuity();
+
     // 1. Discover source PIDs + stream types from each input's PMT.
     final videoStreams = _inspect(videoSegment);
     final audioStreams = _inspect(audioSegment);
@@ -396,122 +490,151 @@ class TsAltAudioRemuxer {
       );
     }
 
-    // 2. Build synthesised PSI.
-    final patPacket = _PsiBuilder.buildPatPacket(pmtPid: outputPmtPid);
+    // 2. Where the source carries its PCR. ISO/IEC 13818-1 §2.4.4.9: the
+    //    program's PCR rides on PCR_PID, which need not be an elementary
+    //    PID. When it is a PCR-only PID, those packets are kept (on
+    //    [outputPcrPid]) — dropping them leaves the output with no clock.
+    final timingSource = videoStream != null ? videoSegment : audioSegment;
+    final timingStream = videoStream ?? audioStream!;
+    final timingOutputPid =
+        videoStream != null ? outputVideoPid : outputAudioPid;
+    final sourcePcrPid = _TsScan.findPcrPid(timingSource);
+    final hasSeparatePcr =
+        sourcePcrPid != null &&
+        sourcePcrPid != timingStream.elementaryPid &&
+        sourcePcrPid != kPidNull;
+    final pcrPid = hasSeparatePcr ? outputPcrPid : timingOutputPid;
 
-    final pmtStreams = <_PmtStream>[];
-    if (videoStream != null) {
-      pmtStreams.add(
+    // 3. Build synthesised PSI.
+    final pmtStreams = <_PmtStream>[
+      if (videoStream != null)
         _PmtStream(
           streamType: videoStream.streamType,
           elementaryPid: outputVideoPid,
         ),
-      );
-    }
-    if (audioStream != null) {
-      pmtStreams.add(
+      if (audioStream != null)
         _PmtStream(
           streamType: audioStream.streamType,
           elementaryPid: outputAudioPid,
         ),
-      );
-    }
-    final pcrPid =
-        videoStream != null ? outputVideoPid : outputAudioPid; // sane default
+    ];
+    final patPacket = _PsiBuilder.buildPatPacket(pmtPid: outputPmtPid);
     final pmtPacket = _PsiBuilder.buildPmtPacket(
       pmtPid: outputPmtPid,
       pcrPid: pcrPid,
       streams: pmtStreams,
     );
 
-    // 3. Walk both segments, dropping PSI/DVB/null packets and rewriting
-    //    elementary PIDs to the chosen output PIDs.
-    final out =
-        BytesBuilder(copy: false)
-          ..add(patPacket)
-          ..add(pmtPacket);
-    var videoPackets = 0;
-    var audioPackets = 0;
-    var dropped = 0;
-
-    // Continuity counter per output PID — renumbered to avoid gaps when
-    // we strip packets from the source.
-    final ccByOutputPid = <int, int>{outputVideoPid: 0, outputAudioPid: 0};
-
-    void copyFiltered(
-      List<int> source, {
-      required int sourcePid,
-      required int targetPid,
-      required Function(int) bumpCount,
-    }) {
+    // 4. Collect each stream's packets with the decode time of the PES they
+    //    belong to.
+    List<_TimedPacket> collect(List<int> source, int sourcePid, int target) {
+      final packets = <_TimedPacket>[];
+      int? current;
       for (var i = 0; i + kTsPacketSize <= source.length; i += kTsPacketSize) {
         if (source[i] != kTsSyncByte) continue;
         final pid = ((source[i + 1] & 0x1F) << 8) | source[i + 2];
-
-        // Drop noise: PSI tables, DVB tables, null packets.
-        if (pid == kPidPat ||
-            pid == kPidNull ||
-            kDvbReservedPids.contains(pid)) {
-          dropped++;
-          continue;
-        }
-        // Drop the source PMT — we have our own.
-        // (Source PMT PIDs are detected per input below; we approximate
-        // here by dropping anything that isn't the elementary stream.)
-        if (pid != sourcePid) {
-          dropped++;
-          continue;
-        }
-
-        // Copy this packet, rewriting PID and continuity counter.
-        final pkt = Uint8List(kTsPacketSize);
-        for (var k = 0; k < kTsPacketSize; k++) {
-          pkt[k] = source[i + k];
-        }
+        if (pid != sourcePid) continue;
+        current = _TsScan.decodeTime(source, i) ?? current;
+        final pkt = Uint8List.fromList(source.sublist(i, i + kTsPacketSize));
         // Rewrite PID in bytes 1–2 while preserving the high 3 flag bits
         // of byte 1 (TEI, PUSI, transport_priority).
-        pkt[1] = (pkt[1] & 0xE0) | ((targetPid >> 8) & 0x1F);
-        pkt[2] = targetPid & 0xFF;
-        // Rewrite continuity counter (low nibble of byte 3) — bump
-        // mod-16 only when packet has payload, but for simplicity we
-        // always bump when adaptation_field_control indicates payload.
-        final afc = (pkt[3] >> 4) & 0x03;
-        final hasPayload = afc == 0x01 || afc == 0x03;
-        final cc = ccByOutputPid[targetPid] ?? 0;
-        if (hasPayload) {
-          pkt[3] = (pkt[3] & 0xF0) | (cc & 0x0F);
-          ccByOutputPid[targetPid] = (cc + 1) & 0x0F;
-        }
-        out.add(pkt);
-        bumpCount(0); // sentinel; outer counter updated via closure side
+        pkt[1] = (pkt[1] & 0xE0) | ((target >> 8) & 0x1F);
+        pkt[2] = target & 0xFF;
+        packets.add(_TimedPacket(pkt, current));
       }
+      return packets;
     }
 
-    if (videoStream != null) {
-      copyFiltered(
-        videoSegment,
-        sourcePid: videoStream.elementaryPid,
-        targetPid: outputVideoPid,
-        bumpCount: (_) => videoPackets++,
-      );
+    final video =
+        videoStream == null
+            ? const <_TimedPacket>[]
+            : collect(videoSegment, videoStream.elementaryPid, outputVideoPid);
+    final audio =
+        audioStream == null
+            ? const <_TimedPacket>[]
+            : collect(audioSegment, audioStream.elementaryPid, outputAudioPid);
+    final pcr =
+        hasSeparatePcr
+            ? collect(timingSource, sourcePcrPid, outputPcrPid)
+            : const <_TimedPacket>[];
+    final inputPackets =
+        (videoStream != null ? videoSegment.length ~/ kTsPacketSize : 0) +
+        (audioStream != null ? audioSegment.length ~/ kTsPacketSize : 0);
+    final dropped = inputPackets - video.length - audio.length - pcr.length;
+
+    // 5. Interleave by decode time (§2.4.2, T-STD): emitting all video and
+    //    then all audio delivers the audio a whole segment late.
+    final merged = _mergeByTime([video, pcr, audio]);
+
+    // 6. Emit PAT, PMT, then the packets with continuity counters renumbered
+    //    per output PID. The counter only advances on packets that carry a
+    //    payload (§2.4.3.3).
+    final out = BytesBuilder(copy: false);
+    void emit(Uint8List pkt, int pid) {
+      final afc = (pkt[3] >> 4) & 0x03;
+      if (afc == 0x01 || afc == 0x03) {
+        pkt[3] = (pkt[3] & 0xF0) | cc._nextFor(pid);
+      } else {
+        pkt[3] = (pkt[3] & 0xF0) | cc._currentFor(pid);
+      }
+      out.add(pkt);
     }
-    if (audioStream != null) {
-      copyFiltered(
-        audioSegment,
-        sourcePid: audioStream.elementaryPid,
-        targetPid: outputAudioPid,
-        bumpCount: (_) => audioPackets++,
-      );
+
+    emit(patPacket, kPidPat);
+    emit(pmtPacket, outputPmtPid);
+    for (final p in merged) {
+      emit(p.bytes, ((p.bytes[1] & 0x1F) << 8) | p.bytes[2]);
     }
 
     final bytes = out.toBytes();
     return RemuxedSegment(
       bytes: bytes,
       packetCount: bytes.length ~/ kTsPacketSize,
-      videoPacketsCopied: videoPackets,
-      audioPacketsCopied: audioPackets,
-      packetsDropped: dropped,
+      videoPacketsCopied: video.length,
+      audioPacketsCopied: audio.length,
+      packetsDropped: dropped < 0 ? 0 : dropped,
     );
+  }
+
+  /// Merges per-stream packet lists by decode time. Each list keeps its
+  /// own order; packets before the first timestamp in their list go
+  /// first. Times are compared on the 33-bit clock relative to the
+  /// earliest one, so a wrap does not reorder the streams. Ties keep the
+  /// order of [lists].
+  static List<_TimedPacket> _mergeByTime(List<List<_TimedPacket>> lists) {
+    int? base;
+    for (final list in lists) {
+      for (final p in list) {
+        final t = p.time;
+        if (t != null && (base == null || _relative(t, base) < 0)) base = t;
+      }
+    }
+    final index = List<int>.filled(lists.length, 0);
+    final result = <_TimedPacket>[];
+    while (true) {
+      var pick = -1;
+      var pickTime = 0;
+      for (var l = 0; l < lists.length; l++) {
+        if (index[l] >= lists[l].length) continue;
+        final t = lists[l][index[l]].time;
+        final rel = (t == null || base == null) ? -1 << 40 : _relative(t, base);
+        if (pick < 0 || rel < pickTime) {
+          pick = l;
+          pickTime = rel;
+        }
+      }
+      if (pick < 0) break;
+      result.add(lists[pick][index[pick]++]);
+    }
+    return result;
+  }
+
+  static const int _clockMask = (1 << 33) - 1;
+
+  /// [t] − [base] on the 33-bit 90 kHz clock, as a signed value.
+  static int _relative(int t, int base) {
+    final d = (t - base) & _clockMask;
+    return d >= (1 << 32) ? d - (1 << 33) : d;
   }
 
   /// Reads a segment's PAT → PMT → declared elementary streams, then
